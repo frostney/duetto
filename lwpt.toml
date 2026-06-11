@@ -19,3 +19,4 @@ wsecho    = { source = "source/apps/wsecho.pas",    output = "build/wsecho" }
 wsbench   = { source = "source/apps/wsbench.pas",   output = "build/wsbench" }
 wsinterop = { source = "source/apps/wsinterop.pas", output = "build/wsinterop" }
 wsprobe   = { source = "source/apps/wsprobe.pas",   output = "build/wsprobe" }
+wsautobahn = { source = "source/apps/wsautobahn.pas", output = "build/wsautobahn" }

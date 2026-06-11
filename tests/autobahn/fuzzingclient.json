@@ -1,0 +1,10 @@
+{
+    "outdir": "/reports/server",
+    "servers": [
+        {"agent": "lwws", "url": "ws://127.0.0.1:9002"},
+        {"agent": "lwws-nodeflate", "url": "ws://127.0.0.1:9003"}
+    ],
+    "cases": ["*"],
+    "exclude-cases": [],
+    "exclude-agent-cases": {}
+}
