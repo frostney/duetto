@@ -4,22 +4,21 @@ name: PR
 # GocciaScript pattern: ci.yml runs only on push to main, so pr.yml is
 # the sole pre-merge signal a PR sees.
 #
-#   pr.yml — every PR: Ubuntu native lwpt bootstrap + install +
-#            format --check + build + test + wsinterop (no Autobahn,
-#            no multi-platform). Typical wall-clock < 5 min.
+#   pr.yml — every PR: Ubuntu native install --frozen + format --check
+#            + build + test + wsinterop (no Autobahn, no
+#            multi-platform). Typical wall-clock < 5 min.
 #   ci.yml — push to main only: per-platform native test runs plus the
-#            full Autobahn fuzzing suite in both directions.
+#            full Autobahn suite in both directions.
 #
 # Trade-off, deliberate (same as lwpt's pr.yml): a PR that introduces a
 # platform-specific regression passes pr.yml and only fails on the
 # main-branch ci.yml run; the maintainer reverts or forward-fixes. This
 # trades pre-merge cross-platform certainty for cheap PR feedback.
 #
-# lwws depends on lwpt both as toolchain (build/test/format driver) and
-# as dependency source (packages/httpclient + packages/testing resolve
-# from a sibling ../lwpt checkout, per lwpt.toml). Every job therefore
-# checks out frostney/lwpt next to this repo and cold-builds the lwpt
-# binary via its bootstrap.sh.
+# The lwpt toolchain comes from its published release (checksum-
+# verified tarball, no sibling checkout, no bootstrap); dependencies
+# resolve from the same release tag and are verified against the
+# committed lockfile + .lwpt/modules tree via install --frozen.
 
 on:
   pull_request:
@@ -30,22 +29,17 @@ on:
 permissions:
   contents: read
 
+env:
+  LWPT_VERSION: "0.1.0"
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     defaults:
       run:
         shell: bash
-        working-directory: lwws
     steps:
       - uses: actions/checkout@v5
-        with:
-          path: lwws
-
-      - uses: actions/checkout@v5
-        with:
-          repository: frostney/lwpt
-          path: lwpt
 
       - name: Install FPC
         run: |
@@ -53,21 +47,29 @@ jobs:
           sudo apt-get install -y fpc
           fpc -iV
 
-      - name: Bootstrap lwpt (cold build of ../lwpt/build/lwpt)
-        working-directory: lwpt
-        run: ./bootstrap.sh
+      - name: Install lwpt (release binary, checksum-verified)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          ASSET="lwpt-${LWPT_VERSION}-linux-x64"
+          BASE="https://github.com/frostney/lwpt/releases/download/${LWPT_VERSION}"
+          curl -fsSLO "${BASE}/${ASSET}.tar.gz"
+          curl -fsSLO "${BASE}/lwpt-${LWPT_VERSION}-checksums.txt"
+          shasum -a 256 -c <(grep "${ASSET}.tar.gz" "lwpt-${LWPT_VERSION}-checksums.txt")
+          tar xzf "${ASSET}.tar.gz"
+          echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
 
-      - name: lwpt install (resolve ../lwpt sibling packages)
-        run: ../lwpt/build/lwpt install
+      - name: lwpt install --frozen (verify lockfile + committed modules)
+        run: lwpt install --frozen
 
       - name: lwpt format --check (formatting drift?)
-        run: ../lwpt/build/lwpt format --check
+        run: lwpt format --check
 
       - name: lwpt build (compile every [build] entry)
-        run: ../lwpt/build/lwpt build
+        run: lwpt build
 
       - name: lwpt test (five co-located unit suites)
-        run: ../lwpt/build/lwpt test
+        run: lwpt test
 
       - name: wsinterop (live-socket battery, own client vs own server)
         run: ./build/wsinterop
