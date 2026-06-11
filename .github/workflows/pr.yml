@@ -1,0 +1,83 @@
+name: PR
+
+# Fast single-runner PR gate (Ubuntu native). Mirrors the lwpt /
+# GocciaScript pattern: ci.yml runs only on push to main, so pr.yml is
+# the sole pre-merge signal a PR sees.
+#
+#   pr.yml — every PR: Ubuntu native lwpt bootstrap + install +
+#            format --check + build + test + wsinterop (no Autobahn,
+#            no multi-platform). Typical wall-clock < 5 min.
+#   ci.yml — push to main only: per-platform native test runs plus the
+#            full Autobahn fuzzing suite in both directions.
+#
+# Trade-off, deliberate (same as lwpt's pr.yml): a PR that introduces a
+# platform-specific regression passes pr.yml and only fails on the
+# main-branch ci.yml run; the maintainer reverts or forward-fixes. This
+# trades pre-merge cross-platform certainty for cheap PR feedback.
+#
+# lwws depends on lwpt both as toolchain (build/test/format driver) and
+# as dependency source (packages/httpclient + packages/testing resolve
+# from a sibling ../lwpt checkout, per lwpt.toml). Every job therefore
+# checks out frostney/lwpt next to this repo and cold-builds the lwpt
+# binary via its bootstrap.sh.
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: lwws
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: lwws
+
+      - uses: actions/checkout@v5
+        with:
+          repository: frostney/lwpt
+          path: lwpt
+
+      - name: Install FPC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          fpc -iV
+
+      - name: Bootstrap lwpt (cold build of ../lwpt/build/lwpt)
+        working-directory: lwpt
+        run: ./bootstrap.sh
+
+      - name: lwpt install (resolve ../lwpt sibling packages)
+        run: ../lwpt/build/lwpt install
+
+      - name: lwpt format --check (formatting drift?)
+        run: ../lwpt/build/lwpt format --check
+
+      - name: lwpt build (compile every [build] entry)
+        run: ../lwpt/build/lwpt build
+
+      - name: lwpt test (five co-located unit suites)
+        run: ../lwpt/build/lwpt test
+
+      - name: wsinterop (live-socket battery, own client vs own server)
+        run: ./build/wsinterop
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Lint Markdown
+        uses: DavidAnson/markdownlint-cli2-action@v19
+        with:
+          globs: "**/*.md"

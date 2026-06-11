@@ -1,0 +1,161 @@
+name: CI
+
+# Two-stage post-merge confirmation, mirroring the lwpt / GocciaScript
+# CI pattern. Sister workflow:
+#
+#   pr.yml — every PR: fast Ubuntu-native gate (the authoritative
+#            pre-merge signal).
+#
+# ci.yml runs ONLY on push to main + manual dispatch. PRs do not
+# trigger ci.yml — pr.yml owns the PR flow. This avoids the
+# duplicate-build cost of triggering on both push and pull_request for
+# the same commit; post-merge, ci.yml runs once on main to confirm the
+# merged tree is green everywhere.
+#
+#   test:     Per-platform native runners. The library units and the
+#             blocking client are POSIX-portable; WS.Server is Linux
+#             epoll only, so the Linux legs build and exercise all five
+#             programs (incl. wsinterop's live-socket battery) while
+#             the macOS legs build the client-side programs and run the
+#             unit suites.
+#
+#   autobahn: The Autobahn fuzzing suite (crossbario/autobahn-testsuite
+#             via Docker) in both directions — fuzzingclient against
+#             build/wsecho (server under test) and fuzzingserver
+#             against build/wsautobahn (client under test, with and
+#             without permessage-deflate). tools/autobahn-check.py
+#             fails the job on any non-acceptable case; the full HTML
+#             reports are uploaded as an artifact either way.
+#
+# lwws depends on lwpt both as toolchain and as dependency source
+# (sibling ../lwpt checkout, per lwpt.toml), so every job checks out
+# frostney/lwpt next to this repo and cold-builds the lwpt binary.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux
+            runner: ubuntu-latest
+            fpc-install: apt
+            server-apps: true
+            format-check: true   # one runner runs format-check (platform-independent)
+          - target: aarch64-linux
+            runner: ubuntu-24.04-arm
+            fpc-install: apt
+            server-apps: true
+          - target: aarch64-darwin
+            runner: macos-latest
+            fpc-install: brew
+          - target: x86_64-darwin
+            runner: macos-15-intel
+            fpc-install: brew
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: lwws
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: lwws
+
+      - uses: actions/checkout@v5
+        with:
+          repository: frostney/lwpt
+          path: lwpt
+
+      - name: Install FPC (apt)
+        if: matrix.fpc-install == 'apt'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          fpc -iV
+
+      - name: Install FPC (brew)
+        if: matrix.fpc-install == 'brew'
+        run: |
+          brew install fpc
+          fpc -iV
+
+      - name: Bootstrap lwpt (cold build of ../lwpt/build/lwpt)
+        working-directory: lwpt
+        run: ./bootstrap.sh
+
+      - name: lwpt install (resolve ../lwpt sibling packages)
+        run: ../lwpt/build/lwpt install
+
+      - name: lwpt format --check (one runner)
+        if: matrix.format-check == true
+        run: ../lwpt/build/lwpt format --check
+
+      - name: lwpt build (all programs — Linux)
+        if: matrix.server-apps == true
+        run: ../lwpt/build/lwpt build
+
+      - name: lwpt build (client-side programs — macOS, no epoll server)
+        if: matrix.server-apps != true
+        run: ../lwpt/build/lwpt build wsprobe wsautobahn
+
+      - name: lwpt test (five co-located unit suites)
+        run: ../lwpt/build/lwpt test
+
+      - name: wsinterop (live-socket battery, own client vs own server)
+        if: matrix.server-apps == true
+        run: ./build/wsinterop
+
+  autobahn:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: lwws
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: lwws
+
+      - uses: actions/checkout@v5
+        with:
+          repository: frostney/lwpt
+          path: lwpt
+
+      - name: Install FPC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          fpc -iV
+
+      - name: Bootstrap lwpt (cold build of ../lwpt/build/lwpt)
+        working-directory: lwpt
+        run: ./bootstrap.sh
+
+      - name: lwpt install + build (wsecho + wsautobahn)
+        run: |
+          ../lwpt/build/lwpt install
+          ../lwpt/build/lwpt build wsecho wsautobahn
+
+      - name: Autobahn fuzzingclient vs wsecho (server under test)
+        run: ./tools/autobahn.sh server
+
+      - name: Autobahn fuzzingserver vs wsautobahn (client under test)
+        run: ./tools/autobahn.sh client
+
+      - name: Upload Autobahn reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: autobahn-reports
+          retention-days: 30
+          path: lwws/tests/autobahn/reports/
