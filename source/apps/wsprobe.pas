@@ -12,7 +12,14 @@ program wsprobe;
 {$I Shared.inc}
 
 uses
-  SysUtils, WS.Client;
+  Classes, SysUtils,
+
+  CLI.Help, CLI.Options, CLI.Parser,
+
+  WS.Client;
+
+const
+  UsageLine = 'ws://host:port/ [--deflate]';
 
 var
   Failures: Integer = 0;
@@ -30,6 +37,9 @@ begin
 end;
 
 var
+  DeflateOpt, HelpOpt: TFlagOption;
+  Options: TOptionArray;
+  Positionals: TStringList;
   Cli: TWSClient;
   Url: string;
   Deflate: Boolean;
@@ -38,13 +48,34 @@ var
   S: RawByteString;
   I: Integer;
 begin
-  if ParamCount < 1 then
-  begin
-    WriteLn('usage: wsprobe ws://host:port/ [--deflate]');
-    Halt(2);
+  DeflateOpt := TFlagOption.Create('deflate',
+    'Offer permessage-deflate in the opening handshake');
+  HelpOpt := TFlagOption.Create('help', 'Show this help and exit');
+  Options := TOptionArray.Create(DeflateOpt, HelpOpt);
+
+  Positionals := nil;
+  try
+    Positionals := ParseCommandLine(Options);
+    if HelpOpt.Present then
+    begin
+      Write(GenerateHelpText('wsprobe', UsageLine, Options));
+      Halt(0);
+    end;
+    if Positionals.Count <> 1 then
+      raise TParseError.Create('expected exactly one ws:// or wss:// URL');
+    Url := Positionals[0];
+  except
+    on E: TParseError do
+    begin
+      WriteLn('wsprobe: ', E.Message);
+      Write(GenerateHelpText('wsprobe', UsageLine, Options));
+      Halt(2);
+    end;
   end;
-  Url := ParamStr(1);
-  Deflate := (ParamCount >= 2) and (ParamStr(2) = '--deflate');
+  Deflate := DeflateOpt.Present;
+  Positionals.Free;
+  for I := 0 to High(Options) do
+    Options[I].Free;
 
   Cli := TWSClient.Create;
   try

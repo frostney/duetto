@@ -17,7 +17,11 @@ program wsautobahn;
 {$I Shared.inc}
 
 uses
-  SysUtils, WS.Client;
+  Classes, SysUtils,
+
+  CLI.Help, CLI.Options, CLI.Parser,
+
+  WS.Client;
 
 const
   // Autobahn's largest payloads (cases 9.x) are 16 MiB; leave headroom so
@@ -130,29 +134,51 @@ begin
   end;
 end;
 
+const
+  UsageLine = '[--server=ws://host:port] [--agent=name] [--deflate]';
+
 var
-  Server, Agent, A: string;
+  ServerOpt, AgentOpt: TStringOption;
+  DeflateOpt, HelpOpt: TFlagOption;
+  Options: TOptionArray;
+  Positionals: TStringList;
+  Server, Agent: string;
   Deflate: Boolean;
   CaseCount, I: Integer;
 begin
-  Server := 'ws://127.0.0.1:9001';
-  Agent := 'lwws';
-  Deflate := False;
-  for I := 1 to ParamCount do
-  begin
-    A := ParamStr(I);
-    if Copy(A, 1, 9) = '--server=' then
-      Server := Copy(A, 10, MaxInt)
-    else if Copy(A, 1, 8) = '--agent=' then
-      Agent := Copy(A, 9, MaxInt)
-    else if A = '--deflate' then
-      Deflate := True
-    else
+  ServerOpt := TStringOption.Create('server',
+    'Fuzzingserver control endpoint (default ws://127.0.0.1:9001)');
+  AgentOpt := TStringOption.Create('agent',
+    'Agent name recorded in the suite report (default lwws)');
+  DeflateOpt := TFlagOption.Create('deflate',
+    'Offer permessage-deflate on every case connection');
+  HelpOpt := TFlagOption.Create('help', 'Show this help and exit');
+  Options := TOptionArray.Create(ServerOpt, AgentOpt, DeflateOpt, HelpOpt);
+
+  Positionals := nil;
+  try
+    Positionals := ParseCommandLine(Options);
+    if HelpOpt.Present then
     begin
-      WriteLn('usage: wsautobahn [--server=ws://host:port] [--agent=name] [--deflate]');
+      Write(GenerateHelpText('wsautobahn', UsageLine, Options));
+      Halt(0);
+    end;
+    if Positionals.Count > 0 then
+      raise TParseError.CreateFmt('unexpected argument: %s', [Positionals[0]]);
+  except
+    on E: TParseError do
+    begin
+      WriteLn('wsautobahn: ', E.Message);
+      Write(GenerateHelpText('wsautobahn', UsageLine, Options));
       Halt(2);
     end;
   end;
+  Server := ServerOpt.ValueOr('ws://127.0.0.1:9001');
+  Agent := AgentOpt.ValueOr('lwws');
+  Deflate := DeflateOpt.Present;
+  Positionals.Free;
+  for I := 0 to High(Options) do
+    Options[I].Free;
 
   CaseCount := FetchCaseCount(Server);
   if CaseCount <= 0 then

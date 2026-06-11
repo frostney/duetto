@@ -6,13 +6,21 @@ program wsecho;
 //
 //   wsecho [--port=9001] [--no-deflate] [--quiet]
 //
-// Prints "listening on <port>" once ready so harnesses can wait for it.
+// Prints "listening on <port>" once ready so harnesses can wait for it
+// (--port=0 binds an ephemeral port and reports the real one).
 
 {$I Shared.inc}
 
 uses
   {$ifdef UNIX} cthreads, {$endif}
-  SysUtils, WS.Server;
+  Classes, SysUtils,
+
+  CLI.Help, CLI.Options, CLI.Parser,
+
+  WS.Server;
+
+const
+  UsageLine = '[--port=N] [--no-deflate] [--quiet]';
 
 type
   TEcho = class
@@ -37,44 +45,61 @@ begin
 end;
 
 var
+  PortOpt: TIntegerOption;
+  NoDeflateOpt, QuietOpt, HelpOpt: TFlagOption;
+  Options: TOptionArray;
+  Positionals: TStringList;
   Srv: TWSServer;
   Echo: TEcho;
-  Port: Word;
-  Deflate, Quiet: Boolean;
   I: Integer;
-  A: string;
 begin
-  Port := 9001;
-  Deflate := True;
-  Quiet := False;
-  for I := 1 to ParamCount do
-  begin
-    A := ParamStr(I);
-    if Copy(A, 1, 7) = '--port=' then
-      Port := StrToInt(Copy(A, 8, MaxInt))
-    else if A = '--no-deflate' then
-      Deflate := False
-    else if A = '--quiet' then
-      Quiet := True
-    else
-    begin
-      WriteLn('usage: wsecho [--port=N] [--no-deflate] [--quiet]');
-      Halt(2);
-    end;
-  end;
+  PortOpt := TIntegerOption.Create('port',
+    'Listen port; 0 binds an ephemeral port (default 9001)');
+  NoDeflateOpt := TFlagOption.Create('no-deflate',
+    'Refuse permessage-deflate during negotiation');
+  QuietOpt := TFlagOption.Create('quiet',
+    'Suppress per-connection logging');
+  HelpOpt := TFlagOption.Create('help', 'Show this help and exit');
+  Options := TOptionArray.Create(PortOpt, NoDeflateOpt, QuietOpt, HelpOpt);
 
-  Echo := TEcho.Create;
-  Echo.Quiet := Quiet;
-  Srv := TWSServer.Create(Port, Deflate);
+  Positionals := nil;
   try
-    Srv.OnMessage := Echo.OnMsg;
-    if not Quiet then
-      Srv.OnOpen := Echo.OnOpen;
-    WriteLn('listening on ', Srv.Port);
-    Flush(Output);
-    Srv.Run;
+    try
+      Positionals := ParseCommandLine(Options);
+      if HelpOpt.Present then
+      begin
+        Write(GenerateHelpText('wsecho', UsageLine, Options));
+        Halt(0);
+      end;
+      if Positionals.Count > 0 then
+        raise TParseError.CreateFmt('unexpected argument: %s',
+          [Positionals[0]]);
+    except
+      on E: TParseError do
+      begin
+        WriteLn('wsecho: ', E.Message);
+        Write(GenerateHelpText('wsecho', UsageLine, Options));
+        Halt(2);
+      end;
+    end;
+
+    Echo := TEcho.Create;
+    Echo.Quiet := QuietOpt.Present;
+    Srv := TWSServer.Create(PortOpt.ValueOr(9001), not NoDeflateOpt.Present);
+    try
+      Srv.OnMessage := Echo.OnMsg;
+      if not QuietOpt.Present then
+        Srv.OnOpen := Echo.OnOpen;
+      WriteLn('listening on ', Srv.Port);
+      Flush(Output);
+      Srv.Run;
+    finally
+      Srv.Free;
+      Echo.Free;
+    end;
   finally
-    Srv.Free;
-    Echo.Free;
+    Positionals.Free;
+    for I := 0 to High(Options) do
+      Options[I].Free;
   end;
 end.
