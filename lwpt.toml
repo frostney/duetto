@@ -1,0 +1,21 @@
+# lwws — lightweight WebSocket for Pascal (RFC 6455 + RFC 7692)
+# Bootstrapped with `lwpt init`; built/tested/formatted via lwpt.
+
+[package]
+name = "lwws"
+version = "0.1.0"
+units = ["source"]
+
+[dependencies]
+# lwpt's network layer: HTTPClient + TransportSecurity (TLS) + StringBuffer.
+# Local sibling path in this sandbox; on a dev machine this becomes
+#   httpclient = "frostney/lwpt@^0.1.0" with an include filter,
+# or the standalone repo once the package graduates (ADR-0014 phase 2).
+httpclient = "../lwpt/packages/httpclient"
+testing = "../lwpt/packages/testing"
+
+[build]
+wsecho    = { source = "src/wsecho.pas",    output = "build/wsecho" }
+wsbench   = { source = "src/wsbench.pas",   output = "build/wsbench" }
+wsinterop = { source = "src/wsinterop.pas", output = "build/wsinterop" }
+wsprobe   = { source = "src/wsprobe.pas",   output = "build/wsprobe" }

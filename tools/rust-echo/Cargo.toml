@@ -1,0 +1,15 @@
+# tungstenite echo baseline for COMPARISON.md.
+# On rustc 1.75 (Ubuntu 24.04 apt), after `cargo build` resolves, run:
+#   cargo update -p idna_adapter --precise 1.1.0
+# (newer idna_adapter requires edition2024), then `cargo build --release`.
+[package]
+name = "rust-echo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tungstenite = "0.21"
+
+[profile.release]
+lto = true
+opt-level = 3
