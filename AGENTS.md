@@ -10,6 +10,14 @@
   builds) and do not invoke `fpc` directly except as `fpc @lwpt.cfg`.
 - **`lwpt.cfg` and `lwpt.lock` are generated** by `lwpt install`; never
   hand-edit them. `lwpt.toml` is the manifest you edit.
+- **The `units` array in `lwpt.toml` deliberately lists the `.lwpt`
+  module source dirs** (lwpt 0.1.0 doesn't discover unit subdirs behind
+  include-filtered deps — see the manifest comment). Do not "clean up"
+  those entries, and keep `[format] exclude = [".lwpt/**"]` so the
+  formatter never rewrites fetched modules.
+- **Programs parse flags via lwpt's `cli` package** (`CLI.Options`,
+  `CLI.Parser`, `CLI.Help`) — no hand-rolled `ParamStr` loops in
+  `source/apps/`.
 - **Layout is fixed:** library units in `source/units/` (namespaced
   `WS.*.pas`, tests co-located as `WS.*.Test.pas`), program entry points in
   `source/apps/`, one-off automation in `tools/`, E2E corpora in `tests/`.
@@ -23,11 +31,13 @@
 
 ## Runtime / Commands
 
-lwpt is expected as a sibling checkout (`../lwpt`, see `lwpt.toml`); use
-`../lwpt/build/lwpt` or an on-PATH `lwpt` interchangeably.
+lwpt is the **released binary on PATH** (checksum-verified tarball from
+lwpt's GitHub releases — see `docs/quick-start.md`); no sibling checkout,
+no bootstrap. Dependencies resolve from the same release tag.
 
 ```bash
 lwpt install         # resolve deps, regenerate lwpt.cfg + lwpt.lock
+lwpt install --frozen  # CI mode: verify lockfile + committed modules, no network
 lwpt format --check  # formatter gate (no flag = rewrite in place)
 lwpt build           # all programs (Linux; on macOS: lwpt build wsprobe wsautobahn)
 lwpt test            # five co-located unit suites

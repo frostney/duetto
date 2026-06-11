@@ -2,32 +2,45 @@
 
 ## Executive Summary
 
-- Prerequisites: FPC 3.2.2, a sibling `../lwpt` checkout (toolchain + dependencies), Lefthook, and Docker for the Autobahn suite.
-- `lwpt install` resolves dependencies, `lwpt build` compiles the programs, `lwpt test` runs the unit suites.
+- Prerequisites: FPC 3.2.2, the lwpt **release binary** on PATH, Lefthook, and Docker for the Autobahn suite.
+- `lwpt install` resolves dependencies from the lwpt release tag, `lwpt build` compiles the programs, `lwpt test` runs the unit suites.
 - `WS.Server` (and therefore `wsecho`, `wsinterop`, `wsbench`) is Linux-only; on macOS build `wsprobe` and `wsautobahn`.
 - `lefthook install` wires the pre-commit formatter hook.
 
 ## Setup
 
+Install lwpt from its release (pick the tarball for your platform —
+`linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`):
+
 ```bash
-git clone https://github.com/frostney/lwpt.git
-git clone https://github.com/frostney/lwws.git
-cd lwpt && ./bootstrap.sh && cd ../lwws   # cold-builds ../lwpt/build/lwpt
-../lwpt/build/lwpt install                 # resolve deps, write lwpt.cfg
-lefthook install                           # pre-commit formatter hook
+curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.1.0/lwpt-0.1.0-macos-arm64.tar.gz
+curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.1.0/lwpt-0.1.0-checksums.txt
+shasum -a 256 -c <(grep macos-arm64 lwpt-0.1.0-checksums.txt)
+tar xzf lwpt-0.1.0-macos-arm64.tar.gz
+export PATH="$PWD/lwpt-0.1.0-macos-arm64:$PATH"   # or copy lwpt into ~/bin
 ```
 
-The `lwpt.toml` manifest resolves `httpclient` and `testing` from the
-sibling `../lwpt/packages/` checkout — keep the two clones next to each
-other.
+Then set up the project:
+
+```bash
+git clone https://github.com/frostney/lwws.git && cd lwws
+lwpt install        # resolve deps from the lwpt release tag, write lwpt.cfg
+lefthook install    # pre-commit formatter hook
+```
+
+The `httpclient`, `testing`, and `cli` dependencies resolve from the
+`frostney/lwpt` 0.1.0 release tag with include filters (see `lwpt.toml`);
+no sibling checkout is needed. The committed `.lwpt/modules/` tree plus
+`lwpt.lock` make `lwpt install --frozen` work offline (CI mode).
 
 ## Build and test
 
 ```bash
-../lwpt/build/lwpt build         # all five programs (Linux)
-../lwpt/build/lwpt build wsprobe wsautobahn   # the client-side subset (macOS)
-../lwpt/build/lwpt test          # five suites, all green
-./build/wsinterop                # live-socket battery, exit 0 = pass
+lwpt build           # all five programs (Linux)
+lwpt build wsprobe   # client-side programs on macOS (one target per
+lwpt build wsautobahn  # invocation in lwpt 0.1.0)
+lwpt test            # five suites, all green
+./build/wsinterop    # live-socket battery, exit 0 = pass
 ```
 
 ## Run something

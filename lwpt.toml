@@ -4,15 +4,32 @@
 [package]
 name = "lwws"
 version = "0.1.0"
-units = ["source/units"]
+# The .lwpt module paths are listed explicitly because the include
+# filters below preserve the packages/<name>/ prefix, which keeps each
+# dep's own manifest off the module root where lwpt would read its
+# units array (lwpt 0.1.0 limitation). Dep test files are excluded at
+# fetch time so `lwpt test` (which walks every units dir) only
+# discovers lwws's own suites; [format] likewise excludes .lwpt so the
+# formatter never rewrites fetched modules out from under the lockfile
+# hash.
+units = [
+  "source/units",
+  ".lwpt/modules/httpclient/packages/httpclient/source",
+  ".lwpt/modules/testing/packages/testing/source",
+  ".lwpt/modules/cli/packages/cli/source",
+]
+
+[format]
+exclude = [".lwpt/**"]
 
 [dependencies]
-# lwpt's network layer: HTTPClient + TransportSecurity (TLS) + StringBuffer.
-# Local sibling path in this sandbox; on a dev machine this becomes
-#   httpclient = "frostney/lwpt@^0.1.0" with an include filter,
-# or the standalone repo once the package graduates (ADR-0014 phase 2).
-httpclient = "../lwpt/packages/httpclient"
-testing = "../lwpt/packages/testing"
+# Resolved from the lwpt 0.1.0 release tag via include filters (one
+# filtered fetch per package). httpclient brings HTTPClient +
+# TransportSecurity (TLS) + StringBuffer; cli is the option/parser/help
+# framework the source/apps programs build their flags on.
+httpclient = { source = "frostney/lwpt", version = "^0.1.0", include = ["packages/httpclient/**"], exclude = ["**/*.Test.pas", "**/Tests.*.pas"] }
+testing = { source = "frostney/lwpt", version = "^0.1.0", include = ["packages/testing/**"], exclude = ["**/*.Test.pas"] }
+cli = { source = "frostney/lwpt", version = "^0.1.0", include = ["packages/cli/**"], exclude = ["**/*.Test.pas"] }
 
 [build]
 wsecho    = { source = "source/apps/wsecho.pas",    output = "build/wsecho" }

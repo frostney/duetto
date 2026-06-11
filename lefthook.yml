@@ -7,8 +7,9 @@
 # `lwpt test`, wsinterop, the Autobahn suite — run on the PR / CI
 # workflows (see .github/workflows/) so local commits stay fast.
 #
-# lwpt is expected as a sibling checkout (../lwpt, same assumption as
-# lwpt.toml). Point LWWS_LWPT at another lwpt binary to override.
+# lwpt is expected on PATH (installed from its GitHub release — see
+# docs/quick-start.md). Point LWWS_LWPT at another lwpt binary to
+# override.
 #
 # Do NOT bypass with `git commit --no-verify` unless a maintainer
 # explicitly authorises it on the PR.
@@ -22,10 +23,10 @@ pre-commit:
 
     format:
       glob: "*.{pas,inc,dpr,toml}"
-      run: ${LWWS_LWPT:-../lwpt/build/lwpt} format
+      run: ${LWWS_LWPT:-lwpt} format
       stage_fixed: true
       fail_text: |
         lwpt format failed. Inspect the output above; the formatter only
-        fails when it cannot parse a file. If the lwpt binary is missing
-        entirely (fresh clone), bootstrap the sibling checkout first —
-        see docs/quick-start.md.
+        fails when it cannot parse a file. If lwpt is missing entirely
+        (fresh clone), install the release binary first — see
+        docs/quick-start.md.

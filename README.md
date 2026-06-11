@@ -55,8 +55,8 @@ implementation. Measured numbers against Rust and Python peers live in
 
 ## Contribution
 
-Clone next to a bootstrapped [lwpt](https://github.com/frostney/lwpt)
-checkout, then `lwpt install` + `lwpt test`. See
+Install the [lwpt](https://github.com/frostney/lwpt) release binary,
+then `lwpt install` + `lwpt test`. See
 [docs/quick-start.md](docs/quick-start.md).
 
 ## References

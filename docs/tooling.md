@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-- FPC **3.2.2** (Delphi mode) is the pinned compiler; [lwpt](https://github.com/frostney/lwpt) is the single toolchain entry point for install / build / test / format.
+- FPC **3.2.2** (Delphi mode) is the pinned compiler; the [lwpt](https://github.com/frostney/lwpt) **0.1.0 release binary** is the single toolchain entry point for install / build / test / format.
 - The Autobahn testsuite runs via Docker (`crossbario/autobahn-testsuite`) through `tools/autobahn.sh`, judged by `tools/autobahn-check.py`.
 - Lefthook runs `lwpt format` pre-commit; markdownlint and the PR workflow are the blocking gates.
 - CI: `pr.yml` is the fast Ubuntu pre-merge gate, `ci.yml` (push to main) adds the platform matrix and the Autobahn suite.
@@ -13,7 +13,7 @@
 | Tool | Version / source | Role |
 | --- | --- | --- |
 | FPC | 3.2.2 (apt / brew) | compiler, Delphi mode via `source/units/Shared.inc` |
-| lwpt | sibling `../lwpt` checkout, cold-built with its `bootstrap.sh` | build, test discovery, formatter, dependency install |
+| lwpt | 0.1.0 release binary (checksum-verified tarball, pinned as `LWPT_VERSION` in CI) | build, test discovery, formatter, dependency install |
 | Lefthook | ≥ 1.5 | pre-commit formatter hook (`lefthook install`) |
 | Docker | any recent | Autobahn testsuite container |
 | git-cliff | latest | changelog generation from Conventional Commits |
@@ -22,6 +22,7 @@
 
 ```bash
 lwpt install         # resolve deps, regenerate lwpt.cfg + lwpt.lock
+lwpt install --frozen  # CI mode: verify lockfile + committed modules, refuse network
 lwpt format          # rewrite Pascal sources in place
 lwpt format --check  # CI / hook form: exit non-zero on drift
 lwpt build [target]  # binaries land under build/
@@ -62,8 +63,21 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
   with the client-side subset) plus the full Autobahn suite with report
   artifacts.
 
-Both workflows check out `frostney/lwpt` as a sibling and cold-build the
-lwpt binary; lwws has no committed toolchain binaries.
+Both workflows install the lwpt release binary from a checksum-verified
+tarball (no sibling checkout, no bootstrap) and verify dependencies
+against the committed lockfile via `lwpt install --frozen`; lwws has no
+committed toolchain binaries.
+
+### Dependency layout note (lwpt 0.1.0)
+
+The `httpclient` / `testing` / `cli` deps are fetched from the
+`frostney/lwpt` release tag with `include = ["packages/<name>/**"]`
+filters, which preserve the `packages/<name>/` prefix inside
+`.lwpt/modules/<name>/`. lwpt 0.1.0 only reads a dep's own `units`
+array from a manifest at the module *root*, so `lwpt.toml` lists the
+nested module source dirs in the project's own `units` array, excludes
+dep test files at fetch time (they would otherwise enter `lwpt test`
+discovery), and carves `.lwpt/**` out of the formatter's scope.
 
 ## Markdown
 
