@@ -161,6 +161,7 @@ end;
 // ---------------------------------------------------------------------------
 
 const
+  HelloProbe: RawByteString = 'hello duetto';
   PipelinedMsgs: array[0..2] of RawByteString = ('one', 'two', 'three');
 
 var
@@ -191,9 +192,10 @@ begin
   // --- duetto client vs duetto server ---------------------------------------
   Cli := TWSClient.Create;
   Cli.Connect(Url);
-  Cli.SendText('hello duetto');
+  Cli.SendText(HelloProbe);
   Check(Cli.ReadMessage(IsText, Data) and IsText and
-    (Length(Data) = 10) and CompareMem(@Data[0], PAnsiChar('hello duetto'), 10),
+    (Length(Data) = Length(HelloProbe)) and
+    CompareMem(@Data[0], @HelloProbe[1], Length(HelloProbe)),
     'text echo round-trip');
 
   SetLength(Big, 1024 * 1024);
