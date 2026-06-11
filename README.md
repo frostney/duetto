@@ -1,75 +1,65 @@
-# lwws — lightweight WebSocket for Pascal
+# lwws
 
-RFC 6455 (v13) + RFC 7692 permessage-deflate in FreePascal, built and tested
-with [lwpt](https://github.com/frostney/lwpt). ~2,700 lines for the whole
-library: frame codec, incremental UTF-8, opening handshake, deflate,
-a sans-I/O connection state machine, a blocking client, and a
-single-threaded epoll server.
+Lightweight WebSocket for Pascal: RFC 6455 (v13) + RFC 7692
+permessage-deflate in FreePascal, built and tested with
+[lwpt](https://github.com/frostney/lwpt). A sans-I/O protocol core behind a
+blocking client and a single-threaded epoll server, validated by unit
+suites, a live-socket battery, and the Autobahn testsuite. See
+[docs/architecture.md](docs/architecture.md).
 
-## Design
+## Install
 
-The heart is `WS.Protocol` — a **sans-I/O state machine** (one per
-connection, either role). The owner feeds raw socket bytes into `Ingest`
-and writes whatever `OutPtr`/`OutPending` holds back to the socket; the
-machine never touches a file descriptor. Every RFC 6455 rule —
-fragmentation, mask-direction policing, control-frame interleave,
-fail-fast streaming UTF-8, close-code validation, RSV bits, deflate —
-lives in that one testable place, so the same machine sits behind the
-blocking client, the epoll server, and the in-process benchmark unchanged.
-
-`Ingest` mutates its buffer (in-place unmask) and returns `False` exactly
-once on protocol failure, after queueing the appropriate close frame
-(1002 / 1007 / 1009): flush, then drop TCP.
-
-Layers, bottom-up:
-
-| Unit | Role |
-|------|------|
-| `WS.Frame` | header parse/encode, strict minimal-length rules; masking via byte loop / UInt64 / SSE2 |
-| `WS.Utf8` | Höhrmann DFA with an 8-byte-word ASCII fast path; resumable across fragments |
-| `WS.Handshake` | upgrade request/response both directions, `Sec-WebSocket-Accept`, deflate parameter negotiation |
-| `WS.Deflate` | RFC 7692 over paszlib: raw deflate, sync flush, 4-byte tail, context takeover control, inflate output cap |
-| `WS.Protocol` | the sans-I/O machine above |
-| `WS.Client` | blocking client, `ws://` and `wss://` (TLS via lwpt's TransportSecurity) |
-| `WS.Server` | Linux epoll reactor: nonblocking sockets, one shared 256 KB read buffer, `EPOLLOUT` armed only while a connection has backlog |
-
-## Programs
-
-```
-lwpt install              # resolve deps (expects lwpt as a sibling checkout; see lwpt.toml)
-lwpt test                 # five suites, all green
-lwpt build --mode release
-build/wsecho [--port=N] [--no-deflate] [--quiet]   # echo server
-build/wsprobe ws://host:port/ [--deflate]          # client probe vs any server
-build/wsinterop                                    # live-socket battery, exit 0 = pass
-build/wsbench                                      # component benchmarks
+```toml
+lwws = "frostney/lwws@^0.1.0"   # in lwpt.toml [dependencies]
 ```
 
-## Validation
+## Usage
 
-`lwpt test` runs five suites: RFC §5.7 frame vectors and strictness, an
-exhaustive 16.8M-case UTF-8 differential, handshake acceptance/rejection
-matrices, deflate round-trips with takeover and bomb-cap checks, and a
-26-test protocol conformance suite asserting *wire* close codes for the
-violation matrix in both roles.
+Client, anywhere POSIX:
 
-On top of that: `wsinterop` (own client ↔ own server over TCP, plus
-raw-socket violations: unmasked frame → 1002, invalid close code → 1002,
-fragmented ping → 1002, invalid UTF-8 → 1007) and
-`tools/crosscheck.py`, which validates against the Python `websockets`
-reference library in **both directions** — including fragmentation
-reassembly and permessage-deflate — plus four more crafted violations.
-The client also passes against a Rust `tungstenite` server.
+```pascal
+uses WS.Client;
 
-The Autobahn fuzzing suite was not run (Python 2 only); the conformance
-suite and raw-socket batteries mirror its core cases.
+Cli := TWSClient.Create;
+Cli.Connect('wss://example.org/feed', { offer deflate } True);
+Cli.SendText('hello');
+while Cli.ReadMessage(IsText, Data) do
+  Handle(IsText, Data);
+Cli.Close(1000);
+```
 
-## Numbers
+Echo server (Linux, epoll) and probe, from the shipped programs:
 
-See [COMPARISON.md](COMPARISON.md) for measured benchmarks against
-tungstenite (Rust) and `websockets` (Python), plus an architectural
-comparison with tokio-websockets, fastwebsockets, websocket.zig, and
-uWebSockets. Headline, on one shared 2.8 GHz core: 2.35 M full protocol
-round-trips/s at 64 B in-process (2.72 GB/s full-duplex at 256 KiB via
-streaming ingest); 3.1 µs opening handshakes; 154 k echo msg/s under
-uWebSockets `load_test` — 1.4× the tungstenite baseline on the same box.
+```bash
+lwpt build
+./build/wsecho --port=9001                       # echo server
+./build/wsprobe ws://localhost:9001/ --deflate   # client probe vs any server
+```
+
+For the full program set (`wsinterop`, `wsbench`, `wsautobahn`) and every
+development command, see [docs/quick-start.md](docs/quick-start.md) and
+[docs/tooling.md](docs/tooling.md).
+
+## Background
+
+Every RFC 6455 rule — fragmentation, mask-direction policing, control-frame
+interleave, fail-fast streaming UTF-8, close-code validation, RSV bits,
+deflate — lives in one sans-I/O state machine (`WS.Protocol`), so the same
+testable core sits behind the client, the server, and the benchmarks
+unchanged. Conformance is enforced four ways: co-located unit suites
+(including a 16.8M-case UTF-8 differential), the `wsinterop` live-socket
+battery, the [Autobahn testsuite](docs/tooling.md#autobahn-testsuite) in
+both directions, and cross-checks against the Python `websockets` reference
+implementation. Measured numbers against Rust and Python peers live in
+[docs/comparison.md](docs/comparison.md).
+
+## Contribution
+
+Clone next to a bootstrapped [lwpt](https://github.com/frostney/lwpt)
+checkout, then `lwpt install` + `lwpt test`. See
+[docs/quick-start.md](docs/quick-start.md).
+
+## References
+
+- [Agent instructions](AGENTS.md)
+- [License](LICENSE) (MIT)
