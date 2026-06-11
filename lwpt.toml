@@ -4,7 +4,7 @@
 [package]
 name = "lwws"
 version = "0.1.0"
-units = ["source"]
+units = ["source/units"]
 
 [dependencies]
 # lwpt's network layer: HTTPClient + TransportSecurity (TLS) + StringBuffer.
@@ -15,7 +15,7 @@ httpclient = "../lwpt/packages/httpclient"
 testing = "../lwpt/packages/testing"
 
 [build]
-wsecho    = { source = "src/wsecho.pas",    output = "build/wsecho" }
-wsbench   = { source = "src/wsbench.pas",   output = "build/wsbench" }
-wsinterop = { source = "src/wsinterop.pas", output = "build/wsinterop" }
-wsprobe   = { source = "src/wsprobe.pas",   output = "build/wsprobe" }
+wsecho    = { source = "source/apps/wsecho.pas",    output = "build/wsecho" }
+wsbench   = { source = "source/apps/wsbench.pas",   output = "build/wsbench" }
+wsinterop = { source = "source/apps/wsinterop.pas", output = "build/wsinterop" }
+wsprobe   = { source = "source/apps/wsprobe.pas",   output = "build/wsprobe" }
