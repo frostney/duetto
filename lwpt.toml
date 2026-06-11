@@ -1,15 +1,15 @@
-# lwws — lightweight WebSocket for Pascal (RFC 6455 + RFC 7692)
+# duetto — lightweight WebSocket for Pascal (RFC 6455 + RFC 7692)
 # Bootstrapped with `lwpt init`; built/tested/formatted via lwpt.
 
 [package]
-name = "lwws"
+name = "duetto"
 version = "0.1.0"
 # The .lwpt module paths are listed explicitly because the include
 # filters below preserve the packages/<name>/ prefix, which keeps each
 # dep's own manifest off the module root where lwpt would read its
 # units array (lwpt 0.1.0 limitation). Dep test files are excluded at
 # fetch time so `lwpt test` (which walks every units dir) only
-# discovers lwws's own suites; [format] likewise excludes .lwpt so the
+# discovers duetto's own suites; [format] likewise excludes .lwpt so the
 # formatter never rewrites fetched modules out from under the lockfile
 # hash.
 units = [

@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-- lwws implements RFC 6455 (WebSocket v13) and RFC 7692 (permessage-deflate) in ~2,700 lines of FreePascal.
+- duetto implements RFC 6455 (WebSocket v13) and RFC 7692 (permessage-deflate) in ~2,700 lines of FreePascal.
 - The heart is `WS.Protocol`, a **sans-I/O state machine** — one instance per connection, either role — that never touches a file descriptor.
 - Every RFC rule lives in that one testable place; the blocking client, the epoll server, and the in-process benchmark all sit behind the same machine unchanged.
 - Layers are strictly bottom-up: frame codec → UTF-8 → handshake → deflate → protocol machine → client / server.

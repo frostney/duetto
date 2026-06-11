@@ -1,6 +1,6 @@
 program wsecho;
 
-// RFC 6455 echo server on lwws — the standard benchmark/conformance
+// RFC 6455 echo server on duetto — the standard benchmark/conformance
 // target shape (same contract as the Autobahn fuzzingclient peer and the
 // uWebSockets load_test server: echo every data message verbatim).
 //

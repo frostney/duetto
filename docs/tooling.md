@@ -46,9 +46,9 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
 - Configs live in `tests/autobahn/*.json`; reports land in
   `tests/autobahn/reports/` (gitignored; uploaded as a CI artifact).
 - The server direction tests two `wsecho` instances: with deflate
-  (agent `lwws`) and without (agent `lwws-nodeflate`).
-- The client direction runs `wsautobahn` twice: agent `lwws` and agent
-  `lwws-deflate` (permessage-deflate offered).
+  (agent `duetto`) and without (agent `duetto-nodeflate`).
+- The client direction runs `wsautobahn` twice: agent `duetto` and agent
+  `duetto-deflate` (permessage-deflate offered).
 - `tools/autobahn-check.py` judges `index.json`: `behavior` must be
   OK / NON-STRICT / INFORMATIONAL / UNIMPLEMENTED and `behaviorClose`
   OK / INFORMATIONAL / UNIMPLEMENTED; anything else fails the run.
@@ -65,7 +65,7 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
 
 Both workflows install the lwpt release binary from a checksum-verified
 tarball (no sibling checkout, no bootstrap) and verify dependencies
-against the committed lockfile via `lwpt install --frozen`; lwws has no
+against the committed lockfile via `lwpt install --frozen`; duetto has no
 committed toolchain binaries.
 
 ### Dependency layout note (lwpt 0.1.0)

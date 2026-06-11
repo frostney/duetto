@@ -23,7 +23,7 @@ export PATH="$PWD/lwpt-0.1.0-macos-arm64:$PATH"   # or copy lwpt into ~/bin
 Then set up the project:
 
 ```bash
-git clone https://github.com/frostney/lwws.git && cd lwws
+git clone https://github.com/frostney/duetto.git && cd duetto
 lwpt install        # resolve deps from the lwpt release tag, write lwpt.cfg
 lefthook install    # pre-commit formatter hook
 ```

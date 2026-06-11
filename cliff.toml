@@ -1,6 +1,6 @@
-# git-cliff configuration for lwws's CHANGELOG.md.
+# git-cliff configuration for duetto's CHANGELOG.md.
 #
-# lwws uses Conventional Commits from the first commit, so unlike lwpt's
+# duetto uses Conventional Commits from the first commit, so unlike lwpt's
 # verb-binning parsers this config maps commit types directly to
 # changelog sections. Preview locally with:
 #
@@ -11,7 +11,7 @@
 header = """
 # Changelog
 
-All notable changes to lwws are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); entries are generated from Conventional Commits by git-cliff.
+All notable changes to duetto are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); entries are generated from Conventional Commits by git-cliff.
 """
 body = """
 {% if version -%}

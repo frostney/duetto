@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the Autobahn testsuite (crossbario/autobahn-testsuite via Docker)
-# against lwws and judge the result with tools/autobahn-check.py.
+# against duetto and judge the result with tools/autobahn-check.py.
 #
 #   tools/autobahn.sh client   # fuzzingserver in Docker tests build/wsautobahn
 #   tools/autobahn.sh server   # fuzzingclient in Docker tests build/wsecho
@@ -45,8 +45,8 @@ run_client_suite() {
   trap 'docker stop "$CONTAINER" >/dev/null 2>&1 || true' EXIT
   wait_for_port 9001
 
-  "$ROOT/build/wsautobahn" --agent=lwws
-  "$ROOT/build/wsautobahn" --agent=lwws-deflate --deflate
+  "$ROOT/build/wsautobahn" --agent=duetto
+  "$ROOT/build/wsautobahn" --agent=duetto-deflate --deflate
 
   docker stop "$CONTAINER" >/dev/null
   trap - EXIT

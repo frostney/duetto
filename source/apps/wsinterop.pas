@@ -1,6 +1,6 @@
 program wsinterop;
 
-// Live-socket battery: lwws TWSClient against lwws TWSServer over real
+// Live-socket battery: duetto TWSClient against duetto TWSServer over real
 // TCP (loopback), plus a raw-socket section that injects protocol
 // violations a conforming client cannot produce and asserts the close
 // codes RFC 6455 (and Autobahn cases 4.x/7.x) require.
@@ -188,12 +188,12 @@ begin
   SrvT.Start;
   WriteLn('server on ', Port);
 
-  // --- lwws client vs lwws server ---------------------------------------
+  // --- duetto client vs duetto server ---------------------------------------
   Cli := TWSClient.Create;
   Cli.Connect(Url);
-  Cli.SendText('hello lwws');
+  Cli.SendText('hello duetto');
   Check(Cli.ReadMessage(IsText, Data) and IsText and
-    (Length(Data) = 10) and CompareMem(@Data[0], PAnsiChar('hello lwws'), 10),
+    (Length(Data) = 10) and CompareMem(@Data[0], PAnsiChar('hello duetto'), 10),
     'text echo round-trip');
 
   SetLength(Big, 1024 * 1024);

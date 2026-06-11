@@ -1,6 +1,6 @@
 program wsprobe;
 
-// Point the lwws client at any echo endpoint and verify the essentials:
+// Point the duetto client at any echo endpoint and verify the essentials:
 //
 //   wsprobe ws://host:port/ [--deflate]
 //

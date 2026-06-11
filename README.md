@@ -1,6 +1,7 @@
-# lwws
+# duetto
 
-Lightweight WebSocket for Pascal: RFC 6455 (v13) + RFC 7692
+WebSocket for Pascal — *duetto*, Italian for duet: both sides talking at
+once over one full-duplex connection. RFC 6455 (v13) + RFC 7692
 permessage-deflate in FreePascal, built and tested with
 [lwpt](https://github.com/frostney/lwpt). A sans-I/O protocol core behind a
 blocking client and a single-threaded epoll server, validated by unit
@@ -10,7 +11,7 @@ suites, a live-socket battery, and the Autobahn testsuite. See
 ## Install
 
 ```toml
-lwws = "frostney/lwws@^0.1.0"   # in lwpt.toml [dependencies]
+duetto = "frostney/duetto@^0.1.0"   # in lwpt.toml [dependencies]
 ```
 
 ## Usage

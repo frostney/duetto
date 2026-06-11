@@ -1,6 +1,6 @@
 unit WS.Protocol;
 
-// Sans-I/O RFC 6455 connection state machine — the heart of lwws.
+// Sans-I/O RFC 6455 connection state machine — the heart of duetto.
 //
 // One TWSProtocol per connection, either role. The owner feeds raw socket
 // bytes into Ingest and writes whatever OutPtr/OutPending holds back to the

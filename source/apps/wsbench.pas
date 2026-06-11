@@ -1,6 +1,6 @@
 program wsbench;
 
-// Component benchmarks for every lwws layer, bottom-up:
+// Component benchmarks for every duetto layer, bottom-up:
 //
 //   masking      — naive byte loop vs UInt64 XOR vs SSE2 (GB/s)
 //   frame parse  — ParseFrameHeader over a packed stream (frames/s)
@@ -309,7 +309,7 @@ end;
 
 begin
   T0 := Now;
-  WriteLn('lwws component bench  (FPC ', {$I %FPCVERSION%}, ', -O2, x86_64)');
+  WriteLn('duetto component bench  (FPC ', {$I %FPCVERSION%}, ', -O2, x86_64)');
   WriteLn;
   BenchMasking; WriteLn;
   BenchFrameParse; WriteLn;

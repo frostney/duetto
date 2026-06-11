@@ -4,9 +4,9 @@
 # identical for every contender, so relative numbers are meaningful.
 set -u
 LT=/home/claude/uWebSockets/benchmarks/load_test
-LWWS=/home/claude/lwws/build/wsecho
+DUETTO=/home/claude/duetto/build/wsecho
 RUST=/home/claude/rust-echo/target/release/rust-echo
-PY=/home/claude/lwws/tools/pyecho.py
+PY=/home/claude/duetto/tools/pyecho.py
 DUR=${DUR:-14}
 
 run_one() { # name start_cmd port deflate payload
@@ -26,12 +26,12 @@ run_one() { # name start_cmd port deflate payload
 
 echo "== plain echo, 100 connections, ${DUR}s each =="
 for size in 20 1024 16384; do
-  run_one lwws       "$LWWS --port=9201 --quiet --no-deflate" 9201 0 "$size"
+  run_one duetto       "$DUETTO --port=9201 --quiet --no-deflate" 9201 0 "$size"
   run_one tungstenite "$RUST 9202"                            9202 0 "$size"
   run_one py-websockets "python3 $PY 9203"                    9203 0 "$size"
   echo
 done
 
 echo "== permessage-deflate, 100 connections, 4096 B =="
-run_one lwws         "$LWWS --port=9211 --quiet" 9211 1 4096
+run_one duetto         "$DUETTO --port=9211 --quiet" 9211 1 4096
 run_one py-websockets "python3 $PY 9213 deflate" 9213 1 4096

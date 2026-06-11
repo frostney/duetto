@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Cross-implementation check: lwws vs the `websockets` reference library.
+"""Cross-implementation check: duetto vs the `websockets` reference library.
 
-Direction 1: python client -> lwws wsecho server
-Direction 2: lwws wsprobe client -> python echo server
+Direction 1: python client -> duetto wsecho server
+Direction 2: duetto wsprobe client -> python echo server
 
 Plus raw-socket pokes at wsecho that a conforming client can't emit,
 asserting RFC 6455 close codes from an independent codebase.
@@ -26,35 +26,35 @@ async def client_vs_wsecho(port):
 
     async with websockets.connect(uri) as ws:
         await ws.send("hello from python")
-        check(await ws.recv() == "hello from python", "py->lwws text echo")
+        check(await ws.recv() == "hello from python", "py->duetto text echo")
 
         msg = "ünïcødé 中文 🚀 " * 100
         await ws.send(msg)
-        check(await ws.recv() == msg, "py->lwws multibyte text echo")
+        check(await ws.recv() == msg, "py->duetto multibyte text echo")
 
         blob = bytes((i * 13 + 7) & 0xFF for i in range(512 * 1024))
         await ws.send(blob)
-        check(await ws.recv() == blob, "py->lwws binary 512 KiB echo")
+        check(await ws.recv() == blob, "py->duetto binary 512 KiB echo")
 
         # fragmented message: websockets sends an iterable as fragments
         await ws.send(["frag-one ", "frag-two ", "frag-three"])
         check(await ws.recv() == "frag-one frag-two frag-three",
-              "py->lwws fragmented text reassembled")
+              "py->duetto fragmented text reassembled")
 
         pong = await ws.ping("heartbeat")
         await asyncio.wait_for(pong, 5)
-        check(True, "py->lwws ping answered")
+        check(True, "py->duetto ping answered")
 
     # context exit performed the closing handshake; reconnect to verify codes
     async with websockets.connect(uri) as ws:
         await ws.close(code=1000, reason="bye")
-    check(True, "py->lwws clean close handshake")
+    check(True, "py->duetto clean close handshake")
 
     # permessage-deflate (websockets enables it by default)
     async with websockets.connect(uri) as ws:
         big = "compress me please! " * 20000
         await ws.send(big)
-        check(await ws.recv() == big, "py->lwws deflate 400 KB echo")
+        check(await ws.recv() == big, "py->duetto deflate 400 KB echo")
 
 # --------------------------------------------------- raw violations, direction 1
 def raw_handshake(port):
@@ -119,7 +119,7 @@ async def wsprobe_vs_python_server():
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             out, _ = await asyncio.wait_for(proc.communicate(), 30)
             sys.stdout.write(out.decode())
-            check(proc.returncode == 0, f"lwws client vs python server ({label})")
+            check(proc.returncode == 0, f"duetto client vs python server ({label})")
 
 async def main():
     server = subprocess.Popen([WSECHO, "--port=0", "--quiet"],

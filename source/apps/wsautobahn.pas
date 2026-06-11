@@ -2,7 +2,7 @@ program wsautobahn;
 
 // Autobahn testsuite client driver — the peer for `wstest -m fuzzingserver`.
 //
-//   wsautobahn [--server=ws://127.0.0.1:9001] [--agent=lwws] [--deflate]
+//   wsautobahn [--server=ws://127.0.0.1:9001] [--agent=duetto] [--deflate]
 //
 // Speaks the fuzzingserver control protocol: fetch the case count from
 // /getCaseCount, run every case via /runCase?case=N&agent=A (echo each
@@ -149,7 +149,7 @@ begin
   ServerOpt := TStringOption.Create('server',
     'Fuzzingserver control endpoint (default ws://127.0.0.1:9001)');
   AgentOpt := TStringOption.Create('agent',
-    'Agent name recorded in the suite report (default lwws)');
+    'Agent name recorded in the suite report (default duetto)');
   DeflateOpt := TFlagOption.Create('deflate',
     'Offer permessage-deflate on every case connection');
   HelpOpt := TFlagOption.Create('help', 'Show this help and exit');
@@ -174,7 +174,7 @@ begin
     end;
   end;
   Server := ServerOpt.ValueOr('ws://127.0.0.1:9001');
-  Agent := AgentOpt.ValueOr('lwws');
+  Agent := AgentOpt.ValueOr('duetto');
   Deflate := DeflateOpt.Present;
   Positionals.Free;
   for I := 0 to High(Options) do

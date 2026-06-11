@@ -1,4 +1,4 @@
-# lwws pre-commit hook.
+# duetto pre-commit hook.
 #
 # Install once per fresh clone:  lefthook install
 #
@@ -8,7 +8,7 @@
 # workflows (see .github/workflows/) so local commits stay fast.
 #
 # lwpt is expected on PATH (installed from its GitHub release — see
-# docs/quick-start.md). Point LWWS_LWPT at another lwpt binary to
+# docs/quick-start.md). Point DUETTO_LWPT at another lwpt binary to
 # override.
 #
 # Do NOT bypass with `git commit --no-verify` unless a maintainer
@@ -23,7 +23,7 @@ pre-commit:
 
     format:
       glob: "*.{pas,inc,dpr,toml}"
-      run: ${LWWS_LWPT:-lwpt} format
+      run: ${DUETTO_LWPT:-lwpt} format
       stage_fixed: true
       fail_text: |
         lwpt format failed. Inspect the output above; the formatter only
