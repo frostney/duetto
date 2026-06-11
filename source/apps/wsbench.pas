@@ -56,11 +56,14 @@ begin
   GBs := SIZE / (1024.0 * 1024 * 1024) * REPS / Secs;
   WriteLn(Format('uint64  : %8.2f GB/s', [GBs]));
 
+  // UnmaskSSE2 only exists where WS.Frame compiles it (x86_64 Linux).
+  {$if defined(CPUX86_64) and defined(LINUX)}
   T := Now64;
   for R := 1 to REPS do UnmaskSSE2(PByte(Buf), SIZE, $12345678);
   Secs := (Now64 - T) / 1e6;
   GBs := SIZE / (1024.0 * 1024 * 1024) * REPS / Secs;
   WriteLn(Format('sse2    : %8.2f GB/s', [GBs]));
+  {$endif}
 
   // keep the work observable
   Sum := 0;
