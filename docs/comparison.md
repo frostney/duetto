@@ -125,9 +125,10 @@ ahead. The server-side deflate ceiling is the component number above.
   deflate — plus four more raw violations (reserved opcode, oversize
   control, unnegotiated RSV1) answered with the right codes. duetto client
   also passes 5/5 against a tungstenite server.
-- Not run: Autobahn (Python 2 only). The batteries above mirror its core
-  cases; a full ~500-case run is the obvious next validation step on a
-  dev machine.
+- Autobahn testsuite (added after the measurement date above): the full
+  ~500-case suite runs in CI on every push to main, in both directions —
+  fuzzingclient vs `wsecho` (with and without deflate) and fuzzingserver
+  vs `wsautobahn` — judged strictly by `tools/autobahn-check.py`. Green.
 
 ## Analytical comparison (not run locally — documentation and published numbers)
 
@@ -158,8 +159,8 @@ slowest of six by a wide margin, which matches the 7× gap measured here.
 
 Multi-core hardware (separate generator and server boxes, or at minimum
 pinned cores), p50/p99 latency rather than throughput alone, RSS at 10 k
-idle connections, a full Autobahn run, TLS (`wss://`) throughput, and a
-tokio-websockets build on a current toolchain as the proper Rust peer.
+idle connections, TLS (`wss://`) throughput, and a tokio-websockets
+build on a current toolchain as the proper Rust peer.
 On the library side the remaining copies at large sizes are send-path
 `OutAppend` and the assembly append — vectored I/O (`writev` of header +
 caller payload) would remove the former for unmasked server sends.
