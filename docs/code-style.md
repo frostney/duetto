@@ -35,6 +35,15 @@ Changing a project-wide flag means editing the include, not every file.
 - No magic literals — extract named constants, in `interface` when shared.
 - Performance-sensitive small routines are marked `inline`.
 
+## RTL policy
+
+duetto aims to rival C and Rust implementations; on hot paths, prefer
+direct OS APIs (syscalls, WinSock2, kqueue/epoll/IOCP) and hand-rolled
+primitives over RTL/FCL conveniences whenever measurement shows the RTL
+costs — the inlined base64 and stack-buffer handshake builders (see
+`docs/comparison.md`) set the precedent. RTL use is fine off the hot
+path; replacing it is justified by a `wsbench` number, not by taste.
+
 ## Formatter
 
 `lwpt format` rewrites sources in place (uses-clause grouping, identifier

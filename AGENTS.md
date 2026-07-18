@@ -27,6 +27,10 @@
 - **`WS.Protocol` owns all RFC 6455 rules.** Protocol behaviour (close
   codes, fragmentation, masking policy, UTF-8 failure) must not leak into
   the client, the server, or the apps.
+- **Hot paths avoid the RTL/FCL.** Performance rivals C/Rust by design:
+  prefer direct OS APIs and hand-rolled primitives on hot paths when a
+  `wsbench` measurement justifies it — see the RTL policy in
+  [docs/code-style.md](docs/code-style.md).
 
 ## Runtime / Commands
 
