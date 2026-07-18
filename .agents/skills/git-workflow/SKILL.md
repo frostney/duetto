@@ -1,12 +1,9 @@
 ---
 name: git-workflow
 description: >-
-  Default git workflow for the user's repositories: feature branches off the
-  remote default branch, merge (never rebase) to take baseline updates, plain
-  pushes (no --force or --force-with-lease), always-new commits (no amend), and
-  squash-merge for all pull requests. Use when running any git action —
-  branching, syncing, conflict resolution, committing, pushing, or merging — on
-  the user's repos.
+  Applies the user's git defaults: branch from the remote default, merge rather
+  than rebase, never amend or force-push, and squash-merge pull requests. Use
+  when branching, syncing, committing, pushing, or merging in the user's repos.
 license: Unlicense OR MIT
 compatibility: >-
   Requires git; pull-request operations also require the GitHub CLI (gh) and
@@ -51,6 +48,8 @@ Resolve any conflicts and commit the merge before continuing. Do not `git rebase
 ### Commits
 
 - Each logical change is its own commit. Use a HEREDOC for multi-line messages so formatting is preserved.
+- Always use Conventional Commit subjects: `type(scope): summary`, with type from `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, or `revert`. Pick the narrowest accurate scope; omit the scope only when no meaningful scope exists.
+- Write the subject in imperative mood, lowercase after the type/scope, no trailing period, and keep it concise. Use the body for rationale or verification details when helpful.
 - Do not amend. If a commit needs a fix-up, add a new commit.
 - Do not skip hooks (`--no-verify`) unless the user explicitly asks.
 

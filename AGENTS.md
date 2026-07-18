@@ -10,11 +10,10 @@
   builds) and do not invoke `fpc` directly except as `fpc @lwpt.cfg`.
 - **`lwpt.cfg` and `lwpt.lock` are generated** by `lwpt install`; never
   hand-edit them. `lwpt.toml` is the manifest you edit.
-- **The `units` array in `lwpt.toml` deliberately lists the `.lwpt`
-  module source dirs** (lwpt 0.1.0 doesn't discover unit subdirs behind
-  include-filtered deps — see the manifest comment). Do not "clean up"
-  those entries, and keep `[format] exclude = [".lwpt/**"]` so the
-  formatter never rewrites fetched modules.
+- **The `units` array in `lwpt.toml` lists only `source/units`** —
+  lwpt 0.2.0 discovers dep units through nested manifests. Keep
+  `[format] exclude = [".lwpt/**"]` so the formatter never rewrites
+  fetched modules.
 - **Programs parse flags via lwpt's `cli` package** (`CLI.Options`,
   `CLI.Parser`, `CLI.Help`) — no hand-rolled `ParamStr` loops in
   `source/apps/`.
@@ -28,6 +27,10 @@
 - **`WS.Protocol` owns all RFC 6455 rules.** Protocol behaviour (close
   codes, fragmentation, masking policy, UTF-8 failure) must not leak into
   the client, the server, or the apps.
+- **Hot paths avoid the RTL/FCL.** Performance rivals C/Rust by design:
+  prefer direct OS APIs and hand-rolled primitives on hot paths when a
+  `wsbench` measurement justifies it — see the RTL policy in
+  [docs/code-style.md](docs/code-style.md).
 
 ## Runtime / Commands
 

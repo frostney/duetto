@@ -1,19 +1,10 @@
 ---
 name: project-structure
 description: >-
-  Language-agnostic repo structure conventions used across the user's projects
-  in any language — the user-facing README.md structure (name, logo,
-  description, install, usage, optional background, contribution, references),
-  the docs/ template (application, architecture, code-style,
-  quick-start, tooling, deployment), the AGENTS.md template with a Hard
-  Constraints section (symlinked to CLAUDE.md), nested area AGENTS.md for
-  multi-area repos, optional CONTRIBUTING.md, the pre-commit hook contract
-  with Lefthook as the default and explicit alternatives, scripts directory in
-  the project's own language, co-located tests, the .agents/skills folder
-  symlinked to .claude/skills, and changelog generation with git-cliff.
-  Stack-specific tools (test runners, linters, generators) live in the
-  matching stack skill. Use when scaffolding or restructuring any repo,
-  writing AGENTS.md or docs, or laying out folders.
+  Applies the user's language-agnostic repository layout, documentation,
+  governance, hook, test, agent-file, and changelog conventions. Use when
+  scaffolding or restructuring a repo, writing AGENTS.md or docs, or laying out
+  folders.
 license: Unlicense OR MIT
 ---
 
@@ -31,6 +22,9 @@ A repo on this style has these **roles** at the root, named with whatever conven
 | --- | --- | --- |
 | **Agent context** | Operating manual for AI assistants. Symlinked across agent filenames. | `AGENTS.md` ↔ `CLAUDE.md` |
 | **Contribution rules** | Authoritative rules for human contributors. Optional. | `CONTRIBUTING.md` |
+| **Product / technical vision** | The durable direction: what the project is for and what it explicitly is not. | `VISION.md` |
+| **Definition of Ready** | The bar an idea/issue must clear before implementation may start. | `DEFINITION_OF_READY.md` |
+| **Definition of Done** | The bar a change must clear before it is shippable. | `DEFINITION_OF_DONE.md` |
 | **Project intro** | What the project is and how to run it. | `README.md` |
 | **Build / package manifest** | Dependency declaration. | `package.json`, `Cargo.toml`, `Gemfile`, `pyproject.toml`, `*.cabal`, `*.dpr` / `*.lpi`, etc. |
 | **Lockfile** | One canonical lockfile for the project's PM. | Whatever the PM produces; forbid all others. |
@@ -64,6 +58,20 @@ Rules:
 - Respect the character caps on sections 3, 4, and 7. When the content doesn't fit, link out instead of overflowing.
 - Optional sections (logo, background) are omitted cleanly when they don't apply; do not emit an empty heading.
 - Markdown linting and the link check (below) apply to `README.md` like any other committed markdown.
+
+### `VISION.md`, `DEFINITION_OF_READY.md`, `DEFINITION_OF_DONE.md`
+
+Every project on this style ships three root-level governance files. They are **canonical**: tooling and skills (e.g. `/implement-idea`, `/implement-issue`) read them as the source of truth for direction, readiness, and completion, and **flag their absence rather than inventing a substitute**.
+
+- **`VISION.md`** — the durable product and technical vision: what the project is for, who it serves, and what it explicitly is *not*. Work that conflicts with it is surfaced before implementation rather than silently built.
+- **`DEFINITION_OF_READY.md`** — the bar an idea or issue must clear before implementation may start (clear scope, outcome, success/acceptance criteria, constraints, dependencies resolved). Every applicable item is a hard gate before any code is written.
+- **`DEFINITION_OF_DONE.md`** — the bar a change must clear before it is shippable (implementation, tests, documentation, a green verification gate, review evidence, handoff artifacts). Every applicable item is a hard gate before handoff.
+
+Rules:
+
+- Keep each at the repo root. In multi-area repos an area may add its own; the nearest/most specific file wins for that area.
+- These are governance docs, not duplicates of `AGENTS.md` or `CONTRIBUTING.md` — link rather than restate.
+- They are subject to markdown linting and the link check like any other committed markdown.
 
 ### Tests
 
@@ -210,6 +218,8 @@ Generate the changelog from conventional commits with **git-cliff**.
 - Adopt conventional commit messages so types map cleanly to changelog sections (`feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `perf`, `build`, `ci`, `style`, `revert`).
 - Verify the current `git-cliff` version before running.
 - `git-cliff --tag <new-tag>` produces the release notes; do not hand-edit them. If wording is wrong, edit the conventional commit and regenerate.
+- Configure `commit_parsers` to skip the `chore(release)` commit so the release commit itself never appears in a later changelog.
+- This section owns the `cliff.toml` configuration only. The end-to-end release flow — compute version → changelog → release PR → tag the merge commit → publish — lives in `create-release`, which keeps the changelog committed *before* the tag so the release always contains it.
 
 git-cliff is the default because it is language-agnostic, single-binary, reads commit history directly, and uses one declarative config file. **Alternatives are only acceptable when git-cliff cannot meet a specific need:**
 
