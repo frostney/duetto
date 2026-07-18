@@ -31,8 +31,7 @@ name: CI
 # verified per-platform tarball, no sibling checkout, no bootstrap);
 # dependencies resolve from the same release tag and are verified
 # against the committed lockfile + .lwpt/modules tree via
-# install --frozen. lwpt 0.1.0 builds one named target per invocation,
-# hence the repeated build steps on the macOS legs.
+# install --frozen.
 
 on:
   push:
@@ -44,7 +43,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.1.0"
+  LWPT_VERSION: "0.2.0"
 
 jobs:
   test:
@@ -116,9 +115,7 @@ jobs:
 
       - name: lwpt build (client-side programs — macOS, no epoll server)
         if: matrix.server-apps != true
-        run: |
-          lwpt build wsprobe
-          lwpt build wsautobahn
+        run: lwpt build wsprobe wsautobahn
 
       - name: lwpt test (five co-located unit suites)
         run: lwpt test

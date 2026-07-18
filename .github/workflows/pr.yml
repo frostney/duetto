@@ -30,7 +30,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.1.0"
+  LWPT_VERSION: "0.2.0"
 
 jobs:
   build-and-test:
