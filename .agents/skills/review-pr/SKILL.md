@@ -1,11 +1,8 @@
 ---
 name: review-pr
 description: >-
-  Resolves outstanding review comments on the current pull request by replying
-  in-thread and pushing fixes in any GitHub repository, without leaving new
-  top-level PR or issue comments. Prefers the /resolve-reviews skill when it is
-  available and falls back to a standalone workflow otherwise. Use when the
-  user runs /review-pr.
+  Resolves current pull-request review threads in place, validates and pushes
+  fixes, and avoids new top-level comments. Use when the user runs /review-pr.
 license: Unlicense OR MIT
 compatibility: >-
   Requires the GitHub CLI (gh) authenticated to the target repository and
@@ -36,6 +33,13 @@ To check availability, look for a skill or command named `resolve-reviews` (e.g.
 - Run relevant verification before committing fixes.
 - Avoid commands that create top-level comments: `gh pr comment`, REST issue-comment endpoints, or any review body not tied to an existing thread.
 
+### Review checkpoint
+
+Before editing, read the PR, unresolved threads, affected code, and applicable
+project instructions. Give one concise phase update naming any material context
+that changes how the review will be resolved; do not list irrelevant files or
+narrate an internal checklist.
+
 ### Steps
 
 1. Confirm the current branch has an open PR:
@@ -54,8 +58,10 @@ To check availability, look for a skill or command named `resolve-reviews` (e.g.
 
    Resolve conflicts and commit the merge before addressing reviews.
 
-3. List unresolved review threads and inline comments. Address each one in code where it requires a code change.
-4. When a thread needs acknowledgement, clarification, or a follow-up question, reply **inline on the originating thread** — never via a new top-level comment.
-5. Run relevant verification: typecheck, lint, tests, and targeted UI checks (visual, accessibility, responsive, theme) for user-facing changes.
-6. Invoke the `/update-pr` skill to commit and push the review fixes. Do not run commit/push commands directly — `/update-pr` enforces the no-amend, no-force-push, baseline-merge, and PR title/body reconciliation rules. If the `/update-pr` skill is not invokable in this environment (not registered, not available as a command), follow the rules and steps documented in the `update-pr` skill manually to commit and push.
-7. Report in chat: the threads addressed, the commits pushed, verification run, and the PR URL.
+3. List unresolved review threads and inline comments. Read the PR diff and changed-file context closely enough to identify the affected project area, related docs, and any applicable local skills.
+4. **Give the review checkpoint before fixing.** If it reveals missing material context, load that context before editing.
+5. Address each unresolved thread in code where it requires a code change.
+6. When a thread needs acknowledgement, clarification, or a follow-up question, reply **inline on the originating thread** — never via a new top-level comment.
+7. Run relevant verification: typecheck, lint, tests, and targeted UI checks (visual, accessibility, responsive, theme) for user-facing changes.
+8. Invoke the `/update-pr` skill to commit and push the review fixes. Do not run commit/push commands directly — `/update-pr` enforces the no-amend, no-force-push, baseline-merge, and PR title/body reconciliation rules. If the `/update-pr` skill is not invokable in this environment (not registered, not available as a command), follow the rules and steps documented in the `update-pr` skill manually to commit and push.
+9. Report in chat: the threads addressed, the commits pushed, verification run, and the PR URL.
