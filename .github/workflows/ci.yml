@@ -114,20 +114,16 @@ jobs:
           brew install fpc
           fpc -iV
 
-      # The choco package is i386-win32 only (no ppcrossx64); win64 legs
-      # install the official native win64 FPC silently instead.
-      - name: Install FPC (win64 native)
-        if: matrix.fpc-install == 'choco' && matrix.fpc-win-target == 'x86_64-win64'
+      # One official installer carries native win32 and the win64 cross
+      # set (choco's package is i386-only and downloads.freepascal.org
+      # ships no Windows .exe for win64).
+      - name: Install FPC (Windows combo installer)
+        if: matrix.fpc-install == 'choco'
         shell: pwsh
         run: |
-          $url = "https://downloads.freepascal.org/fpc/dist/3.2.2/x86_64-win64/fpc-3.2.2.x86_64-win64.exe"
-          Invoke-WebRequest -Uri $url -OutFile fpc64-setup.exe
-          Start-Process -Wait -FilePath .\fpc64-setup.exe -ArgumentList "/VERYSILENT","/NORESTART","/DIR=C:\fpc64"
-
-      - name: Install FPC (choco)
-        if: matrix.fpc-install == 'choco' && matrix.fpc-win-target != 'x86_64-win64'
-        run: |
-          choco install -y freepascal
+          $url = "https://downloads.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe"
+          Invoke-WebRequest -Uri $url -OutFile fpc-setup.exe -MaximumRedirection 10
+          Start-Process -Wait -FilePath .\fpc-setup.exe -ArgumentList "/VERYSILENT","/NORESTART","/DIR=C:\fpc322"
 
       - name: Locate FPC (Windows)
         if: matrix.fpc-install == 'choco'
@@ -135,7 +131,7 @@ jobs:
           # Add the FPC bin to PATH for subsequent steps. Chocolatey has
           # used both C:\fpc and C:\tools\freepascal layouts over time.
           FPC_BIN=""
-          for candidate_root in /c/fpc64 /c/tools/freepascal /c/fpc; do
+          for candidate_root in /c/fpc322 /c/tools/freepascal /c/fpc; do
             if [ -d "$candidate_root" ]; then
               FPC_BIN=$(find "$candidate_root" -name fpc.exe -type f 2>/dev/null | head -1)
               if [ -n "$FPC_BIN" ]; then break; fi
@@ -166,6 +162,13 @@ jobs:
             fi
           done
           echo "LWPT_FPC_UNIT_PATHS=$FPC_UNIT_PATHS" >> "$GITHUB_ENV"
+          # win64 legs: the combo install's cross backend produces
+          # genuine x86_64 binaries (fpc.exe defaults to i386-win32).
+          if [ "${{ matrix.fpc-win-target }}" = "x86_64-win64" ]; then
+            PPCX64=$(find /c/fpc322 -name ppcrossx64.exe -type f 2>/dev/null | head -1)
+            if [ -z "$PPCX64" ]; then echo "::error::ppcrossx64.exe not found in the combo install"; exit 1; fi
+            echo "LWPT_FPC=$(cygpath -w "$PPCX64")" >> "$GITHUB_ENV"
+          fi
 
       - name: Install lwpt (release binary, checksum-verified)
         run: |
