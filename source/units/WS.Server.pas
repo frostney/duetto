@@ -8,19 +8,19 @@ unit WS.Server;
 // "handshaking" to "open".
 //
 // Concurrency (ADR-0003): callbacks fire on the transport's execution
-// context — the Run thread on Linux (epoll), per-connection serial
-// dispatch queues on macOS (Network.framework). Per-connection order is
-// guaranteed everywhere; handlers for DIFFERENT connections may run
-// concurrently on macOS, so cross-connection state in user handlers
-// needs the user's own synchronization. The hot path here is confined
-// to one connection and stays lock-free; the only lock guards the
-// connection registry on accept/close (cold path).
+// context — the Run thread on Linux (epoll) and Windows (IOCP),
+// per-connection serial dispatch queues on macOS (Network.framework).
+// Per-connection order is guaranteed everywhere; handlers for DIFFERENT
+// connections may run concurrently on macOS, so cross-connection state
+// in user handlers needs the user's own synchronization. The hot path
+// here is confined to one connection and stays lock-free; the only lock
+// guards the connection registry on accept/close (cold path).
 
 {$I Shared.inc}
 
 interface
 
-{$if defined(LINUX) or defined(DARWIN)}
+{$if defined(LINUX) or defined(DARWIN) or defined(WINDOWS)}
 
 uses
   syncobjs,
@@ -115,7 +115,7 @@ type
 
 implementation
 
-{$if defined(LINUX) or defined(DARWIN)}
+{$if defined(LINUX) or defined(DARWIN) or defined(WINDOWS)}
 
 uses
   {$ifdef LINUX}
@@ -123,6 +123,9 @@ uses
   {$endif}
   {$ifdef DARWIN}
   WS.Transport.NetworkFramework;
+  {$endif}
+  {$ifdef WINDOWS}
+  WS.Transport.Iocp;
   {$endif}
 
 const
@@ -196,6 +199,9 @@ begin
   {$endif}
   {$ifdef DARWIN}
   FTransport := TWSNetworkFrameworkTransport.Create(APort, ATls);
+  {$endif}
+  {$ifdef WINDOWS}
+  FTransport := TWSIocpTransport.Create(APort, ATls);
   {$endif}
   FTransport.OnAccept := HandleAccept;
   FTransport.OnData := HandleData;
