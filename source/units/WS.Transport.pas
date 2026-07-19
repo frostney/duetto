@@ -19,7 +19,14 @@ unit WS.Transport;
 // ALen bytes immediately and returns the count taken (-1 = connection
 // is dead; caller must SubmitClose); when it returns short, the
 // transport fires OnSendReady once it can take more — the caller then
-// re-offers its current pending output.
+// re-offers its current pending output. OnSendReady may also fire after
+// a send that took everything; a re-offer with nothing pending is a
+// harmless no-op.
+//
+// Accept and receive are transport-armed rather than submitted — a
+// narrower surface than ADR-0001 sketches, completion-shaped all the
+// same; a completion-port transport hosts it by arming its own receives
+// internally.
 //
 // Ownership: transport connection objects are created by the transport
 // (surfaced via OnAccept) and freed by the transport. After SubmitClose
@@ -81,12 +88,21 @@ type
   protected
     procedure SetPort(AValue: Word);
   public
-    // Blocks. ATimeoutMs >= 0 returns after one completion round (test
-    // use); -1 loops until Stop.
+    // Blocks until Stop; with ATimeoutMs >= 0 returns after at most that
+    // long (the epoll transport additionally completes at most one
+    // readiness round per call; queue-driven transports do their work on
+    // their own queues and simply wait here).
     procedure Run(ATimeoutMs: Integer = -1); virtual; abstract;
 
-    // Thread-safe. Stops accepting, tears down connections, unblocks Run.
+    // Thread-safe. Unblocks Run and stops accepting new connections.
+    // Connection teardown belongs to Shutdown/destruction.
     procedure Stop; virtual; abstract;
+
+    // Quiesce: cancel every connection and block until no completion
+    // can ever fire again. Must be called (with Run returned) before
+    // the session frees its per-connection state; the transport frees
+    // its connection objects during the drain.
+    procedure Shutdown; virtual; abstract;
 
     // The bound port (kernel-assigned when the transport was created
     // with port 0); valid as soon as the constructor returns.

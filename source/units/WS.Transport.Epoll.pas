@@ -58,6 +58,7 @@ type
     destructor Destroy; override;
     procedure Run(ATimeoutMs: Integer = -1); override;
     procedure Stop; override;
+    procedure Shutdown; override;
   end;
 
 {$endif}
@@ -65,6 +66,9 @@ type
 implementation
 
 {$ifdef LINUX}
+
+const
+  ConnTableGrowth = 64;
 
 procedure SetNonBlocking(AFd: Integer);
 var
@@ -167,15 +171,23 @@ begin
 end;
 
 destructor TWSEpollTransport.Destroy;
+begin
+  Shutdown;
+  if FEpFd >= 0 then FileClose(FEpFd);
+  if FListenFd >= 0 then CloseSocket(FListenFd);
+  inherited;
+end;
+
+// Single-threaded (the Run thread is the only execution context and Run
+// has returned by contract), so quiescing is just closing every
+// connection.
+procedure TWSEpollTransport.Shutdown;
 var
   I: Integer;
 begin
   for I := 0 to High(FConns) do
     if FConns[I] <> nil then
       FConns[I].SubmitClose;
-  if FEpFd >= 0 then FileClose(FEpFd);
-  if FListenFd >= 0 then CloseSocket(FListenFd);
-  inherited;
 end;
 
 procedure TWSEpollTransport.EpollMod(AFd: Integer; AEvents: Cardinal);
@@ -190,7 +202,7 @@ end;
 procedure TWSEpollTransport.Track(AConn: TWSEpollConn);
 begin
   if AConn.FFd >= Length(FConns) then
-    SetLength(FConns, AConn.FFd + 64);
+    SetLength(FConns, AConn.FFd + ConnTableGrowth);
   FConns[AConn.FFd] := AConn;
 end;
 

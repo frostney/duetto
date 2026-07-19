@@ -47,6 +47,11 @@ type
   public
     UserData: Pointer;
     destructor Destroy; override;
+    // Callable from this connection's callback context (ADR-0003). If
+    // the transport reports the connection dead during the flush, the
+    // connection is dropped and freed before the call returns (no
+    // OnClientClose follows) — do not touch it afterwards. This matches
+    // the pre-seam reactor's semantics.
     procedure SendText(P: PByte; ALen: NativeInt);
     procedure SendBinary(P: PByte; ALen: NativeInt);
     procedure Close(ACode: Word = 1000; const AReason: string = '');
@@ -63,14 +68,15 @@ type
     FTransport: TWSTransport;
     FAllowDeflate: Boolean;
     FMaxMessage: NativeInt;
-    FConns: array of TWSConnection;
-    FConnCount: Integer;
+    FRegistry: array of TWSConnection;
+    FRegistryCount: Integer;
     FLock: TCriticalSection;
     FOnMessage: TWSServerMessage;
     FOnOpen, FOnClose: TWSServerNotify;
 
     procedure RegistryAdd(AConn: TWSConnection);
     procedure RegistryRemove(AConn: TWSConnection);
+    procedure ReleaseConn(AConn: TWSConnection);
     // Caller-initiated teardown; returns False so drop sites can chain
     // "Exit(DropConn(...))". The connection is freed on return.
     function DropConn(AConn: TWSConnection): Boolean;
@@ -118,6 +124,10 @@ uses
   {$ifdef DARWIN}
   WS.Transport.NetworkFramework;
   {$endif}
+
+const
+  HandshakeMaxBytes = 16 * 1024;
+  RegistryGrowth = 64;
 
 { TWSConnection }
 
@@ -197,14 +207,14 @@ destructor TWSServer.Destroy;
 var
   I: Integer;
 begin
-  // Stop has been called and Run has returned by contract; teardown is
-  // single-threaded from here.
-  for I := 0 to FConnCount - 1 do
-  begin
-    FConns[I].FTConn.UserData := nil;
-    FConns[I].FTConn.SubmitClose;
-    FConns[I].Free;
-  end;
+  // Quiesce the transport first: after Shutdown returns, no completion
+  // can fire on any thread and every transport connection object is
+  // gone — freeing the session connections is genuinely
+  // single-threaded. (Callbacks racing the shutdown ran to completion
+  // against still-valid state.)
+  FTransport.Shutdown;
+  for I := 0 to FRegistryCount - 1 do
+    FRegistry[I].Free;
   FTransport.Free;
   FLock.Free;
   inherited;
@@ -214,10 +224,10 @@ procedure TWSServer.RegistryAdd(AConn: TWSConnection);
 begin
   FLock.Acquire;
   try
-    if FConnCount = Length(FConns) then
-      SetLength(FConns, FConnCount + 64);
-    FConns[FConnCount] := AConn;
-    Inc(FConnCount);
+    if FRegistryCount = Length(FRegistry) then
+      SetLength(FRegistry, FRegistryCount + RegistryGrowth);
+    FRegistry[FRegistryCount] := AConn;
+    Inc(FRegistryCount);
   finally
     FLock.Release;
   end;
@@ -229,12 +239,12 @@ var
 begin
   FLock.Acquire;
   try
-    for I := 0 to FConnCount - 1 do
-      if FConns[I] = AConn then
+    for I := 0 to FRegistryCount - 1 do
+      if FRegistry[I] = AConn then
       begin
-        FConns[I] := FConns[FConnCount - 1];
-        FConns[FConnCount - 1] := nil;
-        Dec(FConnCount);
+        FRegistry[I] := FRegistry[FRegistryCount - 1];
+        FRegistry[FRegistryCount - 1] := nil;
+        Dec(FRegistryCount);
         Break;
       end;
   finally
@@ -242,15 +252,25 @@ begin
   end;
 end;
 
-function TWSServer.DropConn(AConn: TWSConnection): Boolean;
+// Shared teardown tail: unregister, notify (post-handshake conns only),
+// free the session object.
+procedure TWSServer.ReleaseConn(AConn: TWSConnection);
 begin
-  Result := False;
   RegistryRemove(AConn);
   if (AConn.FState <> wcsHandshake) and Assigned(FOnClose) then
     FOnClose(AConn);
-  AConn.FTConn.UserData := nil;
-  AConn.FTConn.SubmitClose;
   AConn.Free;
+end;
+
+function TWSServer.DropConn(AConn: TWSConnection): Boolean;
+var
+  TConn: TWSTransportConn;
+begin
+  Result := False;
+  TConn := AConn.FTConn;
+  TConn.UserData := nil;
+  ReleaseConn(AConn);
+  TConn.SubmitClose;
 end;
 
 function TWSServer.FlushConn(AConn: TWSConnection): Boolean;
@@ -339,7 +359,7 @@ begin
         Off := Length(Conn.FHsBuf);
         SetLength(Conn.FHsBuf, Off + ALen);
         Move(P^, Conn.FHsBuf[Off + 1], ALen);
-        if Length(Conn.FHsBuf) > 16 * 1024 then
+        if Length(Conn.FHsBuf) > HandshakeMaxBytes then
         begin
           DropConn(Conn);
           Exit;
@@ -380,10 +400,8 @@ var
 begin
   Conn := TWSConnection(ATConn.UserData);
   if Conn = nil then Exit;
-  RegistryRemove(Conn);
-  if (Conn.FState <> wcsHandshake) and Assigned(FOnClose) then
-    FOnClose(Conn);
-  Conn.Free;
+  ATConn.UserData := nil;
+  ReleaseConn(Conn);
   // The transport frees ATConn after this callback returns.
 end;
 
