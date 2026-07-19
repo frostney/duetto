@@ -69,8 +69,10 @@ recorded reason.
 - A fix that alters concurrency or lifecycle behaviour (locks, deferred
   frees, close/teardown ordering, cross-thread signalling) gets a
   focused external re-review of the fix diff before the PR is declared
-  clear — re-running the gate is weakest exactly there (the
-  drop-when-drained race in #15 shipped past an 8x-green battery).
+  clear. A green rerun of the automated gate (the `pr.yml` battery) is
+  necessary but not sufficient for this class: the drop-when-drained
+  race in #15 shipped past an 8x-green battery, and only review of the
+  final state catches what the tests cannot make deterministic.
 - The PR body reports the validation commands run and their results.
 
 ## Release readiness
