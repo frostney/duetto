@@ -59,12 +59,15 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
   `install` → `format --check` → `build` → `test` → `wsinterop`, plus a
   blocking markdownlint job. The authoritative pre-merge gate.
 - **`.github/workflows/ci.yml`** — push to main: native test matrix
-  (x86_64/aarch64 Linux and macOS, each building the full program set
-  and running wsinterop plus `tools/crosscheck.py` against the python
-  `websockets` reference) and the full Autobahn suite with report
-  artifacts. On the macOS legs the crosscheck is the merge-time
-  conformance battery — the Autobahn container needs Docker, which
-  GitHub's macOS runners lack.
+  (x86_64/aarch64 Linux and macOS) plus the full Autobahn suite with
+  report artifacts. Every leg builds the full program set and runs the
+  unit suites; all legs except x86_64 macOS also run wsinterop and
+  `tools/crosscheck.py` against the python `websockets` reference. On
+  arm64 macOS the crosscheck is the merge-time conformance battery —
+  the Autobahn container needs Docker, which GitHub's macOS runners
+  lack. The x86_64 macOS leg skips the loopback batteries entirely:
+  GitHub's Intel VMs deliver Network.framework loopback traffic on a
+  ~60 s timer (duetto#11).
 
 Both workflows install the lwpt release binary from a checksum-verified
 tarball (no sibling checkout, no bootstrap) and verify dependencies
