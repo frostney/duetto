@@ -72,7 +72,9 @@ rule may live in one.
 - `wsinterop` is the in-repo E2E battery (own client ↔ own server over real
   sockets, plus raw-socket protocol violations).
 - The Autobahn suite is the external conformance net (`tools/autobahn.sh`,
-  judged by `tools/autobahn-check.py`); CI runs it on every push to main.
+  judged by `tools/autobahn-check.py`); CI runs it on every push to main —
+  Docker on Linux (both directions), native Rosetta python-2.7 on arm64
+  macOS (server direction).
 - `tools/crosscheck.py` validates against the Python `websockets` reference
   implementation in both directions.
 - Nothing in the test stack touches the external network; everything runs
