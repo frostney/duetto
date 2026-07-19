@@ -42,6 +42,7 @@ type
     FState: TWSConnState;
     FProto: TWSProtocol;
     FHsBuf: RawByteString;     // handshake accumulator
+    FDropPending: Boolean;     // protocol failed; drop once output drains
     procedure ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
     function GetId: NativeUInt;
   public
@@ -333,8 +334,17 @@ begin
   Result := False;
   if not AConn.FProto.Ingest(P, ALen) then
   begin
-    // Get the close frame out, then die.
-    if FlushConn(AConn) then DropConn(AConn);
+    // Get the close frame out, then die. If a prior send is still in
+    // flight the transport takes nothing now — defer the drop until
+    // OnSendReady has drained the close frame, or it never reaches the
+    // wire (races the 101 on fast loopback).
+    if FlushConn(AConn) then
+    begin
+      if AConn.FProto.OutPending = 0 then
+        DropConn(AConn)
+      else
+        AConn.FDropPending := True;
+    end;
     Exit;
   end;
   if not FlushConn(AConn) then Exit;
@@ -402,8 +412,15 @@ begin
   if Conn = nil then Exit;
   if not FlushConn(Conn) then Exit;
   if Conn.FProto <> nil then
+  begin
+    if Conn.FDropPending and (Conn.FProto.OutPending = 0) then
+    begin
+      DropConn(Conn);
+      Exit;
+    end;
     if Conn.FProto.CloseDone and (Conn.FProto.OutPending = 0) then
       DropConn(Conn);
+  end;
 end;
 
 procedure TWSServer.HandleClosed(ATConn: TWSTransportConn);
