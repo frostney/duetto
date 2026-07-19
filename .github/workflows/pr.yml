@@ -122,7 +122,11 @@ jobs:
           if [ "${{ matrix.lwpt-archive }}" = "zip" ]; then EXT="zip"; fi
           curl -fsSLO "${BASE}/${ASSET}.${EXT}"
           curl -fsSLO "${BASE}/lwpt-${LWPT_VERSION}-checksums.txt"
-          shasum -a 256 -c <(grep "${ASSET}.${EXT}" "lwpt-${LWPT_VERSION}-checksums.txt")
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 -c <(grep "${ASSET}.${EXT}" "lwpt-${LWPT_VERSION}-checksums.txt")
+          else
+            sha256sum -c <(grep "${ASSET}.${EXT}" "lwpt-${LWPT_VERSION}-checksums.txt")
+          fi
           if [ "$EXT" = "zip" ]; then unzip -q "${ASSET}.zip"; else tar xzf "${ASSET}.tar.gz"; fi
           echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
 
