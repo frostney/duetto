@@ -62,9 +62,12 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
   (x86_64/aarch64 Linux and macOS, each building the full program set
   and running wsinterop plus `tools/crosscheck.py` against the python
   `websockets` reference) and the full Autobahn suite with report
-  artifacts. On the macOS legs the crosscheck is the merge-time
+  artifacts. On the arm64 macOS leg the crosscheck is the merge-time
   conformance battery — the Autobahn container needs Docker, which
-  GitHub's macOS runners lack.
+  GitHub's macOS runners lack. The x86_64 macOS leg runs build + unit
+  suites only: GitHub's Intel VMs deliver Network.framework loopback
+  traffic on a ~60 s timer (duetto#11), so loopback batteries cannot
+  run there.
 
 Both workflows install the lwpt release binary from a checksum-verified
 tarball (no sibling checkout, no bootstrap) and verify dependencies

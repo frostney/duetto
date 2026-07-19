@@ -39,15 +39,24 @@ end;
 var
   Failures: Integer = 0;
 
+var
+  LastTick: QWord;
+
 procedure Check(ACond: Boolean; const AName: string);
+var
+  Now_: QWord;
 begin
+  Now_ := GetTickCount64;
   if ACond then
-    WriteLn('ok   - ', AName)
+    Write('ok   - ', AName)
   else
   begin
-    WriteLn('FAIL - ', AName);
+    Write('FAIL - ', AName);
     Inc(Failures);
   end;
+  WriteLn('  [+', Now_ - LastTick, ' ms]');
+  LastTick := Now_;
+  Flush(Output);
 end;
 
 // ---------------------------------------------------------------------------
@@ -188,6 +197,8 @@ begin
   Url := Format('ws://127.0.0.1:%d/', [Port]);
   SrvT.Start;
   WriteLn('server on ', Port);
+  Flush(Output);
+  LastTick := GetTickCount64;
 
   // --- duetto client vs duetto server ---------------------------------------
   Cli := TWSClient.Create;

@@ -69,6 +69,11 @@ jobs:
             runner: macos-15-intel
             lwpt-asset: macos-x64
             fpc-install: brew
+            # GH Intel-macOS VMs deliver nw loopback traffic on a ~60s
+            # timer (issue #11: transport hops <2ms, transit 12-60s),
+            # so the loopback batteries can't run here. Build + unit
+            # suites still give x86_64 compile and blocks-ABI coverage.
+            loopback-battery: skip
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -117,6 +122,7 @@ jobs:
         run: lwpt test
 
       - name: wsinterop (live-socket battery, own client vs own server)
+        if: matrix.loopback-battery != 'skip'
         run: ./build/wsinterop
 
       # Cross-implementation net vs the python `websockets` reference,
@@ -125,6 +131,7 @@ jobs:
       # Network.framework transport — Autobahn needs Docker, which
       # GitHub's macOS runners don't have.
       - name: crosscheck vs python websockets (reference implementation)
+        if: matrix.loopback-battery != 'skip'
         run: |
           python3 -m venv "$RUNNER_TEMP/crosscheck-venv"
           "$RUNNER_TEMP/crosscheck-venv/bin/pip" install --quiet websockets
