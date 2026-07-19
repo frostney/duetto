@@ -58,7 +58,9 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
 - **`.github/workflows/pr.yml`** — every PR: the full battery
   (`install --frozen` → `build` → `test` → `wsinterop`) on Linux, macOS,
   and win64 runners plus format-check and a blocking markdownlint job.
-  The authoritative pre-merge gate; i386-win32 stays post-merge.
+  The authoritative pre-merge gate; i386-win32 stays post-merge. The
+  Windows legs install online (`lwpt install`, not `--frozen`) until
+  lwpt#78 makes the frozen verifier's tree hash path-portable.
 - **`.github/workflows/ci.yml`** — push to main: native test matrix
   (x86_64/aarch64 Linux and macOS, x86_64/i386 Windows) plus the full
   Autobahn suite with report artifacts. Every leg builds the full program set and runs the

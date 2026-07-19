@@ -17,7 +17,7 @@ duetto = "frostney/duetto@^0.1.0"   # in lwpt.toml [dependencies]
 
 ## Usage
 
-Client, anywhere POSIX:
+Client (POSIX and Windows, direct WinSock2):
 
 ```pascal
 uses WS.Client;

@@ -9,8 +9,9 @@
 
 ## Setup
 
-Install lwpt from its release (pick the tarball for your platform —
-`linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`):
+Install lwpt from its release (pick the archive for your platform —
+`linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64` tarballs, or the
+`windows-x64` / `windows-x86` zips):
 
 ```bash
 curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.2.0/lwpt-0.2.0-macos-arm64.tar.gz
