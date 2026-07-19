@@ -240,7 +240,7 @@ begin
   FListenSocket := C_WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP,
     nil, 0, WSA_FLAG_OVERLAPPED);
   if FListenSocket = INVALID_SOCKET then
-    raise Exception.Create('WSASocketW() failed');
+    raise Exception.CreateFmt('WSASocketW() failed (%d)', [WSAGetLastError]);
   One := 1;
   WinSock2.setsockopt(FListenSocket, SOL_SOCKET, SO_REUSEADDR,
     @One, SizeOf(One));
@@ -250,25 +250,25 @@ begin
   Address.sin_port := htons(APort);
   Address.sin_addr.S_addr := INADDR_ANY;
   if WinSock2.bind(FListenSocket, @Address, SizeOf(Address)) <> 0 then
-    raise Exception.CreateFmt('bind to port %d failed', [APort]);
+    raise Exception.CreateFmt('bind to port %d failed (%d)', [APort, WSAGetLastError]);
   if WinSock2.listen(FListenSocket, 511) <> 0 then
-    raise Exception.Create('listen() failed');
+    raise Exception.CreateFmt('listen() failed (%d)', [WSAGetLastError]);
 
   AddressLength := SizeOf(Address);
   if WinSock2.getsockname(FListenSocket, Address, AddressLength) <> 0 then
-    raise Exception.Create('getsockname() failed');
+    raise Exception.CreateFmt('getsockname() failed (%d)', [WSAGetLastError]);
   SetPort(ntohs(Address.sin_port));
 
   FCompletionPort := C_CreateIoCompletionPort(THandle(FListenSocket), 0,
     ListenerCompletionKey, 1);
   if FCompletionPort = 0 then
-    raise Exception.Create('CreateIoCompletionPort() failed');
+    raise Exception.CreateFmt('CreateIoCompletionPort() failed (%d)', [GetLastError]);
 
   Bytes := 0;
   if C_WSAIoctl(FListenSocket, SIO_GET_EXTENSION_FUNCTION_POINTER,
       @AcceptExGuid, SizeOf(AcceptExGuid), @FAcceptEx, SizeOf(FAcceptEx),
       @Bytes, nil, nil) <> 0 then
-    raise Exception.Create('could not resolve AcceptEx');
+    raise Exception.CreateFmt('could not resolve AcceptEx (%d)', [WSAGetLastError]);
 end;
 
 destructor TWSIocpTransport.Destroy;
