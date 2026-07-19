@@ -66,6 +66,13 @@ recorded reason.
   draft does not count.
 - Required CI checks pass before the squash-merge; deferred follow-up
   work is explicit, not hidden.
+- A fix that alters concurrency or lifecycle behaviour (locks, deferred
+  frees, close/teardown ordering, cross-thread signalling) gets a
+  focused external re-review of the fix diff before the PR is declared
+  clear. A green rerun of the automated gate (the `pr.yml` battery) is
+  necessary but not sufficient for this class: the drop-when-drained
+  race in #15 shipped past an 8x-green battery, and only review of the
+  final state catches what the tests cannot make deterministic.
 - The PR body reports the validation commands run and their results.
 
 ## Release readiness
