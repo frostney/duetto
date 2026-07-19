@@ -1,6 +1,16 @@
 # Changelog
 
 All notable changes to duetto are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); entries are generated from Conventional Commits by git-cliff.
+## [0.2.0] - 2026-07-19
+
+### Internal
+
+- scope the x86_64-darwin leg to build + unit suites (#12)
+
+### New Features
+
+- completion-shaped transport seam + Network.framework macOS transport (#9)
+
 ## [0.1.0] - 2026-07-19
 
 ### Bug Fixes
