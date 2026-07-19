@@ -79,6 +79,7 @@ jobs:
             lwpt-asset: windows-x64
             lwpt-archive: zip
             fpc-install: choco
+            fpc-win-target: x86_64-win64
             exe: .exe
             frozen-install: skip   # lwpt#78: frozen tree-hash not path-portable on Windows
             crosscheck: skip   # python venv on the win runners is a follow-up
@@ -87,6 +88,7 @@ jobs:
             lwpt-asset: windows-x86
             lwpt-archive: zip
             fpc-install: choco
+            fpc-win-target: i386-win32
             exe: .exe
             frozen-install: skip   # lwpt#78: frozen tree-hash not path-portable on Windows
             crosscheck: skip
@@ -136,7 +138,7 @@ jobs:
           FPC_UNIT_PATHS=""
           for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process paszlib hash; do
             UNIT_PATH=""
-            for unit_target in i386-win32 x86_64-win64; do
+            for unit_target in ${{ matrix.fpc-win-target }} i386-win32 x86_64-win64; do
               UNIT_PATH=$(find /c/tools/freepascal /c/fpc -path "*/units/${unit_target}/${unit_dir}" -type d 2>/dev/null | head -1 || true)
               if [ -n "$UNIT_PATH" ]; then break; fi
             done
@@ -150,6 +152,15 @@ jobs:
             fi
           done
           echo "LWPT_FPC_UNIT_PATHS=$FPC_UNIT_PATHS" >> "$GITHUB_ENV"
+          # win64 legs: drive the cross backend through the fpc driver so
+          # binaries are genuinely x86_64 (choco's default target is
+          # i386-win32).
+          if [ "${{ matrix.fpc-win-target }}" = "x86_64-win64" ]; then
+            WRAP_DIR="$RUNNER_TEMP/fpc-win64"
+            mkdir -p "$WRAP_DIR"
+            printf '@echo off\r\n"%s" -Px86_64 %%*\r\n' "$(cygpath -w "$FPC_BIN")" > "$WRAP_DIR/fpc-win64.cmd"
+            echo "LWPT_FPC=$(cygpath -w "$WRAP_DIR/fpc-win64.cmd")" >> "$GITHUB_ENV"
+          fi
 
       - name: Install lwpt (release binary, checksum-verified)
         run: |
