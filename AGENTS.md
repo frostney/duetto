@@ -42,9 +42,9 @@ no bootstrap. Dependencies resolve from the same release tag.
 lwpt install         # resolve deps, regenerate lwpt.cfg + lwpt.lock
 lwpt install --frozen  # CI mode: verify lockfile + committed modules, no network
 lwpt format --check  # formatter gate (no flag = rewrite in place)
-lwpt build           # all programs (Linux; on macOS: lwpt build wsprobe wsautobahn)
+lwpt build           # all programs (Linux and macOS)
 lwpt test            # five co-located unit suites
-./build/wsinterop    # live-socket battery, exit 0 = pass
+./build/wsinterop    # live-socket battery (Linux and macOS), exit 0 = pass
 tools/autobahn.sh server   # Autobahn fuzzingclient vs wsecho (Linux + Docker)
 tools/autobahn.sh client   # Autobahn fuzzingserver vs wsautobahn (Docker)
 ```
@@ -53,15 +53,17 @@ tools/autobahn.sh client   # Autobahn fuzzingserver vs wsautobahn (Docker)
 
 | Path | Role |
 | --- | --- |
-| `source/units/` | Library: `WS.Frame`, `WS.Utf8`, `WS.Handshake`, `WS.Deflate`, `WS.Protocol` (sans-I/O core), `WS.Client`, `WS.Server` (Linux epoll) |
+| `source/units/` | Library: `WS.Frame`, `WS.Utf8`, `WS.Handshake`, `WS.Deflate`, `WS.Protocol` (sans-I/O core), `WS.Client`, `WS.Transport(.Epoll/.NetworkFramework)`, `WS.Server` (session layer) |
 | `source/apps/` | Programs: `wsecho`, `wsprobe`, `wsinterop`, `wsbench`, `wsautobahn` |
 | `tests/autobahn/` | Autobahn testsuite configs (reports/ is generated) |
 | `tools/` | Cross-implementation checks, benchmarks, Autobahn runner |
 | `docs/` | Architecture, quick-start, tooling, code style, deployment |
 
 Layering is strictly bottom-up — see [docs/architecture.md](docs/architecture.md).
-`WS.Server` is Linux-only (epoll); keep it and anything that uses it out of
-Darwin/Windows build paths.
+`WS.Server` is a platform-neutral session layer over the `WS.Transport`
+completion seam (epoll on Linux, Network.framework on macOS; IOCP planned
+— see docs/adr/0001..0003). Windows stays out of build paths until #3
+lands. Transports move bytes only; no RFC 6455 rule may live in one.
 
 ## Testing
 

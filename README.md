@@ -4,7 +4,8 @@ WebSocket for Pascal — *duetto*, Italian for duet: both sides talking at
 once over one full-duplex connection. RFC 6455 (v13) + RFC 7692
 permessage-deflate in FreePascal, built and tested with
 [lwpt](https://github.com/frostney/lwpt). A sans-I/O protocol core behind a
-blocking client and a single-threaded epoll server, validated by unit
+blocking client and a server with per-platform transports — epoll on
+Linux, Network.framework on macOS (native `wss://`) — validated by unit
 suites, a live-socket battery, and the Autobahn testsuite. See
 [docs/architecture.md](docs/architecture.md).
 
@@ -29,12 +30,13 @@ while Cli.ReadMessage(IsText, Data) do
 Cli.Close(1000);
 ```
 
-Echo server (Linux, epoll) and probe, from the shipped programs:
+Echo server (Linux and macOS) and probe, from the shipped programs:
 
 ```bash
 lwpt build
 ./build/wsecho --port=9001                       # echo server
 ./build/wsprobe ws://localhost:9001/ --deflate   # client probe vs any server
+./build/wsecho --pkcs12=id.p12 --pkcs12-pass=x   # wss:// (macOS, native TLS)
 ```
 
 For the full program set (`wsinterop`, `wsbench`, `wsautobahn`) and every

@@ -40,10 +40,10 @@ function HandshakeFindEnd(const S: RawByteString): Integer; overload;
 function ComputeAccept(const AKey: string): string;
 
 // --- server role ---------------------------------------------------------
-function ServerParseRequest(const ARaw: string; AAllowDeflate: Boolean;
+function ServerParseRequest(const ARaw: RawByteString; AAllowDeflate: Boolean;
   out AHS: TWSServerHandshake): Boolean;
-function ServerBuildResponse(const AHS: TWSServerHandshake): string;
-function ServerBuildReject(ACode: Integer; const AReason: string): string;
+function ServerBuildResponse(const AHS: TWSServerHandshake): RawByteString;
+function ServerBuildReject(ACode: Integer; const AReason: string): RawByteString;
 
 // --- client role ---------------------------------------------------------
 // Crypto-quality random bytes (/dev/urandom on Unix, Randomize fallback).
@@ -424,7 +424,7 @@ begin
   Result := True;
 end;
 
-procedure CollectServerHeaders(const ARaw: string; out H: TSrvHeaders);
+procedure CollectServerHeaders(const ARaw: RawByteString; out H: TSrvHeaders);
 var
   P, PEnd, LineStart, LineEnd, Colon, NEnd, VStart, VEnd: PAnsiChar;
   K: Integer;
@@ -467,11 +467,11 @@ begin
   end;
 end;
 
-function ServerParseRequest(const ARaw: string; AAllowDeflate: Boolean;
+function ServerParseRequest(const ARaw: RawByteString; AAllowDeflate: Boolean;
   out AHS: TWSServerHandshake): Boolean;
 var
   EOL, SP1, SP2: Integer;
-  RequestLine, Method: string;
+  RequestLine, Method: RawByteString;
   H: TSrvHeaders;
 begin
   Result := False;
@@ -535,7 +535,7 @@ begin
   Result := True;
 end;
 
-function ServerBuildResponse(const AHS: TWSServerHandshake): string;
+function ServerBuildResponse(const AHS: TWSServerHandshake): RawByteString;
 var
   B: TWSStrBuilder;
 begin
@@ -566,7 +566,7 @@ begin
   Result := B.Done;
 end;
 
-function ServerBuildReject(ACode: Integer; const AReason: string): string;
+function ServerBuildReject(ACode: Integer; const AReason: string): RawByteString;
 var
   StatusText: string;
   B: TWSStrBuilder;

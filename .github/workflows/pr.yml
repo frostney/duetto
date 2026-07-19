@@ -1,19 +1,17 @@
 name: PR
 
-# Fast single-runner PR gate (Ubuntu native). Mirrors the lwpt /
-# GocciaScript pattern: ci.yml runs only on push to main, so pr.yml is
-# the sole pre-merge signal a PR sees.
+# Fast PR gate. Mirrors the lwpt / GocciaScript pattern: ci.yml runs
+# only on push to main, so pr.yml is the sole pre-merge signal a PR
+# sees.
 #
-#   pr.yml — every PR: Ubuntu native install --frozen + format --check
-#            + build + test + wsinterop (no Autobahn, no
-#            multi-platform). Typical wall-clock < 5 min.
-#   ci.yml — push to main only: per-platform native test runs plus the
-#            full Autobahn suite in both directions.
-#
-# Trade-off, deliberate (same as lwpt's pr.yml): a PR that introduces a
-# platform-specific regression passes pr.yml and only fails on the
-# main-branch ci.yml run; the maintainer reverts or forward-fixes. This
-# trades pre-merge cross-platform certainty for cheap PR feedback.
+#   pr.yml — every PR: native install --frozen + format --check + build
+#            + test + wsinterop on one Linux and one macOS runner (the
+#            two platforms with their own transports — a PR touching
+#            WS.Transport.NetworkFramework gets a real pre-merge
+#            signal; no Autobahn). A win64 cross-compile signal joins
+#            when #3 lands, mirroring lwpt's staging.
+#   ci.yml — push to main only: the full per-arch platform matrix plus
+#            the Autobahn suite in both directions.
 #
 # The lwpt toolchain comes from its published release (checksum-
 # verified tarball, no sibling checkout, no bootstrap); dependencies
@@ -34,24 +32,43 @@ env:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            lwpt-asset: linux-x64
+            fpc-install: apt
+          - runner: macos-latest
+            lwpt-asset: macos-arm64
+            fpc-install: brew
+    runs-on: ${{ matrix.runner }}
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
-      - name: Install FPC
+      - name: Install FPC (apt)
+        if: matrix.fpc-install == 'apt'
         run: |
           sudo apt-get update
           sudo apt-get install -y fpc
+          fpc -iV
+
+      - name: Install FPC (brew)
+        if: matrix.fpc-install == 'brew'
+        run: |
+          brew install fpc
           fpc -iV
 
       - name: Install lwpt (release binary, checksum-verified)
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
-          ASSET="lwpt-${LWPT_VERSION}-linux-x64"
+          ASSET="lwpt-${LWPT_VERSION}-${{ matrix.lwpt-asset }}"
           BASE="https://github.com/frostney/lwpt/releases/download/${LWPT_VERSION}"
           curl -fsSLO "${BASE}/${ASSET}.tar.gz"
           curl -fsSLO "${BASE}/lwpt-${LWPT_VERSION}-checksums.txt"
@@ -63,6 +80,7 @@ jobs:
         run: lwpt install --frozen
 
       - name: lwpt format --check (formatting drift?)
+        if: matrix.fpc-install == 'apt'   # platform-independent; one runner
         run: lwpt format --check
 
       - name: lwpt build (compile every [build] entry)
@@ -78,6 +96,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Lint Markdown
         uses: DavidAnson/markdownlint-cli2-action@v19

@@ -12,12 +12,13 @@ name: CI
 # the same commit; post-merge, ci.yml runs once on main to confirm the
 # merged tree is green everywhere.
 #
-#   test:     Per-platform native runners. The library units and the
-#             blocking client are POSIX-portable; WS.Server is Linux
-#             epoll only, so the Linux legs build and exercise all five
-#             programs (incl. wsinterop's live-socket battery) while
-#             the macOS legs build the client-side programs and run the
-#             unit suites.
+#   test:     Per-platform native runners. Every leg builds all five
+#             programs and runs the unit suites, wsinterop's
+#             live-socket battery, and the crosscheck against the
+#             python `websockets` reference — the server rides the
+#             platform transport (epoll on Linux, Network.framework on
+#             macOS, where crosscheck is the merge-time conformance
+#             battery since the Autobahn container can't run there).
 #
 #   autobahn: The Autobahn fuzzing suite (crossbario/autobahn-testsuite
 #             via Docker) in both directions — fuzzingclient against
@@ -55,13 +56,11 @@ jobs:
             runner: ubuntu-latest
             lwpt-asset: linux-x64
             fpc-install: apt
-            server-apps: true
             format-check: true   # one runner runs format-check (platform-independent)
           - target: aarch64-linux
             runner: ubuntu-24.04-arm
             lwpt-asset: linux-arm64
             fpc-install: apt
-            server-apps: true
           - target: aarch64-darwin
             runner: macos-latest
             lwpt-asset: macos-arm64
@@ -76,6 +75,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Install FPC (apt)
         if: matrix.fpc-install == 'apt'
@@ -109,20 +110,25 @@ jobs:
         if: matrix.format-check == true
         run: lwpt format --check
 
-      - name: lwpt build (all programs — Linux)
-        if: matrix.server-apps == true
+      - name: lwpt build (all programs)
         run: lwpt build
-
-      - name: lwpt build (client-side programs — macOS, no epoll server)
-        if: matrix.server-apps != true
-        run: lwpt build wsprobe wsautobahn
 
       - name: lwpt test (five co-located unit suites)
         run: lwpt test
 
       - name: wsinterop (live-socket battery, own client vs own server)
-        if: matrix.server-apps == true
         run: ./build/wsinterop
+
+      # Cross-implementation net vs the python `websockets` reference,
+      # both directions plus raw-socket violations. On the macOS legs
+      # this is the merge-time conformance battery for the
+      # Network.framework transport — Autobahn needs Docker, which
+      # GitHub's macOS runners don't have.
+      - name: crosscheck vs python websockets (reference implementation)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/crosscheck-venv"
+          "$RUNNER_TEMP/crosscheck-venv/bin/pip" install --quiet websockets
+          PATH="$RUNNER_TEMP/crosscheck-venv/bin:$PATH" python3 tools/crosscheck.py
 
   autobahn:
     runs-on: ubuntu-latest
@@ -131,6 +137,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Install FPC
         run: |

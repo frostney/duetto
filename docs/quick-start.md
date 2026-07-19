@@ -4,7 +4,7 @@
 
 - Prerequisites: FPC 3.2.2, the lwpt **release binary** on PATH, Lefthook, and Docker for the Autobahn suite.
 - `lwpt install` resolves dependencies from the lwpt release tag, `lwpt build` compiles the programs, `lwpt test` runs the unit suites.
-- `WS.Server` (and therefore `wsecho`, `wsinterop`, `wsbench`) is Linux-only; on macOS build `wsprobe` and `wsautobahn`.
+- Every program builds on Linux and macOS; the server rides the platform transport (epoll / Network.framework). Windows is roadmapped (#3).
 - `lefthook install` wires the pre-commit formatter hook.
 
 ## Setup
@@ -36,16 +36,15 @@ no sibling checkout is needed. The committed `.lwpt/modules/` tree plus
 ## Build and test
 
 ```bash
-lwpt build                      # all five programs (Linux)
-lwpt build wsprobe wsautobahn   # client-side programs on macOS
-lwpt test                       # five suites, all green
-./build/wsinterop               # live-socket battery, exit 0 = pass
+lwpt build           # all five programs (Linux and macOS)
+lwpt test            # five suites, all green
+./build/wsinterop    # live-socket battery, exit 0 = pass
 ```
 
 ## Run something
 
 ```bash
-./build/wsecho --port=9001                  # echo server (Linux)
+./build/wsecho --port=9001                  # echo server (Linux/macOS)
 ./build/wsprobe ws://localhost:9001/ --deflate   # probe it from a second shell
 ```
 

@@ -9,11 +9,13 @@ issues use them in exactly this sense.
   units under it) that consumes and produces bytes without performing
   any I/O. `WS.Protocol` owns all RFC 6455 rules; `WS.Deflate`
   implements RFC 7692 beneath it.
-- **Backend** — a platform I/O provider behind the completion seam
+- **Transport** — a platform I/O provider behind the completion seam
   (ADR-0001): it moves bytes and connection lifecycle events between
-  the OS and the sans-I/O core. Existing: epoll (Linux, inside
-  `WS.Server`, adapter to the seam pending); planned:
-  Network.framework (macOS), IOCP (Windows).
+  the OS and the sans-I/O core. Named for the ecosystem convention
+  (Netty transports, NIOTransportServices); ADR-0001/0002 say
+  *backend* for the same concept. Existing: epoll (Linux) and
+  Network.framework (macOS), both behind `WS.Transport`; planned:
+  IOCP (Windows).
 - **Completion model** — the seam's contract: operations are submitted
   and later reported complete. Readiness-based OS APIs (epoll) adapt to
   it; completion-based APIs (IOCP, Network.framework) implement it
