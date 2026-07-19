@@ -40,6 +40,9 @@ recorded reason.
 - `tools/crosscheck.py` passes when wire-level interop behaviour
   changed.
 - No test is silently skipped, disabled, or weakened to obtain a pass.
+- Markdown changes pass markdownlint
+  (`npx markdownlint-cli2 "**/*.md"`, config
+  `.markdownlint-cli2.jsonc`) — the PR `docs` job is blocking.
 - Benchmark numbers inform the PR description where relevant but never
   become CI assertions.
 
