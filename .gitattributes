@@ -1,0 +1,7 @@
+# Hash-stable checkouts everywhere: lwpt's frozen install verifies the
+# committed .lwpt/modules tree byte-for-byte, so Windows autocrlf must
+# never rewrite text files. FPC is LF-happy on all platforms.
+* text=auto eol=lf
+*.tar.gz binary
+*.zip binary
+*.p12 binary
