@@ -354,7 +354,7 @@ jobs:
           PID_PLAIN=$!
           sleep 1
           mkdir -p reports-macos
-          cat > fuzzingclient-macos.json <<'JSON'
+          cat > "$RUNNER_TEMP/fuzzingclient-macos.json" <<'JSON'
           {
               "outdir": "./reports-macos",
               "servers": [
@@ -366,7 +366,7 @@ jobs:
               "exclude-agent-cases": {}
           }
           JSON
-          "$HOME/Library/Python/2.7/bin/wstest" -m fuzzingclient -s fuzzingclient-macos.json
+          "$HOME/Library/Python/2.7/bin/wstest" -m fuzzingclient -s "$RUNNER_TEMP/fuzzingclient-macos.json"
           kill "$PID_DEFLATE" "$PID_PLAIN" || true
           python3 tools/autobahn-check.py reports-macos/index.json
 

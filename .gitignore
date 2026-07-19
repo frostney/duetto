@@ -21,3 +21,7 @@ tests/autobahn/reports/
 # OS noise.
 .DS_Store
 Thumbs.db
+
+# Autobahn reports from the native macOS merge job (and local runs of
+# its recipe) — generated, like tests/autobahn/reports/.
+reports-macos/
