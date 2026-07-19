@@ -39,6 +39,7 @@ tag_pattern = "^v?[0-9]+\\.[0-9]+\\.[0-9]+(-.*)?$"
 sort_commits = "newest"
 
 commit_parsers = [
+  { message = "^chore\\(release\\)", skip = true },
   { message = "^feat",     group = "New Features" },
   { message = "^fix",      group = "Bug Fixes" },
   { message = "^perf",     group = "Performance" },

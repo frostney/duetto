@@ -11,9 +11,11 @@
 
 1. Confirm main is green in
    [ci.yml](../.github/workflows/ci.yml) — including the Autobahn job.
-2. Bump `version` in `lwpt.toml` (SemVer) on a PR; squash-merge it.
+2. On one release PR: bump `version` in `lwpt.toml` (SemVer) and
+   regenerate the changelog (`git-cliff --tag <version> -o CHANGELOG.md`).
+   Changelog lands **before** the tag so the tagged commit contains it
+   (the `/create-release` skill's ordering). Squash-merge it.
 3. Tag the merge commit `<version>` (unprefixed) and push the tag.
-4. Regenerate the changelog: `git-cliff -o CHANGELOG.md` and land it via PR.
 
 If wording in the changelog is wrong, fix the underlying commit message
 convention going forward and regenerate — entries are not hand-edited.
