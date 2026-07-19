@@ -18,15 +18,29 @@ uses
   {$ifdef UNIX}
   BaseUnix, Sockets, netdb,
   {$endif}
+  {$ifdef WINDOWS}
+  WinSock2,
+  {$endif}
   TransportSecurity,
   WS.Handshake, WS.Protocol;
 
 type
   EWSClient = class(Exception);
 
+  TWSPlatformSocket = Tsocket;
+
+const
+  {$ifdef WINDOWS}
+  WSSocketInvalid = INVALID_SOCKET;
+  {$else}
+  WSSocketInvalid = TWSPlatformSocket(-1);
+  {$endif}
+
+type
+
   TWSClient = class
   private
-    FSock: Tsocket;
+    FSock: TWSPlatformSocket;
     FTls: TTransportSecurityConnection;
     FUseTls: Boolean;
     FProto: TWSProtocol;
@@ -152,19 +166,105 @@ begin
 end;
 {$endif}
 
+{$ifdef WINDOWS}
+type
+  PWSAddrInfo = ^TWSAddrInfo;
+  TWSAddrInfo = record
+    ai_flags: LongInt;
+    ai_family: LongInt;
+    ai_socktype: LongInt;
+    ai_protocol: LongInt;
+    ai_addrlen: PtrUInt;
+    ai_canonname: PAnsiChar;
+    ai_addr: PSockAddr;
+    ai_next: PWSAddrInfo;
+  end;
+
+function C_getaddrinfo(ANodeName, AServiceName: PAnsiChar;
+  AHints: PWSAddrInfo; out AResult: PWSAddrInfo): LongInt; stdcall;
+  external WINSOCK2_DLL name 'getaddrinfo';
+procedure C_freeaddrinfo(AInfo: PWSAddrInfo); stdcall;
+  external WINSOCK2_DLL name 'freeaddrinfo';
+
+var
+  WinSockInitialized: Boolean = False;
+
+procedure EnsureWinSockInitialized;
+var
+  Data: TWSAData;
+begin
+  if WinSockInitialized then Exit;
+  if WSAStartup($0202, Data) <> 0 then
+    raise EWSClient.Create('WSAStartup failed');
+  WinSockInitialized := True;
+end;
+
+function ResolveAndConnect(const AHost: string;
+  APort: Integer): TWSPlatformSocket;
+var
+  Hints: TWSAddrInfo;
+  Info, Current: PWSAddrInfo;
+  Host, Service: AnsiString;
+  One: Integer;
+begin
+  EnsureWinSockInitialized;
+  FillChar(Hints, SizeOf(Hints), 0);
+  Hints.ai_family := AF_INET;
+  Hints.ai_socktype := SOCK_STREAM;
+  Hints.ai_protocol := IPPROTO_TCP;
+  Host := AnsiString(AHost);
+  Service := AnsiString(IntToStr(APort));
+  Info := nil;
+  if C_getaddrinfo(PAnsiChar(Host), PAnsiChar(Service), @Hints, Info) <> 0 then
+    raise EWSClient.CreateFmt('cannot resolve %s', [AHost]);
+
+  Result := WSSocketInvalid;
+  try
+    Current := Info;
+    while Current <> nil do
+    begin
+      Result := WinSock2.socket(Current^.ai_family, Current^.ai_socktype,
+        Current^.ai_protocol);
+      if Result <> WSSocketInvalid then
+      begin
+        if WinSock2.connect(Result, Current^.ai_addr,
+            Current^.ai_addrlen) = 0 then Break;
+        WinSock2.closesocket(Result);
+        Result := WSSocketInvalid;
+      end;
+      Current := Current^.ai_next;
+    end;
+  finally
+    C_freeaddrinfo(Info);
+  end;
+  if Result = WSSocketInvalid then
+    raise EWSClient.CreateFmt('connect to %s:%d failed', [AHost, APort]);
+
+  One := 1;
+  WinSock2.setsockopt(Result, IPPROTO_TCP, TCP_NODELAY, @One, SizeOf(One));
+end;
+{$endif}
+
 { TWSClient }
 
 constructor TWSClient.Create;
 begin
   inherited;
-  FSock := -1;
+  FSock := WSSocketInvalid;
   SetLength(FRecvBuf, 64 * 1024);
 end;
 
 destructor TWSClient.Destroy;
 begin
   if FUseTls and FTls.Active then CloseTransportSecurity(FTls);
-  if FSock >= 0 then CloseSocket(FSock);
+  if FSock <> WSSocketInvalid then
+  begin
+    {$ifdef UNIX}
+    CloseSocket(FSock);
+    {$else}
+    WinSock2.closesocket(FSock);
+    {$endif}
+  end;
   FProto.Free;
   inherited;
 end;
@@ -174,7 +274,11 @@ begin
   if FUseTls then
     Result := TransportSecurityRead(FTls, PByte(P)^, ALen)
   else
+    {$ifdef UNIX}
     Result := fpRecv(FSock, P, ALen, 0);
+    {$else}
+    Result := WinSock2.recv(FSock, P^, ALen, 0);
+    {$endif}
 end;
 
 function TWSClient.RawWrite(P: PByte; ALen: Integer): Integer;
@@ -182,7 +286,11 @@ begin
   if FUseTls then
     Result := TransportSecurityWrite(FTls, P, ALen)
   else
+    {$ifdef UNIX}
     Result := fpSend(FSock, P, ALen, 0);
+    {$else}
+    Result := WinSock2.send(FSock, P^, ALen, 0);
+    {$endif}
 end;
 
 procedure TWSClient.FlushOut;
@@ -233,7 +341,7 @@ begin
   {$ifdef UNIX}
   FSock := ResolveAndConnect(Host, Port);
   {$else}
-  raise EWSClient.Create('WS.Client: this platform is not wired up yet');
+  FSock := ResolveAndConnect(Host, Port);
   {$endif}
 
   if FUseTls then
@@ -358,10 +466,14 @@ begin
   end;
   FOpen := False;
   if FUseTls and FTls.Active then CloseTransportSecurity(FTls);
-  if FSock >= 0 then
+  if FSock <> WSSocketInvalid then
   begin
+    {$ifdef UNIX}
     CloseSocket(FSock);
-    FSock := -1;
+    {$else}
+    WinSock2.closesocket(FSock);
+    {$endif}
+    FSock := WSSocketInvalid;
   end;
 end;
 

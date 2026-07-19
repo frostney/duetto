@@ -13,9 +13,9 @@ issues use them in exactly this sense.
   (ADR-0001): it moves bytes and connection lifecycle events between
   the OS and the sans-I/O core. Named for the ecosystem convention
   (Netty transports, NIOTransportServices); ADR-0001/0002 say
-  *backend* for the same concept. Existing: epoll (Linux) and
-  Network.framework (macOS), both behind `WS.Transport`; planned:
-  IOCP (Windows).
+  *backend* for the same concept. Existing: epoll (Linux),
+  Network.framework (macOS), and IOCP (Windows), all behind
+  `WS.Transport`.
 - **Completion model** — the seam's contract: operations are submitted
   and later reported complete. Readiness-based OS APIs (epoll) adapt to
   it; completion-based APIs (IOCP, Network.framework) implement it

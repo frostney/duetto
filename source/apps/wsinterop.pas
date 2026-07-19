@@ -11,10 +11,17 @@ program wsinterop;
 
 uses
   {$ifdef UNIX} cthreads, {$endif}
-  SysUtils, Classes, BaseUnix, Sockets,
+  SysUtils, Classes, Sockets,
   WS.Server, WS.Client, WS.Frame, WS.Handshake;
 
 type
+  {$ifdef UNIX}
+  TInteropTimeVal = record
+    Seconds: PtrInt;
+    Microseconds: PtrInt;
+  end;
+  {$endif}
+
   TEcho = class
     procedure OnMsg(AConn: TWSConnection; AText: Boolean; P: PByte; Len: NativeInt);
   end;
@@ -66,11 +73,21 @@ end;
 function RawConnect(APort: Word): Tsocket;
 var
   SA: TInetSockAddr;
-  TV: TTimeVal;
+  {$ifdef WINDOWS}
+  TimeoutMs: Cardinal;
+  {$else}
+  TV: TInteropTimeVal;
+  {$endif}
 begin
   Result := fpSocket(AF_INET, SOCK_STREAM, 0);
-  TV.tv_sec := 5; TV.tv_usec := 0;
+  {$ifdef WINDOWS}
+  TimeoutMs := 5000;
+  fpSetSockOpt(Result, SOL_SOCKET, SO_RCVTIMEO, @TimeoutMs,
+    SizeOf(TimeoutMs));
+  {$else}
+  TV.Seconds := 5; TV.Microseconds := 0;
   fpSetSockOpt(Result, SOL_SOCKET, SO_RCVTIMEO, @TV, SizeOf(TV));
+  {$endif}
   FillChar(SA, SizeOf(SA), 0);
   SA.sin_family := AF_INET;
   SA.sin_port := htons(APort);

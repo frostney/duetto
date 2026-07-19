@@ -4,13 +4,14 @@
 
 - Prerequisites: FPC 3.2.2, the lwpt **release binary** on PATH, Lefthook, and Docker for the Autobahn suite.
 - `lwpt install` resolves dependencies from the lwpt release tag, `lwpt build` compiles the programs, `lwpt test` runs the unit suites.
-- Every program builds on Linux and macOS; the server rides the platform transport (epoll / Network.framework). Windows is roadmapped (#3).
+- Every program builds on Linux, macOS, and Windows; the server rides the platform transport (epoll / Network.framework / IOCP).
 - `lefthook install` wires the pre-commit formatter hook.
 
 ## Setup
 
-Install lwpt from its release (pick the tarball for your platform —
-`linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`):
+Install lwpt from its release (pick the archive for your platform —
+`linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64` tarballs, or the
+`windows-x64` / `windows-x86` zips):
 
 ```bash
 curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.2.0/lwpt-0.2.0-macos-arm64.tar.gz
@@ -36,7 +37,7 @@ no sibling checkout is needed. The committed `.lwpt/modules/` tree plus
 ## Build and test
 
 ```bash
-lwpt build           # all five programs (Linux and macOS)
+lwpt build           # all five programs (Linux, macOS, Windows)
 lwpt test            # five suites, all green
 ./build/wsinterop    # live-socket battery, exit 0 = pass
 ```
