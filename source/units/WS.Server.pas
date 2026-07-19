@@ -1,36 +1,34 @@
 unit WS.Server;
 
-// Single-threaded epoll reactor (Linux). The shape every fast WebSocket
-// server converges on — uWebSockets, tokio-websockets' bench harness,
-// websocket.zig's nonblocking mode — one event loop, nonblocking sockets,
-// level-triggered readiness, EPOLLOUT armed only while a connection has
-// backlog.
+// Platform-neutral WebSocket server session layer. Per connection: a
+// TWSProtocol does every byte of RFC 6455; this unit only moves bytes
+// between the platform transport (WS.Transport, selected per platform
+// below) and that machine. Handshakes are accumulated until the blank
+// line, parsed by WS.Handshake, answered, and the connection flips from
+// "handshaking" to "open".
 //
-// Per connection: a TWSProtocol does every byte of RFC 6455; this unit
-// only moves bytes between epoll and that machine. Handshakes are
-// accumulated until the blank line, parsed by WS.Handshake, answered, and
-// the socket flips from "handshaking" to "open".
-//
-// Reads land in ONE shared 256 KB buffer — Ingest consumes it fully
-// (copying only partial trailing frames into the connection's carry), so
-// by the next readiness event the buffer is free again. Zero steady-state
-// allocation on the hot echo path.
+// Concurrency (ADR-0003): callbacks fire on the transport's execution
+// context — the Run thread on Linux (epoll), per-connection serial
+// dispatch queues on macOS (Network.framework). Per-connection order is
+// guaranteed everywhere; handlers for DIFFERENT connections may run
+// concurrently on macOS, so cross-connection state in user handlers
+// needs the user's own synchronization. The hot path here is confined
+// to one connection and stays lock-free; the only lock guards the
+// connection registry on accept/close (cold path).
 
 {$I Shared.inc}
 
 interface
 
-{$ifdef LINUX}
+{$if defined(LINUX) or defined(DARWIN)}
 
 uses
-  BaseUnix,
+  syncobjs,
   SysUtils,
-  Unix,
 
-  Linux,
-  Sockets,
   WS.Handshake,
-  WS.Protocol;
+  WS.Protocol,
+  WS.Transport;
 
 type
   TWSServer = class;
@@ -40,12 +38,12 @@ type
   TWSConnection = class
   private
     FServer: TWSServer;
-    FFd: Integer;
+    FTConn: TWSTransportConn;
     FState: TWSConnState;
     FProto: TWSProtocol;
     FHsBuf: RawByteString;     // handshake accumulator
-    FWantWrite: Boolean;
     procedure ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
+    function GetId: NativeUInt;
   public
     UserData: Pointer;
     destructor Destroy; override;
@@ -53,7 +51,7 @@ type
     procedure SendBinary(P: PByte; ALen: NativeInt);
     procedure Close(ACode: Word = 1000; const AReason: string = '');
     property Proto: TWSProtocol read FProto;
-    property Fd: Integer read FFd;
+    property Id: NativeUInt read GetId;
   end;
 
   TWSServerMessage = procedure(AConn: TWSConnection; AText: Boolean;
@@ -62,35 +60,46 @@ type
 
   TWSServer = class
   private
-    FListenFd, FEpFd: Integer;
-    FPort: Word;
+    FTransport: TWSTransport;
     FAllowDeflate: Boolean;
     FMaxMessage: NativeInt;
-    FConns: array of TWSConnection;   // fd-indexed
-    FRecv: TBytes;                    // shared read buffer
-    FRunning: Boolean;
+    FConns: array of TWSConnection;
+    FConnCount: Integer;
+    FLock: TCriticalSection;
     FOnMessage: TWSServerMessage;
     FOnOpen, FOnClose: TWSServerNotify;
 
-    procedure EpollMod(AFd: Integer; AEvents: Cardinal);
-    procedure Track(AConn: TWSConnection);
-    procedure Drop(AConn: TWSConnection);
-    procedure AcceptPending;
-    procedure HandleReadable(AConn: TWSConnection);
-    procedure HandleWritable(AConn: TWSConnection);
-    procedure FlushConn(AConn: TWSConnection);
-    procedure FinishHandshake(AConn: TWSConnection);
+    procedure RegistryAdd(AConn: TWSConnection);
+    procedure RegistryRemove(AConn: TWSConnection);
+    // Caller-initiated teardown; returns False so drop sites can chain
+    // "Exit(DropConn(...))". The connection is freed on return.
+    function DropConn(AConn: TWSConnection): Boolean;
+    // Hands pending protocol output to the transport. False = the
+    // connection died and was dropped.
+    function FlushConn(AConn: TWSConnection): Boolean;
+    function FinishHandshake(AConn: TWSConnection): Boolean;
+    function IngestAndFlush(AConn: TWSConnection; P: PByte;
+      ALen: NativeInt): Boolean;
+
+    procedure HandleAccept(ATConn: TWSTransportConn);
+    procedure HandleData(ATConn: TWSTransportConn; P: PByte; ALen: NativeInt);
+    procedure HandleSendReady(ATConn: TWSTransportConn);
+    procedure HandleClosed(ATConn: TWSTransportConn);
+    function GetPort: Word;
   public
     constructor Create(APort: Word; AAllowDeflate: Boolean = True;
-      AMaxMessage: NativeInt = 16 * 1024 * 1024);
+      AMaxMessage: NativeInt = 16 * 1024 * 1024); overload;
+    constructor Create(APort: Word; const ATls: TWSTransportTls;
+      AAllowDeflate: Boolean = True;
+      AMaxMessage: NativeInt = 16 * 1024 * 1024); overload;
     destructor Destroy; override;
 
-    // Blocks. ATimeoutMs >= 0 returns after one epoll_wait round (test use);
-    // -1 loops until Stop.
+    // Blocks. ATimeoutMs >= 0 returns after one completion round (test
+    // use); -1 loops until Stop.
     procedure Run(ATimeoutMs: Integer = -1);
     procedure Stop;
 
-    property Port: Word read FPort;
+    property Port: Word read GetPort;
     property OnMessage: TWSServerMessage read FOnMessage write FOnMessage;
     property OnOpen: TWSServerNotify read FOnOpen write FOnOpen;
     property OnClientClose: TWSServerNotify read FOnClose write FOnClose;
@@ -100,23 +109,15 @@ type
 
 implementation
 
-{$ifdef LINUX}
+{$if defined(LINUX) or defined(DARWIN)}
 
-procedure SetNonBlocking(AFd: Integer);
-var
-  Fl: Integer;
-begin
-  Fl := FpFcntl(AFd, F_GETFL, 0);
-  FpFcntl(AFd, F_SETFL, Fl or O_NONBLOCK);
-end;
-
-procedure SetNoDelay(AFd: Integer);
-var
-  One: Integer;
-begin
-  One := 1;
-  fpSetSockOpt(AFd, IPPROTO_TCP, TCP_NODELAY, @One, SizeOf(One));
-end;
+uses
+  {$ifdef LINUX}
+  WS.Transport.Epoll;
+  {$endif}
+  {$ifdef DARWIN}
+  WS.Transport.NetworkFramework;
+  {$endif}
 
 { TWSConnection }
 
@@ -124,6 +125,11 @@ destructor TWSConnection.Destroy;
 begin
   FProto.Free;
   inherited;
+end;
+
+function TWSConnection.GetId: NativeUInt;
+begin
+  Result := FTConn.Id;
 end;
 
 procedure TWSConnection.ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
@@ -164,276 +170,236 @@ end;
 
 constructor TWSServer.Create(APort: Word; AAllowDeflate: Boolean;
   AMaxMessage: NativeInt);
-var
-  SA: TInetSockAddr;
-  One: Integer;
-  Ev: TEPoll_Event;
-  Len: TSockLen;
+begin
+  Create(APort, WSTransportNoTls, AAllowDeflate, AMaxMessage);
+end;
+
+constructor TWSServer.Create(APort: Word; const ATls: TWSTransportTls;
+  AAllowDeflate: Boolean; AMaxMessage: NativeInt);
 begin
   inherited Create;
   FAllowDeflate := AAllowDeflate;
   FMaxMessage := AMaxMessage;
-  SetLength(FRecv, 256 * 1024);
-
-  FListenFd := fpSocket(AF_INET, SOCK_STREAM, 0);
-  if FListenFd < 0 then raise Exception.Create('socket() failed');
-  One := 1;
-  fpSetSockOpt(FListenFd, SOL_SOCKET, SO_REUSEADDR, @One, SizeOf(One));
-
-  FillChar(SA, SizeOf(SA), 0);
-  SA.sin_family := AF_INET;
-  SA.sin_port := htons(APort);
-  SA.sin_addr.s_addr := 0; // INADDR_ANY
-  if fpBind(FListenFd, @SA, SizeOf(SA)) <> 0 then
-    raise Exception.CreateFmt('bind to port %d failed', [APort]);
-  if fpListen(FListenFd, 511) <> 0 then
-    raise Exception.Create('listen() failed');
-
-  // Port 0 = kernel-assigned; read back what we actually got.
-  Len := SizeOf(SA);
-  fpGetSockName(FListenFd, @SA, @Len);
-  FPort := ntohs(SA.sin_port);
-
-  SetNonBlocking(FListenFd);
-
-  FEpFd := epoll_create(1024);
-  if FEpFd < 0 then raise Exception.Create('epoll_create failed');
-  Ev.events := EPOLLIN;
-  Ev.data.fd := FListenFd;
-  epoll_ctl(FEpFd, EPOLL_CTL_ADD, FListenFd, @Ev);
+  FLock := TCriticalSection.Create;
+  {$ifdef LINUX}
+  FTransport := TWSEpollTransport.Create(APort, ATls);
+  {$endif}
+  {$ifdef DARWIN}
+  FTransport := TWSNetworkFrameworkTransport.Create(APort, ATls);
+  {$endif}
+  FTransport.OnAccept := HandleAccept;
+  FTransport.OnData := HandleData;
+  FTransport.OnSendReady := HandleSendReady;
+  FTransport.OnClosed := HandleClosed;
 end;
 
 destructor TWSServer.Destroy;
 var
   I: Integer;
 begin
-  for I := 0 to High(FConns) do
-    if FConns[I] <> nil then
-    begin
-      FileClose(FConns[I].FFd);
-      FConns[I].Free;
-    end;
-  if FEpFd >= 0 then FileClose(FEpFd);
-  if FListenFd >= 0 then CloseSocket(FListenFd);
+  // Stop has been called and Run has returned by contract; teardown is
+  // single-threaded from here.
+  for I := 0 to FConnCount - 1 do
+  begin
+    FConns[I].FTConn.UserData := nil;
+    FConns[I].FTConn.SubmitClose;
+    FConns[I].Free;
+  end;
+  FTransport.Free;
+  FLock.Free;
   inherited;
 end;
 
-procedure TWSServer.EpollMod(AFd: Integer; AEvents: Cardinal);
+procedure TWSServer.RegistryAdd(AConn: TWSConnection);
+begin
+  FLock.Acquire;
+  try
+    if FConnCount = Length(FConns) then
+      SetLength(FConns, FConnCount + 64);
+    FConns[FConnCount] := AConn;
+    Inc(FConnCount);
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TWSServer.RegistryRemove(AConn: TWSConnection);
 var
-  Ev: TEPoll_Event;
+  I: Integer;
 begin
-  Ev.events := AEvents;
-  Ev.data.fd := AFd;
-  epoll_ctl(FEpFd, EPOLL_CTL_MOD, AFd, @Ev);
+  FLock.Acquire;
+  try
+    for I := 0 to FConnCount - 1 do
+      if FConns[I] = AConn then
+      begin
+        FConns[I] := FConns[FConnCount - 1];
+        FConns[FConnCount - 1] := nil;
+        Dec(FConnCount);
+        Break;
+      end;
+  finally
+    FLock.Release;
+  end;
 end;
 
-procedure TWSServer.Track(AConn: TWSConnection);
+function TWSServer.DropConn(AConn: TWSConnection): Boolean;
 begin
-  if AConn.FFd >= Length(FConns) then
-    SetLength(FConns, AConn.FFd + 64);
-  FConns[AConn.FFd] := AConn;
-end;
-
-procedure TWSServer.Drop(AConn: TWSConnection);
-begin
-  epoll_ctl(FEpFd, EPOLL_CTL_DEL, AConn.FFd, nil);
-  CloseSocket(AConn.FFd);
-  FConns[AConn.FFd] := nil;
+  Result := False;
+  RegistryRemove(AConn);
   if (AConn.FState <> wcsHandshake) and Assigned(FOnClose) then
     FOnClose(AConn);
+  AConn.FTConn.UserData := nil;
+  AConn.FTConn.SubmitClose;
   AConn.Free;
 end;
 
-procedure TWSServer.AcceptPending;
+function TWSServer.FlushConn(AConn: TWSConnection): Boolean;
 var
-  Fd: Integer;
-  Conn: TWSConnection;
-  Ev: TEPoll_Event;
+  W: NativeInt;
 begin
-  repeat
-    Fd := fpAccept(FListenFd, nil, nil);
-    if Fd < 0 then Exit; // EAGAIN: drained
-    SetNonBlocking(Fd);
-    SetNoDelay(Fd);
-    Conn := TWSConnection.Create;
-    Conn.FServer := Self;
-    Conn.FFd := Fd;
-    Conn.FState := wcsHandshake;
-    Track(Conn);
-    Ev.events := EPOLLIN;
-    Ev.data.fd := Fd;
-    epoll_ctl(FEpFd, EPOLL_CTL_ADD, Fd, @Ev);
-  until False;
+  Result := True;
+  if AConn.FProto.OutPending = 0 then Exit;
+  W := AConn.FTConn.SubmitSend(AConn.FProto.OutPtr, AConn.FProto.OutPending);
+  if W < 0 then Exit(DropConn(AConn));
+  AConn.FProto.OutConsume(W);
+  // Anything still pending is backpressure: the transport fires
+  // OnSendReady when it can take more.
 end;
 
-procedure TWSServer.FinishHandshake(AConn: TWSConnection);
+function TWSServer.FinishHandshake(AConn: TWSConnection): Boolean;
 var
   HS: TWSServerHandshake;
   Resp: RawByteString;
 begin
+  Result := False;
   if not ServerParseRequest(AConn.FHsBuf, FAllowDeflate, HS) then
   begin
     Resp := ServerBuildReject(400, HS.Failure);
-    fpSend(AConn.FFd, @Resp[1], Length(Resp), 0);
-    Drop(AConn);
-    Exit;
+    AConn.FTConn.SubmitSend(@Resp[1], Length(Resp)); // best effort
+    Exit(DropConn(AConn));
   end;
 
   AConn.FProto := TWSProtocol.Create(wsrServer, HS.Deflate, FMaxMessage);
   AConn.FProto.OnMessage := AConn.ProtoMessage;
 
-  // Hand the 101 to the protocol's out queue so a partial send shares the
-  // one backpressure path (EPOLLOUT arming, ordered before any frame the
-  // open handler queues).
+  // Hand the 101 to the protocol's out queue so a partial send shares
+  // the one backpressure path (ordered before any frame the open
+  // handler queues).
   Resp := ServerBuildResponse(HS);
   AConn.FProto.QueueRaw(@Resp[1], Length(Resp));
   AConn.FState := wcsOpen;
   AConn.FHsBuf := '';
-  FlushConn(AConn);
-  if FConns[AConn.FFd] <> AConn then Exit; // send error dropped it
+  if not FlushConn(AConn) then Exit;
 
   if Assigned(FOnOpen) then FOnOpen(AConn);
+  Result := True;
 end;
 
-procedure TWSServer.HandleReadable(AConn: TWSConnection);
-var
-  Got: Integer;
-  HdrEnd: Integer;
-  Off: Integer;
+function TWSServer.IngestAndFlush(AConn: TWSConnection; P: PByte;
+  ALen: NativeInt): Boolean;
 begin
-  repeat
-    Got := fpRecv(AConn.FFd, @FRecv[0], Length(FRecv), 0);
-    if Got = 0 then
-    begin
-      Drop(AConn);
-      Exit;
-    end;
-    if Got < 0 then Exit; // EAGAIN
-
-    case AConn.FState of
-      wcsHandshake:
-        begin
-          Off := Length(AConn.FHsBuf);
-          SetLength(AConn.FHsBuf, Off + Got);
-          Move(FRecv[0], AConn.FHsBuf[Off + 1], Got);
-          if Length(AConn.FHsBuf) > 16 * 1024 then
-          begin
-            Drop(AConn);
-            Exit;
-          end;
-          HdrEnd := HandshakeFindEnd(AConn.FHsBuf);
-          if HdrEnd > 0 then
-          begin
-            // Frames pipelined behind the request get replayed post-101.
-            FinishHandshake(AConn);
-            if FConns[AConn.FFd] <> AConn then Exit; // dropped
-            if AConn.FState = wcsOpen then
-              if HdrEnd < Off + Got then
-                if not AConn.FProto.Ingest(@FRecv[HdrEnd - Off], Off + Got - HdrEnd) then
-                begin
-                  FlushConn(AConn);
-                  Exit;
-                end;
-          end;
-        end;
-      wcsOpen, wcsClosing:
-        begin
-          if not AConn.FProto.Ingest(@FRecv[0], Got) then
-          begin
-            FlushConn(AConn); // get the close frame out, then die
-            if FConns[AConn.FFd] = AConn then Drop(AConn);
-            Exit;
-          end;
-          FlushConn(AConn);
-          if FConns[AConn.FFd] <> AConn then Exit;
-          if AConn.FProto.CloseDone and (AConn.FProto.OutPending = 0) then
-          begin
-            Drop(AConn);
-            Exit;
-          end;
-        end;
-    end;
-  until False;
-end;
-
-procedure TWSServer.FlushConn(AConn: TWSConnection);
-var
-  N, W: NativeInt;
-begin
-  while AConn.FProto.OutPending > 0 do
+  Result := False;
+  if not AConn.FProto.Ingest(P, ALen) then
   begin
-    N := AConn.FProto.OutPending;
-    W := fpSend(AConn.FFd, AConn.FProto.OutPtr, N, MSG_NOSIGNAL);
-    if W < 0 then
-    begin
-      if fpgeterrno = ESysEAGAIN then
+    // Get the close frame out, then die.
+    if FlushConn(AConn) then DropConn(AConn);
+    Exit;
+  end;
+  if not FlushConn(AConn) then Exit;
+  if AConn.FProto.CloseDone and (AConn.FProto.OutPending = 0) then
+    Exit(DropConn(AConn));
+  Result := True;
+end;
+
+procedure TWSServer.HandleAccept(ATConn: TWSTransportConn);
+var
+  Conn: TWSConnection;
+begin
+  Conn := TWSConnection.Create;
+  Conn.FServer := Self;
+  Conn.FTConn := ATConn;
+  Conn.FState := wcsHandshake;
+  ATConn.UserData := Conn;
+  RegistryAdd(Conn);
+end;
+
+procedure TWSServer.HandleData(ATConn: TWSTransportConn; P: PByte;
+  ALen: NativeInt);
+var
+  Conn: TWSConnection;
+  Off, HdrEnd, LeftLen: Integer;
+  Left: TBytes;
+begin
+  Conn := TWSConnection(ATConn.UserData);
+  if Conn = nil then Exit;
+
+  case Conn.FState of
+    wcsHandshake:
       begin
-        if not AConn.FWantWrite then
+        Off := Length(Conn.FHsBuf);
+        SetLength(Conn.FHsBuf, Off + ALen);
+        Move(P^, Conn.FHsBuf[Off + 1], ALen);
+        if Length(Conn.FHsBuf) > 16 * 1024 then
         begin
-          AConn.FWantWrite := True;
-          EpollMod(AConn.FFd, EPOLLIN or EPOLLOUT);
+          DropConn(Conn);
+          Exit;
         end;
-        Exit;
+        HdrEnd := HandshakeFindEnd(Conn.FHsBuf);
+        if HdrEnd = 0 then Exit;
+        // Frames pipelined behind the request get replayed post-101.
+        LeftLen := Length(Conn.FHsBuf) - HdrEnd;
+        if LeftLen > 0 then
+        begin
+          SetLength(Left, LeftLen);
+          Move(Conn.FHsBuf[HdrEnd + 1], Left[0], LeftLen);
+        end;
+        if not FinishHandshake(Conn) then Exit;
+        if (Conn.FState = wcsOpen) and (LeftLen > 0) then
+          IngestAndFlush(Conn, @Left[0], LeftLen);
       end;
-      Drop(AConn);
-      Exit;
-    end;
-    AConn.FProto.OutConsume(W);
-  end;
-  if AConn.FWantWrite then
-  begin
-    AConn.FWantWrite := False;
-    EpollMod(AConn.FFd, EPOLLIN);
+    wcsOpen, wcsClosing:
+      IngestAndFlush(Conn, P, ALen);
   end;
 end;
 
-procedure TWSServer.HandleWritable(AConn: TWSConnection);
+procedure TWSServer.HandleSendReady(ATConn: TWSTransportConn);
+var
+  Conn: TWSConnection;
 begin
-  FlushConn(AConn);
-  if FConns[AConn.FFd] <> AConn then Exit;
-  if AConn.FProto <> nil then
-    if AConn.FProto.CloseDone and (AConn.FProto.OutPending = 0) then
-      Drop(AConn);
+  Conn := TWSConnection(ATConn.UserData);
+  if Conn = nil then Exit;
+  if not FlushConn(Conn) then Exit;
+  if Conn.FProto <> nil then
+    if Conn.FProto.CloseDone and (Conn.FProto.OutPending = 0) then
+      DropConn(Conn);
+end;
+
+procedure TWSServer.HandleClosed(ATConn: TWSTransportConn);
+var
+  Conn: TWSConnection;
+begin
+  Conn := TWSConnection(ATConn.UserData);
+  if Conn = nil then Exit;
+  RegistryRemove(Conn);
+  if (Conn.FState <> wcsHandshake) and Assigned(FOnClose) then
+    FOnClose(Conn);
+  Conn.Free;
+  // The transport frees ATConn after this callback returns.
+end;
+
+function TWSServer.GetPort: Word;
+begin
+  Result := FTransport.Port;
 end;
 
 procedure TWSServer.Run(ATimeoutMs: Integer);
-var
-  Evs: array[0..255] of TEPoll_Event;
-  N, I, Fd: Integer;
-  Conn: TWSConnection;
 begin
-  FRunning := True;
-  repeat
-    N := epoll_wait(FEpFd, @Evs[0], Length(Evs), ATimeoutMs);
-    for I := 0 to N - 1 do
-    begin
-      Fd := Evs[I].data.fd;
-      if Fd = FListenFd then
-      begin
-        AcceptPending;
-        Continue;
-      end;
-      if (Fd >= Length(FConns)) or (FConns[Fd] = nil) then Continue;
-      Conn := FConns[Fd];
-      if (Evs[I].events and (EPOLLERR or EPOLLHUP)) <> 0 then
-      begin
-        Drop(Conn);
-        Continue;
-      end;
-      if (Evs[I].events and EPOLLOUT) <> 0 then
-      begin
-        HandleWritable(Conn);
-        if FConns[Fd] <> Conn then Continue;
-      end;
-      if (Evs[I].events and EPOLLIN) <> 0 then
-        HandleReadable(Conn);
-    end;
-  until (not FRunning) or (ATimeoutMs >= 0);
+  FTransport.Run(ATimeoutMs);
 end;
 
 procedure TWSServer.Stop;
 begin
-  FRunning := False;
+  FTransport.Stop;
 end;
 
 {$endif}
