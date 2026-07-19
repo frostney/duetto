@@ -113,14 +113,16 @@ jobs:
             fi
           done
           echo "LWPT_FPC_UNIT_PATHS=$FPC_UNIT_PATHS" >> "$GITHUB_ENV"
-          # win64 legs: drive the cross backend through the fpc driver so
-          # binaries are genuinely x86_64 (choco's default target is
-          # i386-win32).
+          # win64 legs: use the x86_64 cross backend directly so binaries
+          # are genuinely 64-bit (choco's default target is i386-win32; a
+          # .cmd wrapper is not CreateProcess-spawnable by lwpt).
           if [ "${{ matrix.fpc-win-target }}" = "x86_64-win64" ]; then
-            WRAP_DIR="$RUNNER_TEMP/fpc-win64"
-            mkdir -p "$WRAP_DIR"
-            printf '@echo off\r\n"%s" -Px86_64 %%*\r\n' "$(cygpath -w "$FPC_BIN")" > "$WRAP_DIR/fpc-win64.cmd"
-            echo "LWPT_FPC=$(cygpath -w "$WRAP_DIR/fpc-win64.cmd")" >> "$GITHUB_ENV"
+            PPCX64=$(find "$(dirname "$FPC_BIN")" -name ppcrossx64.exe -type f 2>/dev/null | head -1)
+            if [ -z "$PPCX64" ]; then
+              PPCX64=$(find /c/tools/freepascal /c/fpc -name ppcrossx64.exe -type f 2>/dev/null | head -1)
+            fi
+            if [ -z "$PPCX64" ]; then echo "::error::ppcrossx64.exe not found in the FPC install"; exit 1; fi
+            echo "LWPT_FPC=$(cygpath -w "$PPCX64")" >> "$GITHUB_ENV"
           fi
 
       - name: Install lwpt (release binary, checksum-verified)
