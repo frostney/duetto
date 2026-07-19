@@ -80,6 +80,7 @@ jobs:
             lwpt-archive: zip
             fpc-install: choco
             exe: .exe
+            frozen-install: skip   # lwpt#78: frozen tree-hash not path-portable on Windows
             crosscheck: skip   # python venv on the win runners is a follow-up
           - target: i386-win32
             runner: windows-latest
@@ -87,6 +88,7 @@ jobs:
             lwpt-archive: zip
             fpc-install: choco
             exe: .exe
+            frozen-install: skip   # lwpt#78: frozen tree-hash not path-portable on Windows
             crosscheck: skip
     runs-on: ${{ matrix.runner }}
     defaults:
@@ -168,7 +170,14 @@ jobs:
           echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
 
       - name: lwpt install --frozen (verify lockfile + committed modules)
+        if: matrix.frozen-install != 'skip'
         run: lwpt install --frozen
+
+      # Windows: lwpt#78 — the frozen verifier's tree hash is not yet
+      # path-portable; mirror lwpt's own Windows CI and install online.
+      - name: lwpt install (Windows)
+        if: matrix.frozen-install == 'skip'
+        run: lwpt install
 
       - name: lwpt format --check (one runner)
         if: matrix.format-check == true
