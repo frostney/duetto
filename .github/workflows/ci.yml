@@ -153,8 +153,7 @@ jobs:
       - name: lwpt install + build (wsecho + wsautobahn)
         run: |
           lwpt install --frozen
-          lwpt build wsecho
-          lwpt build wsautobahn
+          lwpt build wsecho wsautobahn
 
       - name: Autobahn fuzzingclient vs wsecho (server under test)
         run: ./tools/autobahn.sh server
