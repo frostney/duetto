@@ -43,17 +43,11 @@ type
     procedure SubmitClose; override;
   end;
 
-  TWSAcceptEx = function(AListenSocket, AAcceptSocket: TSocket;
-    AOutputBuffer: Pointer; AReceiveDataLength, ALocalAddressLength,
-    ARemoteAddressLength: DWORD; ABytesReceived: PDWORD;
-    AOverlapped: POverlapped): BOOL; stdcall;
-
   TWSIocpTransport = class(TWSTransport)
   private
     FListenSocket: TSocket;
     FAcceptSocket: TSocket;
     FCompletionPort: THandle;
-    FAcceptEx: TWSAcceptEx;
     FAcceptOverlapped: TOverlapped;
     FAcceptBuffer: array[0..(2 * (SizeOf(TSockAddrIn) + 16)) - 1] of Byte;
     FAcceptPending: Boolean;
@@ -90,7 +84,6 @@ implementation
 
 const
   WSA_FLAG_OVERLAPPED = $00000001;
-  SIO_GET_EXTENSION_FUNCTION_POINTER = $C8000006;
   SO_UPDATE_ACCEPT_CONTEXT = $700B;
   WinErrorIoPending = 997;
   InfiniteWait = DWORD($FFFFFFFF);
@@ -98,8 +91,6 @@ const
   WakeCompletionKey = PtrUInt(2);
   LiveTableGrowth = 64;
   AcceptAddressLength = SizeOf(TSockAddrIn) + 16;
-  AcceptExGuid: TGUID = (D1: $B5367DF1; D2: $CBAC; D3: $11CF;
-    D4: ($95, $CA, $00, $80, $5F, $48, $A1, $92));
 
 type
   PWSIocpBuffer = ^TWSIocpBuffer;
@@ -113,11 +104,15 @@ type
 function C_WSASocketW(AFamily, ASocketType, AProtocol: Integer;
   AProtocolInfo: Pointer; AGroup, AFlags: DWORD): TSocket; stdcall;
   external WINSOCK2_DLL name 'WSASocketW';
-function C_WSAIoctl(ASocket: TSocket; ACode: DWORD; AInput: Pointer;
-  AInputLength: DWORD; AOutput: Pointer; AOutputLength: DWORD;
-  ABytesReturned: PDWORD; AOverlapped: POverlapped;
-  ACompletionRoutine: Pointer): Integer; stdcall;
-  external WINSOCK2_DLL name 'WSAIoctl';
+// AcceptEx is a static export of mswsock.dll; the
+// SIO_GET_EXTENSION_FUNCTION_POINTER route saves an internal per-call
+// lookup but failed with WSAEFAULT under i386 FPC — the direct import
+// binds once at load and needs no resolution machinery.
+function C_AcceptEx(AListenSocket, AAcceptSocket: TSocket;
+  AOutputBuffer: Pointer; AReceiveDataLength, ALocalAddressLength,
+  ARemoteAddressLength: DWORD; ABytesReceived: PDWORD;
+  AOverlapped: POverlapped): BOOL; stdcall;
+  external 'mswsock.dll' name 'AcceptEx';
 function C_WSARecv(ASocket: TSocket; ABuffers: PWSIocpBuffer;
   ABufferCount: DWORD; ABytesReceived, AFlags: PDWORD;
   AOverlapped: POverlapped; ACompletionRoutine: Pointer): Integer; stdcall;
@@ -221,7 +216,6 @@ constructor TWSIocpTransport.Create(APort: Word;
 var
   Address: TSockAddrIn;
   AddressLength: Integer;
-  Bytes: DWORD;
   Data: TWSAData;
   One: Integer;
 begin
@@ -264,11 +258,6 @@ begin
   if FCompletionPort = 0 then
     raise Exception.CreateFmt('CreateIoCompletionPort() failed (%d)', [GetLastError]);
 
-  Bytes := 0;
-  if C_WSAIoctl(FListenSocket, SIO_GET_EXTENSION_FUNCTION_POINTER,
-      @AcceptExGuid, SizeOf(AcceptExGuid), @FAcceptEx, SizeOf(FAcceptEx),
-      @Bytes, nil, nil) <> 0 then
-    raise Exception.CreateFmt('could not resolve AcceptEx (%d)', [WSAGetLastError]);
 end;
 
 destructor TWSIocpTransport.Destroy;
@@ -330,7 +319,7 @@ begin
   FillChar(FAcceptOverlapped, SizeOf(FAcceptOverlapped), 0);
   FillChar(FAcceptBuffer, SizeOf(FAcceptBuffer), 0);
   Bytes := 0;
-  if not FAcceptEx(FListenSocket, FAcceptSocket, @FAcceptBuffer[0], 0,
+  if not C_AcceptEx(FListenSocket, FAcceptSocket, @FAcceptBuffer[0], 0,
       AcceptAddressLength, AcceptAddressLength, @Bytes,
       @FAcceptOverlapped) then
     if WSAGetLastError <> WinErrorIoPending then
