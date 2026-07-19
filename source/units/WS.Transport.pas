@@ -98,6 +98,12 @@ type
     // Connection teardown belongs to Shutdown/destruction.
     procedure Stop; virtual; abstract;
 
+    // Constructors bind and resolve Port but deliver no completions;
+    // connections arriving before Open are refused. Wire the four
+    // events, then Open — closes the window where an accept could fire
+    // with no session attached.
+    procedure Open; virtual;
+
     // Quiesce: cancel every connection and block until no completion
     // can ever fire again. Must be called (with Run returned) before
     // the session frees its per-connection state; the transport frees
@@ -123,6 +129,11 @@ begin
   Result.Enabled := False;
   Result.Pkcs12Path := '';
   Result.Pkcs12Passphrase := '';
+end;
+
+procedure TWSTransport.Open;
+begin
+  // Readiness-driven transports accept only inside Run; nothing to arm.
 end;
 
 procedure TWSTransport.SetPort(AValue: Word);

@@ -42,6 +42,7 @@ type
   TWSEpollTransport = class(TWSTransport)
   private
     FListenFd, FEpFd: Integer;
+    FWakeFd: Integer;          // eventfd; Stop() writes, Run() wakes
     FConns: array of TWSEpollConn;   // fd-indexed
     FRecv: TBytes;                   // shared read buffer
     FRunning: Boolean;
@@ -69,6 +70,12 @@ implementation
 
 const
   ConnTableGrowth = 64;
+  EFD_NONBLOCK = $800;
+
+// The RTL's Linux unit predates eventfd on some targets; bind libc
+// directly (explicit name — the formatter recases identifiers).
+function C_eventfd(ACount: Cardinal; AFlags: Integer): Integer; cdecl;
+  external name 'eventfd';
 
 procedure SetNonBlocking(AFd: Integer);
 var
@@ -136,6 +143,11 @@ var
   Len: TSockLen;
 begin
   inherited Create;
+  // Before anything can raise: the destructor closes every fd >= 0, and
+  // zero-initialized fields would close stdin.
+  FListenFd := -1;
+  FEpFd := -1;
+  FWakeFd := -1;
   if ATls.Enabled then
     raise Exception.Create(
       'epoll transport has no TLS yet (tracked as lwpt#70: accept-side ' +
@@ -168,11 +180,22 @@ begin
   Ev.events := EPOLLIN;
   Ev.data.fd := FListenFd;
   epoll_ctl(FEpFd, EPOLL_CTL_ADD, FListenFd, @Ev);
+
+  // Stop() must unblock a Run(-1) parked in epoll_wait from another
+  // thread; an eventfd in the interest set is the wakeup channel.
+  FWakeFd := C_eventfd(0, EFD_NONBLOCK);
+  if FWakeFd >= 0 then
+  begin
+    Ev.events := EPOLLIN;
+    Ev.data.fd := FWakeFd;
+    epoll_ctl(FEpFd, EPOLL_CTL_ADD, FWakeFd, @Ev);
+  end;
 end;
 
 destructor TWSEpollTransport.Destroy;
 begin
   Shutdown;
+  if FWakeFd >= 0 then FileClose(FWakeFd);
   if FEpFd >= 0 then FileClose(FEpFd);
   if FListenFd >= 0 then CloseSocket(FListenFd);
   inherited;
@@ -270,6 +293,7 @@ var
   Evs: array[0..255] of TEPoll_Event;
   N, I, Fd: Integer;
   Conn: TWSEpollConn;
+  Wake: UInt64;
 begin
   FRunning := True;
   repeat
@@ -277,6 +301,11 @@ begin
     for I := 0 to N - 1 do
     begin
       Fd := Evs[I].data.fd;
+      if Fd = FWakeFd then
+      begin
+        fpRead(FWakeFd, Wake, SizeOf(Wake)); // drain the counter
+        Continue; // the loop condition sees FRunning = False
+      end;
       if Fd = FListenFd then
       begin
         AcceptPending;
@@ -303,8 +332,15 @@ begin
 end;
 
 procedure TWSEpollTransport.Stop;
+var
+  One: UInt64;
 begin
   FRunning := False;
+  if FWakeFd >= 0 then
+  begin
+    One := 1;
+    fpWrite(FWakeFd, One, SizeOf(One));
+  end;
 end;
 
 {$endif}

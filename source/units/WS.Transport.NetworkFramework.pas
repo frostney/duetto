@@ -87,6 +87,7 @@ type
     FActive: LongInt;          // live nw connections (finalize pending)
     FNextId: NativeUInt;       // listener-queue confined
     FStopping: Boolean;
+    FOpen: Boolean;            // accepts refused until the session wires up
     FShutdownDone: Boolean;
     FLive: array of TWSNwConn; // for Shutdown's cancel sweep
     FLiveCount: Integer;
@@ -104,6 +105,7 @@ type
     destructor Destroy; override;
     procedure Run(ATimeoutMs: Integer = -1); override;
     procedure Stop; override;
+    procedure Open; override;
     procedure Shutdown; override;
   end;
 
@@ -132,7 +134,6 @@ const
   NsPerMs = Int64(1000000);
   NsPerSecond = Int64(1000000000);
   ListenerReadyTimeoutSeconds = 10;
-  ListenerCancelTimeoutSeconds = 5;
   DrainPollMs = 100;
   LiveTableGrowth = 64;
   CF_STRING_ENCODING_UTF8 = $08000100;
@@ -403,7 +404,9 @@ var
 begin
   EnsureThreadInit;
   T := TWSNetworkFrameworkTransport(ABlock^.Ctx);
-  if T.FStopping then
+  // Refuse connections while stopping — or before Open, when no session
+  // events are wired and an accepted connection could never progress.
+  if T.FStopping or (not T.FOpen) then
   begin
     Nw_connection_cancel(ANwConn);
     Exit;
@@ -562,8 +565,12 @@ begin
   if FListener <> nil then
   begin
     Nw_listener_cancel(FListener);
-    Dispatch_semaphore_wait(FListenerDoneSem,
-      Dispatch_time(0, ListenerCancelTimeoutSeconds * NsPerSecond));
+    // Wait until the cancelled state has actually landed: returning
+    // early would let a late listener callback touch freed state.
+    // nw guarantees delivery of the cancelled state after cancel.
+    while FListenerState <> NW_LISTENER_STATE_CANCELLED do
+      Dispatch_semaphore_wait(FListenerDoneSem,
+        Dispatch_time(0, DrainPollMs * NsPerMs));
   end;
   FLiveLock.Acquire;
   try
@@ -690,6 +697,11 @@ begin
   CFRelease(IdentRef);
   if FTlsIdentity = nil then
     raise Exception.Create('sec_identity_create failed');
+end;
+
+procedure TWSNetworkFrameworkTransport.Open;
+begin
+  FOpen := True;
 end;
 
 procedure TWSNetworkFrameworkTransport.Run(ATimeoutMs: Integer);

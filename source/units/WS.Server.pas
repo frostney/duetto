@@ -201,6 +201,7 @@ begin
   FTransport.OnData := HandleData;
   FTransport.OnSendReady := HandleSendReady;
   FTransport.OnClosed := HandleClosed;
+  FTransport.Open;
 end;
 
 destructor TWSServer.Destroy;
@@ -211,11 +212,16 @@ begin
   // can fire on any thread and every transport connection object is
   // gone — freeing the session connections is genuinely
   // single-threaded. (Callbacks racing the shutdown ran to completion
-  // against still-valid state.)
-  FTransport.Shutdown;
-  for I := 0 to FRegistryCount - 1 do
-    FRegistry[I].Free;
-  FTransport.Free;
+  // against still-valid state.) The nil guard keeps a transport
+  // constructor failure from masking its own exception when FPC runs
+  // this destructor on the partially constructed server.
+  if FTransport <> nil then
+  begin
+    FTransport.Shutdown;
+    for I := 0 to FRegistryCount - 1 do
+      FRegistry[I].Free;
+    FTransport.Free;
+  end;
   FLock.Free;
   inherited;
 end;

@@ -86,9 +86,12 @@ begin
       if Positionals.Count > 0 then
         raise TParseError.CreateFmt('unexpected argument: %s',
           [Positionals[0]]);
-      if (Pkcs12PassOpt.ValueOr('') <> '') and (Pkcs12Opt.ValueOr('') = '') then
+      if Pkcs12PassOpt.Present and (not Pkcs12Opt.Present) then
         raise TParseError.Create(
           '--pkcs12-pass requires --pkcs12 (refusing to serve plaintext)');
+      if Pkcs12Opt.Present and (Pkcs12Opt.ValueOr('') = '') then
+        raise TParseError.Create(
+          '--pkcs12 needs a file path (refusing to serve plaintext)');
     except
       on E: TParseError do
       begin
@@ -101,7 +104,7 @@ begin
     Echo := TEcho.Create;
     Echo.Quiet := QuietOpt.Present;
     Tls := WSTransportNoTls;
-    if Pkcs12Opt.ValueOr('') <> '' then
+    if Pkcs12Opt.Present then
     begin
       Tls.Enabled := True;
       Tls.Pkcs12Path := Pkcs12Opt.ValueOr('');
