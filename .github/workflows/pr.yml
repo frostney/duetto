@@ -86,7 +86,8 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile fpc-setup.exe -MaximumRedirection 10 -UserAgent "Wget/1.21"
           $f = Get-Item fpc-setup.exe
           Write-Host "downloaded $($f.Length) bytes"
-          if ($f.Length -lt 50000000) { Write-Error "download too small - mirror interstitial?"; exit 1 }
+          $hash = (Get-FileHash -Algorithm SHA256 $f.FullName).Hash.ToLower()
+          if ($hash -ne "8c255390544b051388b577eb61c6191a04883264afe0e3369b3600a56daf7bde") { Write-Error "installer SHA-256 mismatch: $hash"; exit 1 }
           $proc = Start-Process -Wait -PassThru -FilePath $f.FullName -ArgumentList "/VERYSILENT","/NORESTART","/SP-","/DIR=C:\fpc322"
           Write-Host "installer exit code $($proc.ExitCode)"
           if ($proc.ExitCode -ne 0) { exit 1 }

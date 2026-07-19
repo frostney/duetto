@@ -34,9 +34,14 @@ type
     FSendBuffer: array[0..IocpSendBufferSize - 1] of Byte;
     FOutstanding: Integer;
     FSendInFlight: Boolean;
+    FSendPosted: DWORD;        // bytes posted in the current WSASend
+    FSendOffset: DWORD;        // bytes already completed of that post
     FDead: Boolean;
+    FCloseRequested: Boolean;  // SubmitClose while a send is in flight
     procedure ArmReceive;
     procedure CloseConnectionSocket;
+    procedure HardClose;
+    function ResumeSend: Boolean;
     procedure TryFinalize;
   public
     function SubmitSend(P: PByte; ALen: NativeInt): NativeInt; override;
@@ -86,6 +91,7 @@ const
   WSA_FLAG_OVERLAPPED = $00000001;
   SO_UPDATE_ACCEPT_CONTEXT = $700B;
   WinErrorIoPending = 997;
+  SO_EXCLUSIVEADDRUSE = Integer(not DWORD(SO_REUSEADDR));
   InfiniteWait = DWORD($FFFFFFFF);
   ListenerCompletionKey = PtrUInt(1);
   WakeCompletionKey = PtrUInt(2);
@@ -169,6 +175,27 @@ begin
     end;
 end;
 
+// Re-post the unsent tail of the current send buffer. True = the
+// overlapped operation is armed again (the completed op's pin carries
+// over); False = the connection died trying.
+function TWSIocpConn.ResumeSend: Boolean;
+var
+  Buffer: TWSIocpBuffer;
+begin
+  Result := True;
+  FillChar(FSendOverlapped, SizeOf(FSendOverlapped), 0);
+  Buffer.Len := FSendPosted - FSendOffset;
+  Buffer.Buf := PAnsiChar(@FSendBuffer[FSendOffset]);
+  if C_WSASend(FSocket, @Buffer, 1, nil, 0,
+      @FSendOverlapped, nil) = SOCKET_ERROR then
+    if WSAGetLastError <> WinErrorIoPending then
+    begin
+      FDead := True;
+      CloseConnectionSocket;
+      Result := False;
+    end;
+end;
+
 function TWSIocpConn.SubmitSend(P: PByte; ALen: NativeInt): NativeInt;
 var
   Buffer: TWSIocpBuffer;
@@ -184,6 +211,8 @@ begin
   FillChar(FSendOverlapped, SizeOf(FSendOverlapped), 0);
   Buffer.Len := Accepted;
   Buffer.Buf := PAnsiChar(@FSendBuffer[0]);
+  FSendPosted := Accepted;
+  FSendOffset := 0;
   FSendInFlight := True;
   Inc(FOutstanding);
   if C_WSASend(FSocket, @Buffer, 1, nil, 0,
@@ -199,7 +228,7 @@ begin
   Result := Accepted;
 end;
 
-procedure TWSIocpConn.SubmitClose;
+procedure TWSIocpConn.HardClose;
 begin
   if not FDead then
   begin
@@ -207,6 +236,19 @@ begin
     CloseConnectionSocket;
   end;
   TryFinalize;
+end;
+
+procedure TWSIocpConn.SubmitClose;
+begin
+  // A send still in flight carries the final bytes (typically a close
+  // frame or handshake rejection) — closesocket would cancel the
+  // overlapped WSASend. Defer; the send completion finishes the close.
+  if FSendInFlight and (not FDead) then
+  begin
+    FCloseRequested := True;
+    Exit;
+  end;
+  HardClose;
 end;
 
 { TWSIocpTransport }
@@ -235,8 +277,10 @@ begin
     nil, 0, WSA_FLAG_OVERLAPPED);
   if FListenSocket = INVALID_SOCKET then
     raise Exception.CreateFmt('WSASocketW() failed (%d)', [WSAGetLastError]);
+  // Windows SO_REUSEADDR permits hostile duplicate binds (unlike its
+  // POSIX use); exclusive binding is the hardened server default.
   One := 1;
-  WinSock2.setsockopt(FListenSocket, SOL_SOCKET, SO_REUSEADDR,
+  WinSock2.setsockopt(FListenSocket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
     @One, SizeOf(One));
 
   FillChar(Address, SizeOf(Address), 0);
@@ -403,14 +447,30 @@ begin
   end
   else if AOverlapped = @AConn.FSendOverlapped then
   begin
+    if ASucceeded and (not AConn.FDead) then
+    begin
+      // A stream WSASend may complete short under memory pressure; the
+      // caller was told the full accepted count, so the tail must go
+      // out before anything else touches the send buffer.
+      Inc(AConn.FSendOffset, ABytes);
+      if AConn.FSendOffset < AConn.FSendPosted then
+      begin
+        if AConn.ResumeSend then Exit;
+        // resume failed: fall through to the dead path below
+      end;
+    end;
     AConn.FSendInFlight := False;
     if not AConn.FDead then
     begin
       if not ASucceeded then
         RemoteClosed(AConn)
+      else if AConn.FCloseRequested then
+        AConn.HardClose
       else if Assigned(OnSendReady) then
         OnSendReady(AConn);
-    end;
+    end
+    else if AConn.FCloseRequested then
+      AConn.HardClose;
     Dec(AConn.FOutstanding);
     if AConn.FDead then AConn.TryFinalize;
   end;
@@ -451,6 +511,7 @@ end;
 
 procedure TWSIocpTransport.Run(ATimeoutMs: Integer);
 begin
+  if FStopping then Exit;
   FRunning := True;
   if ATimeoutMs < 0 then
     repeat
@@ -494,7 +555,7 @@ begin
   while I < FLiveCount do
   begin
     Conn := FLive[I];
-    Conn.SubmitClose;
+    Conn.HardClose; // abort in-flight I/O; the drain below reaps
     if (I < FLiveCount) and (FLive[I] = Conn) then Inc(I);
   end;
 
