@@ -13,9 +13,12 @@ name: CI
 # merged tree is green everywhere.
 #
 #   test:     Per-platform native runners. Every leg builds all five
-#             programs and runs the unit suites plus wsinterop's
-#             live-socket battery — the server rides the platform
-#             transport (epoll on Linux, Network.framework on macOS).
+#             programs and runs the unit suites, wsinterop's
+#             live-socket battery, and the crosscheck against the
+#             python `websockets` reference — the server rides the
+#             platform transport (epoll on Linux, Network.framework on
+#             macOS, where crosscheck is the merge-time conformance
+#             battery since the Autobahn container can't run there).
 #
 #   autobahn: The Autobahn fuzzing suite (crossbario/autobahn-testsuite
 #             via Docker) in both directions — fuzzingclient against
@@ -113,6 +116,17 @@ jobs:
 
       - name: wsinterop (live-socket battery, own client vs own server)
         run: ./build/wsinterop
+
+      # Cross-implementation net vs the python `websockets` reference,
+      # both directions plus raw-socket violations. On the macOS legs
+      # this is the merge-time conformance battery for the
+      # Network.framework transport — Autobahn needs Docker, which
+      # GitHub's macOS runners don't have.
+      - name: crosscheck vs python websockets (reference implementation)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/crosscheck-venv"
+          "$RUNNER_TEMP/crosscheck-venv/bin/pip" install --quiet websockets
+          PATH="$RUNNER_TEMP/crosscheck-venv/bin:$PATH" python3 tools/crosscheck.py
 
   autobahn:
     runs-on: ubuntu-latest
