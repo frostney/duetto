@@ -83,8 +83,13 @@ jobs:
         shell: pwsh
         run: |
           $url = "https://downloads.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe"
-          Invoke-WebRequest -Uri $url -OutFile fpc-setup.exe -MaximumRedirection 10
-          Start-Process -Wait -FilePath .\fpc-setup.exe -ArgumentList "/VERYSILENT","/NORESTART","/DIR=C:\fpc322"
+          Invoke-WebRequest -Uri $url -OutFile fpc-setup.exe -MaximumRedirection 10 -UserAgent "Wget/1.21"
+          $f = Get-Item fpc-setup.exe
+          Write-Host "downloaded $($f.Length) bytes"
+          if ($f.Length -lt 50000000) { Write-Error "download too small - mirror interstitial?"; exit 1 }
+          $proc = Start-Process -Wait -PassThru -FilePath $f.FullName -ArgumentList "/VERYSILENT","/NORESTART","/SP-","/DIR=C:\fpc322"
+          Write-Host "installer exit code $($proc.ExitCode)"
+          if ($proc.ExitCode -ne 0) { exit 1 }
 
       - name: Locate FPC (Windows)
         if: matrix.fpc-install == 'choco'
