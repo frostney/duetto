@@ -5,9 +5,9 @@ once over one full-duplex connection. RFC 6455 (v13) + RFC 7692
 permessage-deflate in FreePascal, built and tested with
 [lwpt](https://github.com/frostney/lwpt). A sans-I/O protocol core behind a
 blocking client and a server with per-platform transports — epoll on
-Linux, Network.framework on macOS (native `wss://`) — validated by unit
-suites, a live-socket battery, and the Autobahn testsuite. See
-[docs/architecture.md](docs/architecture.md).
+Linux, Network.framework on macOS (native `wss://`), IOCP on Windows —
+validated by unit suites, a live-socket battery, and the Autobahn
+testsuite. See [docs/architecture.md](docs/architecture.md).
 
 ## Install
 
@@ -30,7 +30,7 @@ while Cli.ReadMessage(IsText, Data) do
 Cli.Close(1000);
 ```
 
-Echo server (Linux and macOS) and probe, from the shipped programs:
+Echo server (Linux, macOS, Windows) and probe, from the shipped programs:
 
 ```bash
 lwpt build

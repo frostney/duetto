@@ -74,6 +74,20 @@ jobs:
             # so the loopback batteries can't run here. Build + unit
             # suites still give x86_64 compile and blocks-ABI coverage.
             loopback-battery: skip
+          - target: x86_64-win64
+            runner: windows-latest
+            lwpt-asset: windows-x64
+            lwpt-archive: zip
+            fpc-install: choco
+            exe: .exe
+            crosscheck: skip   # python venv on the win runners is a follow-up
+          - target: i386-win32
+            runner: windows-latest
+            lwpt-asset: windows-x86
+            lwpt-archive: zip
+            fpc-install: choco
+            exe: .exe
+            crosscheck: skip
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -96,16 +110,57 @@ jobs:
           brew install fpc
           fpc -iV
 
+      - name: Install FPC (choco)
+        if: matrix.fpc-install == 'choco'
+        run: |
+          choco install -y freepascal
+          # Add the FPC bin to PATH for subsequent steps. Chocolatey has
+          # used both C:\fpc and C:\tools\freepascal layouts over time.
+          FPC_BIN=""
+          for candidate_root in /c/tools/freepascal /c/fpc; do
+            if [ -d "$candidate_root" ]; then
+              FPC_BIN=$(find "$candidate_root" -name fpc.exe -type f 2>/dev/null | head -1)
+              if [ -n "$FPC_BIN" ]; then break; fi
+            fi
+          done
+          if [ -z "$FPC_BIN" ]; then echo "::error::Chocolatey FPC install: fpc.exe not found"; exit 1; fi
+          echo "Using FPC at $FPC_BIN"
+          echo "$(dirname "$FPC_BIN")" >> "$GITHUB_PATH"
+          echo "LWPT_FPC=$(cygpath -w "$FPC_BIN")" >> "$GITHUB_ENV"
+          INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1)
+          if [ -n "$INSTANTFPC_BIN" ]; then
+            echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
+          fi
+          FPC_UNIT_PATHS=""
+          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process paszlib hash; do
+            UNIT_PATH=""
+            for unit_target in i386-win32 x86_64-win64; do
+              UNIT_PATH=$(find /c/tools/freepascal /c/fpc -path "*/units/${unit_target}/${unit_dir}" -type d 2>/dev/null | head -1 || true)
+              if [ -n "$UNIT_PATH" ]; then break; fi
+            done
+            if [ -n "$UNIT_PATH" ]; then
+              UNIT_PATH_WIN=$(cygpath -w "$UNIT_PATH")
+              if [ -z "$FPC_UNIT_PATHS" ]; then
+                FPC_UNIT_PATHS="$UNIT_PATH_WIN"
+              else
+                FPC_UNIT_PATHS="${FPC_UNIT_PATHS};${UNIT_PATH_WIN}"
+              fi
+            fi
+          done
+          echo "LWPT_FPC_UNIT_PATHS=$FPC_UNIT_PATHS" >> "$GITHUB_ENV"
+
       - name: Install lwpt (release binary, checksum-verified)
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
           ASSET="lwpt-${LWPT_VERSION}-${{ matrix.lwpt-asset }}"
           BASE="https://github.com/frostney/lwpt/releases/download/${LWPT_VERSION}"
-          curl -fsSLO "${BASE}/${ASSET}.tar.gz"
+          EXT="tar.gz"
+          if [ "${{ matrix.lwpt-archive }}" = "zip" ]; then EXT="zip"; fi
+          curl -fsSLO "${BASE}/${ASSET}.${EXT}"
           curl -fsSLO "${BASE}/lwpt-${LWPT_VERSION}-checksums.txt"
-          shasum -a 256 -c <(grep "${ASSET}.tar.gz" "lwpt-${LWPT_VERSION}-checksums.txt")
-          tar xzf "${ASSET}.tar.gz"
+          shasum -a 256 -c <(grep "${ASSET}.${EXT}" "lwpt-${LWPT_VERSION}-checksums.txt")
+          if [ "$EXT" = "zip" ]; then unzip -q "${ASSET}.zip"; else tar xzf "${ASSET}.tar.gz"; fi
           echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
 
       - name: lwpt install --frozen (verify lockfile + committed modules)
@@ -123,7 +178,7 @@ jobs:
 
       - name: wsinterop (live-socket battery, own client vs own server)
         if: matrix.loopback-battery != 'skip'
-        run: ./build/wsinterop
+        run: ./build/wsinterop${{ matrix.exe }}
 
       # Cross-implementation net vs the python `websockets` reference,
       # both directions plus raw-socket violations. On the macOS legs
@@ -131,7 +186,7 @@ jobs:
       # Network.framework transport — Autobahn needs Docker, which
       # GitHub's macOS runners don't have.
       - name: crosscheck vs python websockets (reference implementation)
-        if: matrix.loopback-battery != 'skip'
+        if: matrix.loopback-battery != 'skip' && matrix.crosscheck != 'skip'
         run: |
           python3 -m venv "$RUNNER_TEMP/crosscheck-venv"
           "$RUNNER_TEMP/crosscheck-venv/bin/pip" install --quiet websockets

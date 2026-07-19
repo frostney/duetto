@@ -6,7 +6,7 @@
 - The heart is `WS.Protocol`, a **sans-I/O state machine** — one instance per connection, either role — that never touches a file descriptor.
 - Every RFC rule lives in that one testable place; the blocking client, the epoll server, and the in-process benchmark all sit behind the same machine unchanged.
 - Layers are strictly bottom-up: frame codec → UTF-8 → handshake → deflate → protocol machine → client / server.
-- The server is a platform-neutral session layer over a completion-shaped **transport** seam (ADR-0001/0003): epoll on Linux, Network.framework on macOS (native `wss://`), IOCP planned for Windows. The client is POSIX-portable with TLS delegated to lwpt's `TransportSecurity`.
+- The server is a platform-neutral session layer over a completion-shaped **transport** seam (ADR-0001/0003): epoll on Linux, Network.framework on macOS (native `wss://`), IOCP on Windows. The client runs on POSIX and Windows (direct WinSock2) with TLS delegated to lwpt's `TransportSecurity`.
 
 ## The sans-I/O core
 
@@ -33,6 +33,7 @@ once on protocol failure, after queueing the appropriate close frame
 | `WS.Transport` | the completion-shaped transport contract (ADR-0001): submit sends/closes, receive data/lifecycle completions on the transport's execution context (ADR-0003) |
 | `WS.Transport.Epoll` | Linux transport: nonblocking sockets, one shared 256 KB read buffer, `EPOLLOUT` armed only while a connection has backlog |
 | `WS.Transport.NetworkFramework` | macOS transport (ADR-0002): `nw_listener`/`nw_connection` C API, one serial dispatch queue per connection, native TLS via a PKCS#12 `SecIdentity` |
+| `WS.Transport.Iocp` | Windows transport: one completion-port thread, `AcceptEx`/`WSARecv`/`WSASend` always armed overlapped, copy-on-send, outstanding-operation pinning for deferred frees |
 | `WS.Server` | platform-neutral session layer: handshake accumulation, protocol wiring, flush/backpressure policy over the transport seam |
 
 Units higher in the table never depend on units lower down. The programs in
