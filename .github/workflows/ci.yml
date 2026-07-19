@@ -26,8 +26,13 @@ name: CI
 #             against build/wsautobahn (client under test, with and
 #             without permessage-deflate). tools/autobahn-check.py
 #             fails the job on any non-acceptable case; the full HTML
-#             reports are uploaded as an artifact either way.
+#             reports are uploaded as an artifact either way.#
+#   autobahn-macos: the same fuzzingclient battery natively on arm64
+#             macOS (no Docker there) via Intel python-2.7 under
+#             Rosetta — the Network.framework transport's Autobahn net.
+#             Server direction only; client direction stays on Linux.
 #
+
 # The lwpt toolchain comes from its published release (checksum-
 # verified per-platform tarball, no sibling checkout, no bootstrap);
 # dependencies resolve from the same release tag and are verified
@@ -276,3 +281,99 @@ jobs:
           name: autobahn-reports
           retention-days: 30
           path: tests/autobahn/reports/
+
+  # Native Autobahn on arm64 macOS — no Docker (unavailable on GH macOS
+  # runners): the official Intel python-2.7.18 runs the testsuite under
+  # Rosetta 2 against a native wsecho, giving the Network.framework
+  # transport the same merge-time conformance net Linux/epoll has.
+  # Recipe validated in issue #10 (spike run 29694505585, 41/41 OK).
+  # Server direction only; the client direction (wsautobahn) stays on
+  # the Linux job. Every pin below is load-bearing py2 archaeology.
+  autobahn-macos:
+    runs-on: macos-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install FPC (brew)
+        run: |
+          brew install fpc
+          fpc -iV
+
+      - name: Install lwpt (release binary, checksum-verified)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          ASSET="lwpt-${LWPT_VERSION}-macos-arm64"
+          BASE="https://github.com/frostney/lwpt/releases/download/${LWPT_VERSION}"
+          curl -fsSLO "${BASE}/${ASSET}.tar.gz"
+          curl -fsSLO "${BASE}/lwpt-${LWPT_VERSION}-checksums.txt"
+          shasum -a 256 -c <(grep "${ASSET}.tar.gz" "lwpt-${LWPT_VERSION}-checksums.txt")
+          tar xzf "${ASSET}.tar.gz"
+          echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
+
+      - name: Build wsecho
+        run: |
+          lwpt install --frozen
+          lwpt build wsecho
+
+      - name: Install Autobahn testsuite (Intel py2.7 under Rosetta)
+        run: |
+          set -euo pipefail
+          curl -fsSLO https://www.python.org/ftp/python/2.7.18/python-2.7.18-macosx10.9.pkg
+          echo "c570f38b05dd8b112ad21b418cdf51a9816d62f9f44746452739d421be24d50c  python-2.7.18-macosx10.9.pkg" | shasum -a 256 -c
+          sudo installer -pkg python-2.7.18-macosx10.9.pkg -target /
+          PY=/Library/Frameworks/Python.framework/Versions/2.7/bin/python2.7
+          "$PY" --version
+          "$PY" -m ensurepip --user || true
+          # pip 19 tags wheels from the fat-intel build and rejects every
+          # x86_64 wheel; the final py2 pip tags from the running OS.
+          "$PY" -m pip install --user --quiet "pip==20.3.4"
+          # py2-era pins: unpinned resolution grabs py3-only releases.
+          "$PY" -m pip install --user --quiet "setuptools<45" "wheel<0.38"
+          "$PY" -m pip install --user --quiet "incremental==21.3.0" \
+            "constantly==15.1.0" "zope.interface==5.5.2" \
+            "Automat==20.2.0" "hyperlink==19.0.0" "attrs==20.3.0" \
+            "PyHamcrest==1.10.1"
+          "$PY" -m pip install --user --quiet "Twisted==20.3.0"
+          "$PY" -m pip install --user --quiet "six==1.16.0" \
+            "cryptography==3.3.2" "pyOpenSSL==19.1.0"
+          "$PY" -m pip install --user --quiet autobahntestsuite
+          "$HOME/Library/Python/2.7/bin/wstest" --help >/dev/null
+
+      - name: Autobahn fuzzingclient vs wsecho (native, both agents)
+        run: |
+          set -euo pipefail
+          ./build/wsecho --port=9002 --quiet &
+          PID_DEFLATE=$!
+          ./build/wsecho --port=9003 --quiet --no-deflate &
+          PID_PLAIN=$!
+          sleep 1
+          mkdir -p reports-macos
+          cat > "$RUNNER_TEMP/fuzzingclient-macos.json" <<'JSON'
+          {
+              "outdir": "./reports-macos",
+              "servers": [
+                  {"agent": "duetto-macos", "url": "ws://127.0.0.1:9002"},
+                  {"agent": "duetto-macos-nodeflate", "url": "ws://127.0.0.1:9003"}
+              ],
+              "cases": ["*"],
+              "exclude-cases": [],
+              "exclude-agent-cases": {}
+          }
+          JSON
+          "$HOME/Library/Python/2.7/bin/wstest" -m fuzzingclient -s "$RUNNER_TEMP/fuzzingclient-macos.json"
+          kill "$PID_DEFLATE" "$PID_PLAIN" || true
+          python3 tools/autobahn-check.py reports-macos/index.json
+
+      - name: Upload macOS Autobahn reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: autobahn-macos-reports
+          retention-days: 30
+          path: reports-macos/
