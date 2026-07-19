@@ -7,10 +7,12 @@ issues use them in exactly this sense.
 
 - **Sans-I/O core** — the protocol state machine (`WS.Protocol` and the
   units under it) that consumes and produces bytes without performing
-  any I/O. Owns every RFC 6455/7692 rule.
+  any I/O. `WS.Protocol` owns all RFC 6455 rules; `WS.Deflate`
+  implements RFC 7692 beneath it.
 - **Backend** — a platform I/O provider behind the completion seam
   (ADR-0001): it moves bytes and connection lifecycle events between
-  the OS and the sans-I/O core. Planned: epoll (Linux),
+  the OS and the sans-I/O core. Existing: epoll (Linux, inside
+  `WS.Server`, adapter to the seam pending); planned:
   Network.framework (macOS), IOCP (Windows).
 - **Completion model** — the seam's contract: operations are submitted
   and later reported complete. Readiness-based OS APIs (epoll) adapt to

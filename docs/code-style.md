@@ -38,9 +38,9 @@ Changing a project-wide flag means editing the include, not every file.
 ## RTL policy
 
 duetto aims to rival C and Rust implementations; on hot paths, prefer
-direct OS APIs (syscalls, WinSock2, kqueue/epoll/IOCP) and hand-rolled
-primitives over RTL/FCL conveniences whenever measurement shows the RTL
-costs — the inlined base64 and stack-buffer handshake builders (see
+direct OS APIs (syscalls, WinSock2, epoll/IOCP/Network.framework) and
+hand-rolled primitives over RTL/FCL conveniences whenever measurement
+shows the RTL costs — the inlined base64 and stack-buffer handshake builders (see
 `docs/comparison.md`) set the precedent. RTL use is fine off the hot
 path; replacing it is justified by a `wsbench` number, not by taste.
 

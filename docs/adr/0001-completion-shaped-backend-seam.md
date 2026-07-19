@@ -28,9 +28,11 @@ readiness loop; IOCP and Network.framework implement it natively.
 ## Consequences
 
 - The seam is designed once and survives all three planned backends;
-  0.3.0 (Windows/IOCP) does not start by redoing the 0.2.0 seam.
+  the Windows/IOCP release (duetto 0.3.0) does not start by redoing
+  the seam shipped for macOS (duetto 0.2.0).
 - The epoll backend carries a small adapter layer (readiness →
-  completion). Its hot path must stay allocation-free per the RTL
-  policy in [code-style.md](../code-style.md).
+  completion). Its hot path must stay allocation-free; the RTL policy
+  in [code-style.md](../code-style.md) governs how such hot-path code
+  is written and justified.
 - Protocol behaviour stays in `WS.Protocol` (sans-I/O); the seam moves
   bytes and lifecycle events only.
