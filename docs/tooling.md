@@ -59,8 +59,8 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
   `install` → `format --check` → `build` → `test` → `wsinterop`, plus a
   blocking markdownlint job. The authoritative pre-merge gate.
 - **`.github/workflows/ci.yml`** — push to main: native test matrix
-  (x86_64/aarch64 Linux with the full program set, x86_64/aarch64 macOS
-  with the client-side subset) plus the full Autobahn suite with report
+  (x86_64/aarch64 Linux and macOS, each building the full program set
+  and running wsinterop) plus the full Autobahn suite with report
   artifacts.
 
 Both workflows install the lwpt release binary from a checksum-verified
