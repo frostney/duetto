@@ -258,15 +258,6 @@ end;
 threadvar
   GcdThreadInited: Boolean;
 
-// TEMP DEBUG
-function C_write(AFd: Int32; ABuf: Pointer; ALen: NativeUInt): NativeInt;
-  cdecl; external name 'write';
-
-procedure DbgMark(const S: ShortString);
-begin
-  C_write(2, @S[1], Length(S));
-end;
-
 procedure EnsureThreadInit;
 begin
   if GcdThreadInited then Exit;
@@ -312,7 +303,6 @@ var
 begin
   EnsureThreadInit;
   T := TWSNetworkFrameworkTransport(ABlock^.Ctx);
-  DbgMark('TLSCONFIG'#10);
   SecOpts := Nw_tls_copy_sec_protocol_options(AOptions);
   Sec_protocol_options_set_local_identity(SecOpts, T.FTlsIdentity);
   Nw_release(SecOpts);
@@ -351,7 +341,6 @@ var
 begin
   EnsureThreadInit;
   C := TWSNwConn(ABlock^.Ctx);
-  DbgMark('CONNSTATE ' + Chr(48+AState) + #10);
   case AState of
     NW_CONNECTION_STATE_READY:
       C.ArmReceive;
@@ -414,7 +403,6 @@ var
 begin
   EnsureThreadInit;
   T := TWSNetworkFrameworkTransport(ABlock^.Ctx);
-  DbgMark('NEWCONN'#10);
   if T.FStopping then
   begin
     Nw_connection_cancel(ANwConn);

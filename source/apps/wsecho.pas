@@ -86,6 +86,9 @@ begin
       if Positionals.Count > 0 then
         raise TParseError.CreateFmt('unexpected argument: %s',
           [Positionals[0]]);
+      if (Pkcs12PassOpt.ValueOr('') <> '') and (Pkcs12Opt.ValueOr('') = '') then
+        raise TParseError.Create(
+          '--pkcs12-pass requires --pkcs12 (refusing to serve plaintext)');
     except
       on E: TParseError do
       begin
