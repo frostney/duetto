@@ -48,6 +48,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Install FPC (apt)
         if: matrix.fpc-install == 'apt'
@@ -94,6 +96,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Lint Markdown
         uses: DavidAnson/markdownlint-cli2-action@v19
