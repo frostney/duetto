@@ -90,6 +90,26 @@ its nested manifest, so the project's own `units` array lists only
 would otherwise enter `lwpt test` discovery), and `.lwpt/**` is carved
 out of the formatter's scope.
 
+## CI experimentation (spike pattern)
+
+For anything that can only be validated in the runner environment
+(toolchain provisioning, OS-specific behaviour, runner quirks), use a
+**spike branch** instead of iterating on a real PR:
+
+1. Branch `spike/<topic>` off main; commit a dedicated workflow with
+   `on: push: branches: [spike/**]` so every push self-triggers — and a
+   header banner marking it **never-merge**.
+2. Iterate on the real runner; keep each push a single hypothesis.
+3. Record the verdict and evidence (run links, key log lines) on the
+   driving issue — the spike's output is knowledge, not code.
+4. Graduate a validated recipe via a clean PR from main; **delete the
+   spike branch with the verdict** (the workflow stays armed until the
+   branch dies).
+
+Proven by the native-Autobahn spike (issue #10, run 29694505585:
+recipe validated in five pushes, graduated as the `autobahn-macos`
+job).
+
 ## Markdown
 
 markdownlint-cli2 (config: `.markdownlint-cli2.jsonc`) lints every
