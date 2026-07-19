@@ -28,11 +28,30 @@ interface
 {$ifdef DARWIN}
 
 uses
+  syncobjs,
   SysUtils,
 
   WS.Transport;
 
 type
+  // Hand-rolled C-blocks ABI (see the unit comment). Interface-visible
+  // only so connection/transport objects can embed block storage.
+  PWSBlockDescriptor = ^TWSBlockDescriptor;
+  TWSBlockDescriptor = record
+    Reserved: NativeUInt;
+    Size: NativeUInt;
+  end;
+
+  PWSBlock = ^TWSBlock;
+  TWSBlock = record
+    Isa: Pointer;
+    Flags: Int32;
+    Reserved: Int32;
+    Invoke: CodePointer;
+    Descriptor: PWSBlockDescriptor;
+    Ctx: Pointer;              // single plain-pointer capture
+  end;
+
   TWSNetworkFrameworkTransport = class;
 
   TWSNwConn = class(TWSTransportConn)
@@ -40,9 +59,9 @@ type
     FTransport: TWSNetworkFrameworkTransport;
     FNw: Pointer;              // nw_connection_t (+1)
     FQueue: Pointer;           // serial dispatch queue (+1)
-    FStateBlock: array[0..7] of Pointer;
-    FRecvBlock: array[0..7] of Pointer;
-    FSendBlock: array[0..7] of Pointer;
+    FStateBlock: TWSBlock;
+    FRecvBlock: TWSBlock;
+    FSendBlock: TWSBlock;
     FInFlight: Boolean;        // one outstanding send caps memory
     FDead: Boolean;            // SubmitClose called; drop everything
     FClosedNotified: Boolean;  // OnClosed fired (or suppressed)
@@ -61,22 +80,31 @@ type
     FStopSem: Pointer;
     FReadySem: Pointer;
     FDrainSem: Pointer;
+    FListenerDoneSem: Pointer;
     FTlsIdentity: Pointer;     // sec_identity_t
+    FTempKeychain: Pointer;    // private import keychain (see LoadIdentity)
     FListenerState: Integer;
     FActive: LongInt;          // live nw connections (finalize pending)
     FNextId: NativeUInt;       // listener-queue confined
     FStopping: Boolean;
-    FListenerStateBlock: array[0..7] of Pointer;
-    FNewConnBlock: array[0..7] of Pointer;
-    FTlsBlock: array[0..7] of Pointer;
-    FTcpBlock: array[0..7] of Pointer;
+    FShutdownDone: Boolean;
+    FLive: array of TWSNwConn; // for Shutdown's cancel sweep
+    FLiveCount: Integer;
+    FLiveLock: TCriticalSection;
+    FListenerStateBlock: TWSBlock;
+    FNewConnBlock: TWSBlock;
+    FTlsBlock: TWSBlock;
+    FTcpBlock: TWSBlock;
     procedure LoadIdentity(const APath, APassphrase: string);
+    procedure LiveTrack(AConn: TWSNwConn);
+    procedure LiveUntrack(AConn: TWSNwConn);
     procedure ConnFinalized(AConn: TWSNwConn);
   public
     constructor Create(APort: Word; const ATls: TWSTransportTls);
     destructor Destroy; override;
     procedure Run(ATimeoutMs: Integer = -1); override;
     procedure Stop; override;
+    procedure Shutdown; override;
   end;
 
 {$endif}
@@ -101,6 +129,12 @@ type
 
 const
   DISPATCH_TIME_FOREVER = UInt64($FFFFFFFFFFFFFFFF);
+  NsPerMs = Int64(1000000);
+  NsPerSecond = Int64(1000000000);
+  ListenerReadyTimeoutSeconds = 10;
+  ListenerCancelTimeoutSeconds = 5;
+  DrainPollMs = 100;
+  LiveTableGrowth = 64;
   CF_STRING_ENCODING_UTF8 = $08000100;
 
   NW_LISTENER_STATE_READY = 2;
@@ -171,6 +205,7 @@ var
   BlockIsaStack: Pointer;        // &_NSConcreteStackBlock
   KeyImportPassphrase: Pointer;  // kSecImportExportPassphrase
   KeyImportItemIdentity: Pointer; // kSecImportItemIdentity
+  KeyImportKeychain: Pointer;    // kSecImportExportKeychain
   DictKeyCallbacks: Pointer;     // &kCFTypeDictionaryKeyCallBacks
   DictValueCallbacks: Pointer;   // &kCFTypeDictionaryValueCallBacks
 
@@ -189,6 +224,10 @@ procedure CFRelease(AObj: Pointer); cdecl; external name 'CFRelease';
 function SecPKCS12Import(AData, AOptions: Pointer;
   AItems: PPointer): Int32; cdecl; external name 'SecPKCS12Import';
 function Sec_identity_create(AIdentity: Pointer): Pointer; cdecl; external name 'sec_identity_create';
+function SecKeychainCreate(APath: PAnsiChar; APassLen: UInt32;
+  APass: Pointer; APromptUser: ByteBool; AInitialAccess: Pointer;
+  out AKeychain: Pointer): Int32; cdecl; external name 'SecKeychainCreate';
+function SecKeychainDelete(AKeychain: Pointer): Int32; cdecl; external name 'SecKeychainDelete';
 
 procedure ResolveDataSymbols;
 begin
@@ -203,6 +242,8 @@ begin
     PPointer(Dlsym(RTLD_DEFAULT, 'kSecImportExportPassphrase'))^;
   KeyImportItemIdentity :=
     PPointer(Dlsym(RTLD_DEFAULT, 'kSecImportItemIdentity'))^;
+  KeyImportKeychain :=
+    PPointer(Dlsym(RTLD_DEFAULT, 'kSecImportExportKeychain'))^;
   DictKeyCallbacks := Dlsym(RTLD_DEFAULT, 'kCFTypeDictionaryKeyCallBacks');
   DictValueCallbacks := Dlsym(RTLD_DEFAULT, 'kCFTypeDictionaryValueCallBacks');
 end;
@@ -217,6 +258,15 @@ end;
 threadvar
   GcdThreadInited: Boolean;
 
+// TEMP DEBUG
+function C_write(AFd: Int32; ABuf: Pointer; ALen: NativeUInt): NativeInt;
+  cdecl; external name 'write';
+
+procedure DbgMark(const S: ShortString);
+begin
+  C_write(2, @S[1], Length(S));
+end;
+
 procedure EnsureThreadInit;
 begin
   if GcdThreadInited then Exit;
@@ -230,35 +280,18 @@ end;
 // Blocks ABI
 // ---------------------------------------------------------------------------
 
-type
-  PWSBlockDescriptor = ^TWSBlockDescriptor;
-  TWSBlockDescriptor = record
-    Reserved: NativeUInt;
-    Size: NativeUInt;
-  end;
-
-  PWSBlock = ^TWSBlock;
-  TWSBlock = record
-    Isa: Pointer;
-    Flags: Int32;
-    Reserved: Int32;
-    Invoke: CodePointer;
-    Descriptor: PWSBlockDescriptor;
-    Ctx: Pointer;              // single plain-pointer capture
-  end;
-
 const
   BlockDescriptor: TWSBlockDescriptor =
     (Reserved: 0; Size: SizeOf(TWSBlock));
 
-// The 8-pointer arrays in the classes are raw storage for a TWSBlock;
-// MakeBlock lays one out in place and returns it as the block pointer.
-function MakeBlock(AStorage: Pointer; AInvoke: CodePointer;
+// Lays a block literal out in caller-owned storage and returns it as
+// the block pointer (the runtime copies it when it retains handlers).
+function MakeBlock(var ABlock: TWSBlock; AInvoke: CodePointer;
   ACtx: Pointer): Pointer;
 var
   B: PWSBlock;
 begin
-  B := PWSBlock(AStorage);
+  B := @ABlock;
   B^.Isa := BlockIsaStack;
   B^.Flags := 0;
   B^.Reserved := 0;
@@ -277,7 +310,9 @@ var
   T: TWSNetworkFrameworkTransport;
   SecOpts: Pointer;
 begin
+  EnsureThreadInit;
   T := TWSNetworkFrameworkTransport(ABlock^.Ctx);
+  DbgMark('TLSCONFIG'#10);
   SecOpts := Nw_tls_copy_sec_protocol_options(AOptions);
   Sec_protocol_options_set_local_identity(SecOpts, T.FTlsIdentity);
   Nw_release(SecOpts);
@@ -305,7 +340,7 @@ begin
     NW_LISTENER_STATE_FAILED:
       Dispatch_semaphore_signal(T.FReadySem);
     NW_LISTENER_STATE_CANCELLED:
-      Dispatch_semaphore_signal(T.FDrainSem);
+      Dispatch_semaphore_signal(T.FListenerDoneSem);
   end;
 end;
 
@@ -316,6 +351,7 @@ var
 begin
   EnsureThreadInit;
   C := TWSNwConn(ABlock^.Ctx);
+  DbgMark('CONNSTATE ' + Chr(48+AState) + #10);
   case AState of
     NW_CONNECTION_STATE_READY:
       C.ArmReceive;
@@ -378,6 +414,7 @@ var
 begin
   EnsureThreadInit;
   T := TWSNetworkFrameworkTransport(ABlock^.Ctx);
+  DbgMark('NEWCONN'#10);
   if T.FStopping then
   begin
     Nw_connection_cancel(ANwConn);
@@ -391,10 +428,11 @@ begin
   Inc(T.FNextId);
   C.Id := T.FNextId;
   InterLockedIncrement(T.FActive);
+  T.LiveTrack(C);
   if Assigned(T.OnAccept) then T.OnAccept(C);
   Nw_connection_set_queue(ANwConn, C.FQueue);
   Nw_connection_set_state_changed_handler(ANwConn,
-    MakeBlock(@C.FStateBlock, @ConnStateInvoke, C));
+    MakeBlock(C.FStateBlock, @ConnStateInvoke, C));
   Nw_connection_start(ANwConn);
 end;
 
@@ -405,7 +443,7 @@ end;
 procedure TWSNwConn.ArmReceive;
 begin
   Nw_connection_receive(FNw, 1, High(UInt32),
-    MakeBlock(@FRecvBlock, @RecvInvoke, Self));
+    MakeBlock(FRecvBlock, @RecvInvoke, Self));
 end;
 
 procedure TWSNwConn.RemoteClosed;
@@ -415,8 +453,10 @@ begin
   if Assigned(FTransport.OnClosed) then FTransport.OnClosed(Self);
   // The session has dropped its references; tear the nw side down. The
   // cancelled state is the final callback and frees this object.
+  // A send still in flight performs the cancel from its completion
+  // instead (no need to abort the final bytes; cancel is idempotent).
   FDead := True;
-  Nw_connection_cancel(FNw);
+  if not FInFlight then Nw_connection_cancel(FNw);
 end;
 
 function TWSNwConn.SubmitSend(P: PByte; ALen: NativeInt): NativeInt;
@@ -430,7 +470,7 @@ begin
   Data := Dispatch_data_create(P, ALen, nil, nil);
   FInFlight := True;
   Nw_connection_send(FNw, Data, CtxDefaultStream, False,
-    MakeBlock(@FSendBlock, @SendInvoke, Self));
+    MakeBlock(FSendBlock, @SendInvoke, Self));
   Dispatch_release(Data);
   Result := ALen;
 end;
@@ -464,18 +504,20 @@ begin
   FStopSem := Dispatch_semaphore_create(0);
   FReadySem := Dispatch_semaphore_create(0);
   FDrainSem := Dispatch_semaphore_create(0);
+  FListenerDoneSem := Dispatch_semaphore_create(0);
+  FLiveLock := TCriticalSection.Create;
   FListenerQueue := Dispatch_queue_create('org.duetto.listener', nil);
 
   if ATls.Enabled then
   begin
     LoadIdentity(ATls.Pkcs12Path, ATls.Pkcs12Passphrase);
-    TlsBlock := MakeBlock(@FTlsBlock, @TlsConfigInvoke, Self);
+    TlsBlock := MakeBlock(FTlsBlock, @TlsConfigInvoke, Self);
   end
   else
     TlsBlock := CfgDisableProtocol;
 
   FParams := Nw_parameters_create_secure_tcp(TlsBlock,
-    MakeBlock(@FTcpBlock, @TcpConfigInvoke, Self));
+    MakeBlock(FTcpBlock, @TcpConfigInvoke, Self));
   Nw_parameters_set_reuse_local_address(FParams, True);
 
   PortStr := AnsiString(IntToStr(APort));
@@ -484,47 +526,113 @@ begin
     raise Exception.Create('nw_listener_create_with_port failed');
   Nw_listener_set_queue(FListener, FListenerQueue);
   Nw_listener_set_state_changed_handler(FListener,
-    MakeBlock(@FListenerStateBlock, @ListenerStateInvoke, Self));
+    MakeBlock(FListenerStateBlock, @ListenerStateInvoke, Self));
   Nw_listener_set_new_connection_handler(FListener,
-    MakeBlock(@FNewConnBlock, @NewConnInvoke, Self));
+    MakeBlock(FNewConnBlock, @NewConnInvoke, Self));
   Nw_listener_start(FListener);
 
   Dispatch_semaphore_wait(FReadySem,
-    Dispatch_time(0, 10 * Int64(1000000000)));
+    Dispatch_time(0, ListenerReadyTimeoutSeconds * NsPerSecond));
   if FListenerState <> NW_LISTENER_STATE_READY then
     raise Exception.CreateFmt('listener failed to bind port %d', [APort]);
 end;
 
 destructor TWSNetworkFrameworkTransport.Destroy;
 begin
-  // The session has already SubmitClosed every connection; wait for
-  // their cancelled states to land so no callback outlives us.
-  if FListener <> nil then
-  begin
-    Nw_listener_cancel(FListener);
-    Dispatch_semaphore_wait(FDrainSem,
-      Dispatch_time(0, 5 * Int64(1000000000)));
-  end;
-  while InterLockedExchangeAdd(FActive, 0) > 0 do
-    Dispatch_semaphore_wait(FDrainSem,
-      Dispatch_time(0, 100 * Int64(1000000)));
+  Shutdown;
   if FListener <> nil then Nw_release(FListener);
   if FParams <> nil then Nw_release(FParams);
   if FTlsIdentity <> nil then Nw_release(FTlsIdentity);
+  if FTempKeychain <> nil then
+  begin
+    SecKeychainDelete(FTempKeychain);
+    CFRelease(FTempKeychain);
+  end;
   if FListenerQueue <> nil then Dispatch_release(FListenerQueue);
   Dispatch_release(FStopSem);
   Dispatch_release(FReadySem);
   Dispatch_release(FDrainSem);
+  Dispatch_release(FListenerDoneSem);
+  FLiveLock.Free;
   inherited;
+end;
+
+// Quiesce (idempotent): stop accepting, hard-cancel every live
+// connection — aborting in-flight sends, which is what makes the drain
+// bounded — then wait until every cancelled state has landed. After
+// this returns no completion can ever fire again, so the session may
+// free its per-connection state (nw connection objects are freed by
+// their own cancelled handlers during the drain).
+procedure TWSNetworkFrameworkTransport.Shutdown;
+var
+  Doomed: array of TWSNwConn;
+  I: Integer;
+begin
+  if FShutdownDone then Exit;
+  FShutdownDone := True;
+  FStopping := True;
+  if FListener <> nil then
+  begin
+    Nw_listener_cancel(FListener);
+    Dispatch_semaphore_wait(FListenerDoneSem,
+      Dispatch_time(0, ListenerCancelTimeoutSeconds * NsPerSecond));
+  end;
+  FLiveLock.Acquire;
+  try
+    SetLength(Doomed, FLiveCount);
+    for I := 0 to FLiveCount - 1 do
+      Doomed[I] := FLive[I];
+  finally
+    FLiveLock.Release;
+  end;
+  // nw_connection_cancel is thread-safe and idempotent.
+  for I := 0 to High(Doomed) do
+    Nw_connection_cancel(Doomed[I].FNw);
+  while InterLockedExchangeAdd(FActive, 0) > 0 do
+    Dispatch_semaphore_wait(FDrainSem,
+      Dispatch_time(0, DrainPollMs * NsPerMs));
 end;
 
 procedure TWSNetworkFrameworkTransport.ConnFinalized(AConn: TWSNwConn);
 begin
+  LiveUntrack(AConn);
   Nw_release(AConn.FNw);
   Dispatch_release(AConn.FQueue);
   AConn.Free;
   InterLockedDecrement(FActive);
   Dispatch_semaphore_signal(FDrainSem);
+end;
+
+procedure TWSNetworkFrameworkTransport.LiveTrack(AConn: TWSNwConn);
+begin
+  FLiveLock.Acquire;
+  try
+    if FLiveCount = Length(FLive) then
+      SetLength(FLive, FLiveCount + LiveTableGrowth);
+    FLive[FLiveCount] := AConn;
+    Inc(FLiveCount);
+  finally
+    FLiveLock.Release;
+  end;
+end;
+
+procedure TWSNetworkFrameworkTransport.LiveUntrack(AConn: TWSNwConn);
+var
+  I: Integer;
+begin
+  FLiveLock.Acquire;
+  try
+    for I := 0 to FLiveCount - 1 do
+      if FLive[I] = AConn then
+      begin
+        FLive[I] := FLive[FLiveCount - 1];
+        FLive[FLiveCount - 1] := nil;
+        Dec(FLiveCount);
+        Break;
+      end;
+  finally
+    FLiveLock.Release;
+  end;
 end;
 
 procedure TWSNetworkFrameworkTransport.LoadIdentity(const APath,
@@ -533,8 +641,10 @@ var
   FS: TFileStream;
   Bytes: TBytes;
   CfData, CfPass, CfOpts, Items, Item0, IdentRef: Pointer;
-  Keys, Values: array[0..0] of Pointer;
+  Keys, Values: array[0..1] of Pointer;
   Status: Int32;
+  KcPath: AnsiString;
+  KcPass: AnsiString;
 begin
   FS := TFileStream.Create(APath, fmOpenRead);
   try
@@ -544,12 +654,28 @@ begin
     FS.Free;
   end;
 
+  // Import into a private throwaway keychain owned by this transport.
+  // SecPKCS12Import otherwise lands the key in the login keychain with
+  // an ACL bound to the importing binary: the next build of the same
+  // server would block forever inside the TLS handshake waiting for an
+  // authorization prompt no headless process can answer. The keychain
+  // file is deleted in Destroy.
+  KcPath := AnsiString(GetTempFileName(GetTempDir, 'duetto-tls-'));
+  KcPass := 'duetto-transient';
+  Status := SecKeychainCreate(PAnsiChar(KcPath), Length(KcPass),
+    PAnsiChar(KcPass), False, nil, FTempKeychain);
+  if Status <> 0 then
+    raise Exception.CreateFmt('temporary keychain creation failed (%d)',
+      [Status]);
+
   CfData := CFDataCreate(nil, @Bytes[0], Length(Bytes));
   CfPass := CFStringCreateWithCString(nil,
     PAnsiChar(AnsiString(APassphrase)), CF_STRING_ENCODING_UTF8);
   Keys[0] := KeyImportPassphrase;
   Values[0] := CfPass;
-  CfOpts := CFDictionaryCreate(nil, @Keys[0], @Values[0], 1,
+  Keys[1] := KeyImportKeychain;
+  Values[1] := FTempKeychain;
+  CfOpts := CFDictionaryCreate(nil, @Keys[0], @Values[0], 2,
     DictKeyCallbacks, DictValueCallbacks);
   Items := nil;
   Status := SecPKCS12Import(CfData, CfOpts, @Items);
@@ -584,7 +710,7 @@ begin
     Dispatch_semaphore_wait(FStopSem, DISPATCH_TIME_FOREVER)
   else
     Dispatch_semaphore_wait(FStopSem,
-      Dispatch_time(0, Int64(ATimeoutMs) * 1000000));
+      Dispatch_time(0, Int64(ATimeoutMs) * NsPerMs));
 end;
 
 procedure TWSNetworkFrameworkTransport.Stop;
