@@ -49,7 +49,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.2.0"
+  LWPT_VERSION: "0.4.0"
 
 jobs:
   test:
@@ -86,8 +86,6 @@ jobs:
             fpc-install: choco
             fpc-win-target: x86_64-win64
             exe: .exe
-            frozen-install: skip   # lwpt#78: frozen tree-hash not path-portable on Windows
-            crosscheck: skip   # python venv on the win runners is a follow-up
           - target: i386-win32
             runner: windows-latest
             lwpt-asset: windows-x86
@@ -95,8 +93,6 @@ jobs:
             fpc-install: choco
             fpc-win-target: i386-win32
             exe: .exe
-            frozen-install: skip   # lwpt#78: frozen tree-hash not path-portable on Windows
-            crosscheck: skip
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -200,14 +196,7 @@ jobs:
           echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
 
       - name: lwpt install --frozen (verify lockfile + committed modules)
-        if: matrix.frozen-install != 'skip'
         run: lwpt install --frozen
-
-      # Windows: lwpt#78 — the frozen verifier's tree hash is not yet
-      # path-portable; mirror lwpt's own Windows CI and install online.
-      - name: lwpt install (Windows)
-        if: matrix.frozen-install == 'skip'
-        run: lwpt install
 
       - name: lwpt format --check (one runner)
         if: matrix.format-check == true
@@ -229,11 +218,15 @@ jobs:
       # Network.framework transport — Autobahn needs Docker, which
       # GitHub's macOS runners don't have.
       - name: crosscheck vs python websockets (reference implementation)
-        if: matrix.loopback-battery != 'skip' && matrix.crosscheck != 'skip'
+        if: matrix.loopback-battery != 'skip'
         run: |
-          python3 -m venv "$RUNNER_TEMP/crosscheck-venv"
-          "$RUNNER_TEMP/crosscheck-venv/bin/pip" install --quiet websockets
-          PATH="$RUNNER_TEMP/crosscheck-venv/bin:$PATH" python3 tools/crosscheck.py
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python   # Windows runners ship `python` only
+          "$PY" -m venv "$RUNNER_TEMP/crosscheck-venv"
+          VENV_BIN="$RUNNER_TEMP/crosscheck-venv/bin"
+          [ -d "$VENV_BIN" ] || VENV_BIN="$RUNNER_TEMP/crosscheck-venv/Scripts"   # Windows venv layout
+          "$VENV_BIN/pip" install --quiet websockets
+          "$VENV_BIN/python" tools/crosscheck.py
 
   autobahn:
     runs-on: ubuntu-latest
