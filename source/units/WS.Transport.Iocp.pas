@@ -419,6 +419,12 @@ begin
   FAcceptPending := False;
   AcceptedSocket := FAcceptSocket;
   FAcceptSocket := INVALID_SOCKET;
+  // The re-arm lives in the outer finally: a raising OnAccept (or a
+  // raise out of the pin's own finally) must not leave the listener
+  // permanently unarmed — a host that catches the exception and
+  // re-enters Run would otherwise serve nothing while the kernel
+  // backlog keeps completing handshakes nobody reads.
+  try
   if ASucceeded and (not FStopping) then
   begin
     if WinSock2.setsockopt(AcceptedSocket, SOL_SOCKET,
@@ -464,8 +470,9 @@ begin
   end
   else if AcceptedSocket <> INVALID_SOCKET then
     WinSock2.closesocket(AcceptedSocket);
-
-  if not FStopping then ArmAccept;
+  finally
+    if not FStopping then ArmAccept;
+  end;
 end;
 
 procedure TWSIocpTransport.HandleConnectionCompletion(AConn: TWSIocpConn;
@@ -670,6 +677,10 @@ end;
 // PostQueuedCompletionStatus wake was lost would otherwise sit in the
 // queue until Shutdown. The dirty HasPending read costs one predictable
 // branch per dispatched completion, never one per connection.
+// Not absolute: an idle Run(-1) thread parked in GetQueuedCompletionStatus
+// produces no completion round, so a post whose PQCS wake failed twice
+// waits for traffic or Shutdown. The sweep covers the realistic case —
+// wake lost or post landing behind a drain on a live server.
 procedure TWSIocpTransport.SweepPosts;
 begin
   if FPosts.HasPending then DeliverPosts(FPosts.Drain, False);

@@ -477,9 +477,11 @@ begin
     end;
     // Wake-independent backstop (once per batch, never per event): a
     // post whose eventfd wake was lost, or that landed after this
-    // round's drain, would otherwise sit in the queue until the next
-    // readiness event — or until Shutdown, on an idle server. The dirty
-    // HasPending read costs one predictable branch per epoll_wait.
+    // round's drain, is picked up on the next readiness event. Not
+    // absolute: an idle Run(-1) reactor with a lost wake produces no
+    // batch, so that post waits for traffic or Shutdown — acceptable
+    // because eventfd loss is only the (self-healing) saturated-counter
+    // case. The dirty HasPending read costs one branch per epoll_wait.
     if FPosts.HasPending then DeliverPosts(FPosts.Drain, False);
   until (not FRunning) or (ATimeoutMs >= 0);
 end;

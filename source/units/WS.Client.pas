@@ -539,6 +539,9 @@ begin
   begin
     // Exactly one non-blocking round. A peer that keeps the socket
     // readable must not be able to hold this call for another pass.
+    // (Over wss even this round can block: the pump reads through the
+    // TLS layer, which waits for a whole record — see the overload
+    // comment.)
     if WaitReadable(0) then PumpOnce;
     if FQHead <> FQTail then
     begin

@@ -491,12 +491,13 @@ begin
   // connection reference in OnOpen, which runs from OnData on this
   // connection's own queue, strictly after everything here.
   //
-  // A connection closed inside OnAccept is never published at all. It
-  // still gets its queue, handler, and start, so the cancel SubmitClose
-  // issued still produces a cancelled state and ConnFinalized still
-  // reclaims it exactly once — LiveUntrack simply finds nothing to
-  // remove, which is a no-op by construction, not a double-handle.
-  if not C.FDead then T.LiveTrack(C);
+  // A connection closed inside OnAccept is published too — FindLiveById
+  // filters FDead, so posts still cannot reach it. Publishing it keeps
+  // it in Shutdown's cancel sweep: SubmitClose's cancel fired before
+  // set_queue/start, and rather than rest on nw delivering a cancelled
+  // state for a pre-start cancel, the sweep's (idempotent) second
+  // cancel guarantees ConnFinalized runs and FActive drains.
+  T.LiveTrack(C);
   Nw_connection_set_state_changed_handler(ANwConn,
     MakeBlock(C.FStateBlock, @ConnStateInvoke, C));
   Nw_connection_start(ANwConn);

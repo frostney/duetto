@@ -61,14 +61,16 @@ type
     FInDelivery: Boolean;      // inside Ingest/OnOpen delivery — drops defer
     FDropping: Boolean;        // teardown running; re-entrant drops no-op
     FDropDeferred: Boolean;    // dropped mid-delivery; freed on unwind
-    // Own slot in FServer.FRegistry, or -1 when unregistered. Written
-    // and read only under FServer.FLock; makes the Post rendezvous O(1)
-    // instead of a scan of every live connection.
+    // Own slot in FServer.FRegistry, or -1 when unregistered (set at
+    // construction, before the object is reachable). Once registered,
+    // written and read only under FServer.FLock; makes the Post
+    // rendezvous O(1) instead of a scan of every live connection.
     FRegistryIndex: Integer;
     procedure ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
     function GetId: NativeUInt;
   public
     UserData: Pointer;
+    constructor Create;
     destructor Destroy; override;
     // Callable from this connection's callback context (ADR-0003).
     // False = the transport reported the connection dead during the
@@ -259,6 +261,15 @@ type
   end;
 
 { TWSConnection }
+
+constructor TWSConnection.Create;
+begin
+  inherited;
+  // The sentinel lives in the type, not in a caller: a zero-initialized
+  // index would alias registry slot 0 and let an unregistered
+  // connection validate against — and swap-remove — someone else's.
+  FRegistryIndex := -1;
+end;
 
 destructor TWSConnection.Destroy;
 begin
@@ -650,7 +661,6 @@ begin
   Conn.FServer := Self;
   Conn.FTConn := ATConn;
   Conn.FState := wcsHandshake;
-  Conn.FRegistryIndex := -1; // RegistryAdd assigns the real slot
   ATConn.UserData := Conn;
   RegistryAdd(Conn);
 end;

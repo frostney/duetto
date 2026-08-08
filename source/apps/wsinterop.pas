@@ -396,10 +396,12 @@ type
     // the last worker starts so the wall-clock budget covers the window
     // in which every worker is actually running (a worker scheduled late
     // would otherwise burn its budget before its first cycle). Read per
-    // iteration. Unsynchronised on purpose: the single write moves the
-    // deadline a millisecond or two, so even the torn read a 32-bit leg
-    // could see yields one of the two neighbouring values — and the
-    // cycle caps bound the loops regardless of what it reads.
+    // iteration. Unsynchronised on purpose: whatever a torn read on a
+    // 32-bit leg yields (including a value off by 2^32 ms if the low
+    // dword wraps between the two writes), the loops stay bounded by
+    // the cycle caps and the repeat-until guarantees one cycle, and
+    // nothing asserts on elapsed time — so no torn value can produce a
+    // false failure.
     DeadlinePtr: PQWord;
     Cycles: Integer;
     Ok: Boolean;
@@ -1264,6 +1266,10 @@ begin
   StressPhase := 'storm joined; workers freed';
   LingerVerified := 0;
   LingerBad := '';
+  // Local class-reference array: FPC does not zero it, and the except
+  // arm below survives a partial fill — the nil guards on the read and
+  // free loops need real nils, not stack garbage.
+  FillChar(Linger, SizeOf(Linger), 0);
   // Runs on the main thread, so a connect that exhausts its retries
   // would abort the process before the summary; catch it and turn it
   // into the failure this check exists to report.
@@ -1336,7 +1342,7 @@ begin
   Watchdog.Free;
 
   for I := 0 to High(Linger) do
-    Linger[I].Free;
+    if Linger[I] <> nil then Linger[I].Free;
   Tracker.Free;
   Echo.Free;
 
