@@ -24,12 +24,21 @@ type
 
   // Classification of a complete request header block, computed as a
   // by-product of ServerParseRequest for the session layer's single-port
-  // fallback (TWSServer.OnPlainRequest). wrkUpgrade: a WebSocket upgrade
-  // attempt (Upgrade header lists "websocket"), whether or not it
-  // validates. wrkPlain: a well-formed body-less non-upgrade request —
-  // GET or HEAD with no Content-Length and no Transfer-Encoding —
-  // eligible for the fallback. wrkOther: everything else (malformed, or
-  // a non-upgrade request carrying/advertising a body); always refused.
+  // fallback (TWSServer.OnPlainRequest). A parseable request line
+  // (method, target, version) is the precondition for anything but
+  // wrkOther — noise that never yields those three is wrkOther even
+  // when it carries an Upgrade header.
+  //
+  // wrkUpgrade: a WebSocket upgrade attempt — the request line parsed
+  // and the Upgrade header lists "websocket" — whether or not the rest
+  // of the handshake validates.
+  // wrkPlain: a well-formed body-less non-upgrade request eligible for
+  // the fallback — GET or HEAD, HTTP/1.1 or HTTP/1.0, with neither a
+  // Content-Length nor a Transfer-Encoding header present (by name,
+  // whatever the value) and no obs-fold continuation lines.
+  // wrkOther: everything else (malformed, unknown HTTP version, or a
+  // non-upgrade request that carries or advertises a body); always
+  // refused.
   TWSRequestKind = (wrkOther, wrkUpgrade, wrkPlain);
 
   TWSServerHandshake = record
@@ -54,7 +63,9 @@ function ComputeAccept(const AKey: string): string;
 // Collect every value of header AName (case-insensitive) from a raw
 // header block, joined with ', ' — RFC 7230 list semantics. Exported so
 // OnPlainRequest consumers can query arbitrary headers of the raw
-// request block without a second HTTP parser.
+// request block without a second HTTP parser. Scanning stops at the
+// first empty line: whatever follows the header block is a body or a
+// pipelined request, never a header of this message.
 function HeaderValue(const ARaw, AName: string): string;
 
 // --- server role ---------------------------------------------------------
@@ -249,6 +260,10 @@ begin
       if (Line <> '') and (Line[Length(Line)] = #13) then
         SetLength(Line, Length(Line) - 1);
       LineStart := I + 1;
+      // The blank line terminates the header block. Bytes past it are a
+      // body or a pipelined request; folding them in would let a second
+      // message contribute headers to this one.
+      if Line = '' then Exit;
       Colon := Pos(':', Line);
       if Colon > 0 then
       begin
@@ -417,14 +432,36 @@ end;
 // cares about. Repeated headers comma-join, mirroring HeaderValue (RFC
 // 7230 list folding). Replaces seven full-request rescans on the
 // connection-setup path.
+//
+// Slot indices — SrvHdrCount sizes both the name table and the collected
+// array, so the two can never drift apart.
 const
-  SRV_HDR_NAMES: array[0..8] of string = (
+  ShiUpgrade = 0;
+  ShiConnection = 1;
+  ShiVersion = 2;
+  ShiKey = 3;
+  ShiHost = 4;
+  ShiProtocol = 5;
+  ShiExtensions = 6;
+  ShiContentLength = 7;
+  ShiTransferEncoding = 8;
+  SrvHdrCount = 9;
+
+  SRV_HDR_NAMES: array[0..SrvHdrCount - 1] of string = (
     'Upgrade', 'Connection', 'Sec-WebSocket-Version', 'Sec-WebSocket-Key',
     'Host', 'Sec-WebSocket-Protocol', 'Sec-WebSocket-Extensions',
     'Content-Length', 'Transfer-Encoding');
 
 type
-  TSrvHeaders = array[0..8] of string;
+  // Seen records that the header NAME appeared, independently of Value:
+  // an empty-valued 'Content-Length:' is still a Content-Length, and the
+  // body-less gate must key off presence, not off a non-empty value.
+  TSrvHeader = record
+    Value: string;
+    Seen: Boolean;
+  end;
+
+  TSrvHeaders = array[0..SrvHdrCount - 1] of TSrvHeader;
 
 function NameIsCI(P: PAnsiChar; L: Integer; const N: string): Boolean;
 var
@@ -443,13 +480,24 @@ begin
   Result := True;
 end;
 
-procedure CollectServerHeaders(const ARaw: RawByteString; out H: TSrvHeaders);
+// AObsFold reports that at least one header line began with SP or HTAB,
+// i.e. an RFC 7230 §3.2.4 obs-fold continuation of the previous header.
+// Continuation lines are not parsed as headers (their leading whitespace
+// makes the name comparison fail anyway); the flag lets the classifier
+// fail closed on a construct that is deprecated and ambiguous to split.
+procedure CollectServerHeaders(const ARaw: RawByteString; out H: TSrvHeaders;
+  out AObsFold: Boolean);
 var
   P, PEnd, LineStart, LineEnd, Colon, NEnd, VStart, VEnd: PAnsiChar;
   K: Integer;
   V: string;
 begin
-  for K := 0 to High(H) do H[K] := '';
+  for K := 0 to High(H) do
+  begin
+    H[K].Value := '';
+    H[K].Seen := False;
+  end;
+  AObsFold := False;
   P := PAnsiChar(ARaw);
   PEnd := P + Length(ARaw);
   // skip the request line
@@ -462,7 +510,15 @@ begin
     LineEnd := P;
     if P < PEnd then Inc(P); // past the LF
     if (LineEnd > LineStart) and ((LineEnd - 1)^ = #13) then Dec(LineEnd);
-    if LineEnd = LineStart then Continue; // blank line (end of headers)
+    // The blank line ends this message's headers. Stop rather than skip:
+    // a pipelined follow-up request sits right behind it and its headers
+    // are not ours to collect, whatever the caller handed us.
+    if LineEnd = LineStart then Break;
+    if LineStart^ in [' ', #9] then
+    begin
+      AObsFold := True;
+      Continue;
+    end;
     Colon := LineStart;
     while (Colon < LineEnd) and (Colon^ <> ':') do Inc(Colon);
     if Colon = LineEnd then Continue;
@@ -477,10 +533,14 @@ begin
         VEnd := LineEnd;
         while (VEnd > VStart) and ((VEnd - 1)^ in [' ', #9]) do Dec(VEnd);
         SetString(V, VStart, VEnd - VStart);
-        if H[K] = '' then
-          H[K] := V
+        // Join on the accumulated value (not on Seen) so an empty first
+        // occurrence cannot prepend a stray ', ' — Seen stays purely
+        // additive and leaves every existing value identical.
+        if H[K].Value = '' then
+          H[K].Value := V
         else
-          H[K] := H[K] + ', ' + V;
+          H[K].Value := H[K].Value + ', ' + V;
+        H[K].Seen := True;
         Break;
       end;
   end;
@@ -490,13 +550,14 @@ function ServerParseRequest(const ARaw: RawByteString; AAllowDeflate: Boolean;
   out AHS: TWSServerHandshake): Boolean;
 var
   EOL, SP1, SP2: Integer;
-  RequestLine, Method: RawByteString;
+  RequestLine, Method, HttpVersion: RawByteString;
   H: TSrvHeaders;
+  IsUpgrade, ObsFold: Boolean;
 begin
   Result := False;
   AHS := Default(TWSServerHandshake);
   AHS.Deflate.Reset;
-  CollectServerHeaders(ARaw, H);
+  CollectServerHeaders(ARaw, H, ObsFold);
 
   EOL := Pos(#13#10, ARaw);
   if EOL = 0 then begin AHS.Failure := 'malformed request line'; Exit; end;
@@ -511,18 +572,40 @@ begin
     Exit;
   end;
   Method := Copy(RequestLine, 1, SP1 - 1);
+  HttpVersion := Copy(RequestLine, SP2 + 1, MaxInt);
   AHS.Method := Method;
   AHS.Path := Copy(RequestLine, SP1 + 1, SP2 - SP1 - 1);
-  AHS.Host := H[4];
+  AHS.Host := H[ShiHost].Value;
 
   // Classify before validating: the session layer's single-port
   // fallback needs to know, even when the checks below fail, whether
   // this was an upgrade attempt, a body-less plain request, or noise.
-  // (Default() above already left Kind = wrkOther.)
-  if TokenListHas(H[0], 'websocket') then
+  // (Default() above already left Kind = wrkOther — which is also where
+  // an unparseable request line stops, above, before we get here.)
+  //
+  // The plain gate is deliberately fail-closed: the fallback answers
+  // exactly one request and then closes, so anything that could carry
+  // or imply a body must not reach it.
+  //   * Content-Length / Transfer-Encoding disqualify on NAME presence,
+  //     whatever the value — 'Content-Length: 0' and an empty-valued
+  //     'Content-Length:' are both out. Zero is a documented part of
+  //     the contract, not an oversight: the scope is body-less by
+  //     header shape, not by byte count.
+  //   * obs-fold (RFC 7230 §3.2.4) anywhere in the block disqualifies:
+  //     it is deprecated, and a folded Content-Length is exactly the
+  //     smuggling shape the gate exists to keep out.
+  //   * The HTTP version must be one we know. The upgrade path stays
+  //     lenient about it (and about method case — SameText below is a
+  //     deliberate deviation from RFC 7230's case-sensitive methods,
+  //     kept for symmetry with the upgrade path rather than tightened
+  //     here); the fallback does not extend that leniency.
+  IsUpgrade := TokenListHas(H[ShiUpgrade].Value, 'websocket');
+  if IsUpgrade then
     AHS.Kind := wrkUpgrade
   else if (SameText(Method, 'GET') or SameText(Method, 'HEAD')) and
-    (H[7] = '') and (H[8] = '') then
+    ((HttpVersion = 'HTTP/1.1') or (HttpVersion = 'HTTP/1.0')) and
+    (not ObsFold) and (not H[ShiContentLength].Seen) and
+    (not H[ShiTransferEncoding].Seen) then
     AHS.Kind := wrkPlain;
 
   if not SameText(Method, 'GET') then
@@ -531,25 +614,25 @@ begin
     Exit;
   end;
 
-  if not TokenListHas(H[0], 'websocket') then
+  if not IsUpgrade then
   begin
     AHS.Failure := 'missing Upgrade: websocket';
     Exit;
   end;
-  if not TokenListHas(H[1], 'Upgrade') then
+  if not TokenListHas(H[ShiConnection].Value, 'Upgrade') then
   begin
     AHS.Failure := 'missing Connection: Upgrade';
     Exit;
   end;
 
-  AHS.Version := StrToIntDef(H[2], -1);
+  AHS.Version := StrToIntDef(H[ShiVersion].Value, -1);
   if AHS.Version <> 13 then
   begin
     AHS.Failure := 'unsupported version';
     Exit;
   end;
 
-  AHS.Key := H[3];
+  AHS.Key := H[ShiKey].Value;
   // 16 random bytes, base64: exactly 24 chars ending in '=='.
   if (Length(AHS.Key) <> 24) then
   begin
@@ -557,10 +640,10 @@ begin
     Exit;
   end;
 
-  AHS.Protocols := H[5];
+  AHS.Protocols := H[ShiProtocol].Value;
 
   if AAllowDeflate then
-    NegotiateDeflate(H[6], AHS.Deflate);
+    NegotiateDeflate(H[ShiExtensions].Value, AHS.Deflate);
 
   Result := True;
 end;
