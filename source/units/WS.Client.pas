@@ -7,7 +7,7 @@ unit WS.Client;
 // All protocol behaviour lives in TWSProtocol; this unit is the socket,
 // the TLS shim, the opening handshake, and a pump loop. ReadMessage blocks
 // until a complete message arrives (pings are answered invisibly along the
-// way) or the connection ends.
+// way) or the connection ends; a bounded overload caps the wait instead.
 
 {$I Shared.inc}
 
@@ -37,6 +37,8 @@ const
   {$endif}
 
 type
+  // Outcome of the bounded ReadMessage overload.
+  TWSReadResult = (wrrMessage, wrrTimeout, wrrClosed);
 
   TWSClient = class
   private
@@ -58,6 +60,8 @@ type
     function RawWrite(P: PByte; ALen: Integer): Integer;
     procedure FlushOut;
     function PumpOnce: Boolean;
+    function WaitReadable(ATimeoutMs: Integer): Boolean;
+    procedure PopMessage(out AText: Boolean; out AData: TBytes);
   public
     constructor Create;
     destructor Destroy; override;
@@ -73,6 +77,17 @@ type
     // Blocks until a message arrives. False = connection closed (see
     // CloseCode/CloseReason) or failed.
     function ReadMessage(out AText: Boolean; out AData: TBytes): Boolean;
+      overload;
+
+    // Bounded variant. Waits at most ATimeoutMs milliseconds of wall
+    // clock for a complete message — the deadline is monotonic, so a
+    // peer trickling a partial frame cannot stretch the wait. A message
+    // already queued returns immediately. ATimeoutMs <= 0 means one
+    // non-blocking poll: take what the socket already holds, never
+    // block. wrrClosed covers clean close and failure alike — inspect
+    // CloseCode afterwards, exactly like the unbounded form's False.
+    function ReadMessage(out AText: Boolean; out AData: TBytes;
+      ATimeoutMs: Integer): TWSReadResult; overload;
 
     // Initiate the closing handshake and wait (bounded) for the echo.
     procedure Close(ACode: Word = 1000; const AReason: string = '');
@@ -404,13 +419,31 @@ begin
   if FProto.CloseDone then FOpen := False;
 end;
 
-function TWSClient.ReadMessage(out AText: Boolean; out AData: TBytes): Boolean;
+// True when the socket has bytes to read within ATimeoutMs milliseconds
+// (0 = one non-blocking check). This polls the raw fd, so plaintext the
+// TLS layer has decrypted but not yet surfaced is invisible; over wss a
+// read sliced mid-record can wait here until the next record arrives.
+function TWSClient.WaitReadable(ATimeoutMs: Integer): Boolean;
+var
+  FDs: TFDSet;
+  TV: TTimeVal;
 begin
-  while FQHead = FQTail do
-  begin
-    if not FOpen then Exit(False);
-    PumpOnce;
-  end;
+  TV.tv_sec := ATimeoutMs div 1000;
+  TV.tv_usec := (ATimeoutMs mod 1000) * 1000;
+  {$ifdef UNIX}
+  fpFD_ZERO(FDs);
+  fpFD_SET(FSock, FDs);
+  Result := fpSelect(FSock + 1, @FDs, nil, nil, @TV) > 0;
+  {$else}
+  WinSock2.FD_ZERO(FDs);
+  WinSock2.FD_SET(FSock, FDs);
+  // WinSock ignores the nfds parameter.
+  Result := WinSock2.select(0, @FDs, nil, nil, @TV) > 0;
+  {$endif}
+end;
+
+procedure TWSClient.PopMessage(out AText: Boolean; out AData: TBytes);
+begin
   AText := FQueue[FQHead].Text;
   AData := FQueue[FQHead].Data;
   FQueue[FQHead].Data := nil;
@@ -420,7 +453,40 @@ begin
     FQHead := 0;
     FQTail := 0;
   end;
+end;
+
+function TWSClient.ReadMessage(out AText: Boolean; out AData: TBytes): Boolean;
+begin
+  while FQHead = FQTail do
+  begin
+    if not FOpen then Exit(False);
+    PumpOnce;
+  end;
+  PopMessage(AText, AData);
   Result := True;
+end;
+
+function TWSClient.ReadMessage(out AText: Boolean; out AData: TBytes;
+  ATimeoutMs: Integer): TWSReadResult;
+var
+  Deadline: QWord;
+  Remaining: Int64;
+begin
+  if ATimeoutMs < 0 then ATimeoutMs := 0;
+  Deadline := GetTickCount64 + QWord(ATimeoutMs);
+  while FQHead = FQTail do
+  begin
+    if not FOpen then Exit(wrrClosed);
+    Remaining := Int64(Deadline) - Int64(GetTickCount64);
+    if Remaining < 0 then Remaining := 0;
+    if WaitReadable(Integer(Remaining)) then
+      PumpOnce // a partial frame is fine; the loop re-derives the rest
+    else if Remaining <= 0 then
+      Exit(wrrTimeout);
+    // A wait cut short (e.g. EINTR) simply re-derives the remainder.
+  end;
+  PopMessage(AText, AData);
+  Result := wrrMessage;
 end;
 
 procedure TWSClient.SendText(const S: RawByteString);
