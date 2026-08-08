@@ -236,6 +236,9 @@ const
   StressEchoCycleCap = 30;
   StressDropCycleCap = 150;
   StressDropPauseMs = 5;
+  // Whole-section watchdog: storm budget plus generous headroom for a
+  // slow CI VM. Purely a wedge detector, never a speed assertion.
+  StressWatchdogMs = StressBudgetMs + 120000;
   StressPushTail: RawByteString = 'duetto-push';
 
 type
@@ -293,6 +296,19 @@ type
   public
     Tracker: TStressTracker;
     Deadline: QWord;
+    procedure Execute; override;
+  end;
+
+  // Converts a wedged server into a fast, attributable failure: a dead
+  // accept path leaves TCP connects completing against the kernel
+  // backlog while the 101 never arrives, which blocks the client's
+  // unbounded Connect — and would hang the process (and a CI job)
+  // until an external timeout with no output. If the section has not
+  // signalled completion inside the watchdog bound, report and
+  // hard-exit.
+  TStressWatchdog = class(TThread)
+  public
+    Done: PBoolean; // written by the main thread, polled here
     procedure Execute; override;
   end;
 
@@ -604,6 +620,25 @@ begin
   end;
 end;
 
+procedure TStressWatchdog.Execute;
+var
+  Waited: Integer;
+begin
+  Waited := 0;
+  while Waited < StressWatchdogMs do
+  begin
+    Sleep(250);
+    Inc(Waited, 250);
+    if Done^ then Exit;
+  end;
+  if Done^ then Exit; // completion at the boundary is not an expiry
+  WriteLn('FAIL - stress: watchdog expired after ', StressWatchdogMs,
+    ' ms; section did not complete (wedged server, or pathological ',
+    'slowness — per-worker diagnostics were discarded)');
+  Flush(Output);
+  Halt(2);
+end;
+
 // ---------------------------------------------------------------------------
 
 const
@@ -632,6 +667,8 @@ var
   DropWorkers: array[0..StressDropWorkerCount - 1] of TStressDropWorker;
   Linger: array[0..StressLingerCount - 1] of TWSClient;
   Deadline: QWord;
+  Watchdog: TStressWatchdog;
+  StressDone: Boolean;
   TotalCycles, TotalPushes, TotalDrops: Integer;
   AllOk: Boolean;
 begin
@@ -740,6 +777,10 @@ begin
   Check(Code = 1007, 'invalid UTF-8 text -> close 1007');
 
   // --- concurrent-connections stress -------------------------------------
+  StressDone := False;
+  Watchdog := TStressWatchdog.Create(True);
+  Watchdog.Done := @StressDone;
+  Watchdog.Start;
   Deadline := GetTickCount64 + StressBudgetMs;
   for I := 0 to High(EchoWorkers) do
   begin
@@ -831,9 +872,18 @@ begin
   SrvT.Terminate;
   SrvT.Srv.Stop;
   SrvT.WaitFor;
+  // A transport exception (e.g. a fatal ArmAccept error) unwinds Run
+  // and lands here, not in a crash — surface it instead of letting a
+  // dead server thread masquerade as a mystery wedge.
+  if SrvT.FatalException <> nil then
+    WriteLn('       server thread died: ',
+      Exception(SrvT.FatalException).Message);
   SrvT.Srv.Free; // Shutdown quiesces and drains with the linger conns open
   SrvT.Free;
   Check(True, 'stress: shutdown with live connections drained cleanly');
+  StressDone := True;
+  Watchdog.WaitFor; // exits within one 250 ms poll slice
+  Watchdog.Free;
 
   for I := 0 to High(Linger) do
     Linger[I].Free;

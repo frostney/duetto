@@ -361,24 +361,34 @@ end;
 procedure TWSIocpTransport.ArmAccept;
 var
   Bytes: DWORD;
+  Err: Integer;
 begin
   if FStopping or FAcceptPending then Exit;
-  FAcceptSocket := C_WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP,
-    nil, 0, WSA_FLAG_OVERLAPPED);
-  if FAcceptSocket = INVALID_SOCKET then
-    raise Exception.Create('accept WSASocketW() failed');
-  FillChar(FAcceptOverlapped, SizeOf(FAcceptOverlapped), 0);
-  FillChar(FAcceptBuffer, SizeOf(FAcceptBuffer), 0);
-  Bytes := 0;
-  if not C_AcceptEx(FListenSocket, FAcceptSocket, @FAcceptBuffer[0], 0,
-      AcceptAddressLength, AcceptAddressLength, @Bytes,
-      @FAcceptOverlapped) then
-    if WSAGetLastError <> WinErrorIoPending then
-    begin
-      WinSock2.closesocket(FAcceptSocket);
-      FAcceptSocket := INVALID_SOCKET;
-      raise Exception.Create('AcceptEx() failed');
-    end;
+  repeat
+    FAcceptSocket := C_WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP,
+      nil, 0, WSA_FLAG_OVERLAPPED);
+    if FAcceptSocket = INVALID_SOCKET then
+      raise Exception.Create('accept WSASocketW() failed');
+    FillChar(FAcceptOverlapped, SizeOf(FAcceptOverlapped), 0);
+    FillChar(FAcceptBuffer, SizeOf(FAcceptBuffer), 0);
+    Bytes := 0;
+    if C_AcceptEx(FListenSocket, FAcceptSocket, @FAcceptBuffer[0], 0,
+        AcceptAddressLength, AcceptAddressLength, @Bytes,
+        @FAcceptOverlapped) then Break;
+    Err := WSAGetLastError;
+    if Err = WinErrorIoPending then Break;
+    // The backlog head was reset before acceptance — a documented
+    // transient (AcceptEx fails synchronously with WSAECONNRESET or
+    // WSAECONNABORTED; MSDN says retry). Raising here would unwind the
+    // completion thread and silently stop the listener for good: the
+    // kernel backlog keeps completing TCP handshakes no one will ever
+    // read. Retire this accept socket and re-arm for the next backlog
+    // entry; anything else stays fatal.
+    WinSock2.closesocket(FAcceptSocket);
+    FAcceptSocket := INVALID_SOCKET;
+    if (Err <> WSAECONNRESET) and (Err <> WSAECONNABORTED) then
+      raise Exception.CreateFmt('AcceptEx() failed (%d)', [Err]);
+  until False;
   FAcceptPending := True;
 end;
 
