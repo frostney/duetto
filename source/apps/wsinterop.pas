@@ -309,6 +309,11 @@ type
   TStressWatchdog = class(TThread)
   public
     Done: PBoolean; // written by the main thread, polled here
+    Srv: TThread;   // the server thread, for FatalException on expiry
+    // Last phase marker the main thread recorded. ShortString on
+    // purpose: value semantics, no refcounted heap pointer, so a torn
+    // cross-thread read garbles the text at worst instead of crashing.
+    Phase: ^ShortString;
     procedure Execute; override;
   end;
 
@@ -635,6 +640,12 @@ begin
   WriteLn('FAIL - stress: watchdog expired after ', StressWatchdogMs,
     ' ms; section did not complete (wedged server, or pathological ',
     'slowness — per-worker diagnostics were discarded)');
+  WriteLn('       phase: ', Phase^);
+  if (Srv <> nil) and (Srv.FatalException <> nil) then
+    WriteLn('       server thread died: ',
+      Exception(Srv.FatalException).Message)
+  else
+    WriteLn('       server thread alive (no FatalException)');
   Flush(Output);
   Halt(2);
 end;
@@ -669,6 +680,7 @@ var
   Deadline: QWord;
   Watchdog: TStressWatchdog;
   StressDone: Boolean;
+  StressPhase: ShortString;
   TotalCycles, TotalPushes, TotalDrops: Integer;
   AllOk: Boolean;
 begin
@@ -778,8 +790,11 @@ begin
 
   // --- concurrent-connections stress -------------------------------------
   StressDone := False;
+  StressPhase := 'storm';
   Watchdog := TStressWatchdog.Create(True);
   Watchdog.Done := @StressDone;
+  Watchdog.Srv := SrvT;
+  Watchdog.Phase := @StressPhase;
   Watchdog.Start;
   Deadline := GetTickCount64 + StressBudgetMs;
   for I := 0 to High(EchoWorkers) do
@@ -855,20 +870,27 @@ begin
   // Prove the server is still healthy after the storm, then leave the
   // connections open so the teardown below is a Shutdown with live
   // connections — the drain must complete and the process exit cleanly.
+  StressPhase := 'storm joined; workers freed';
   Ok := True;
   for I := 0 to High(Linger) do
   begin
+    StressPhase := 'linger connect ' + IntToStr(I);
     Linger[I] := StressConnect(Url);
+    StressPhase := 'linger send ' + IntToStr(I);
     Linger[I].SendText(LingerProbe);
   end;
   for I := 0 to High(Linger) do
+  begin
+    StressPhase := 'linger read ' + IntToStr(I);
     Ok := Ok and (Linger[I].ReadMessage(IsText, Data, StressStallLimitMs) =
       wrrMessage) and IsText and (Length(Data) = Length(LingerProbe)) and
       CompareMem(@Data[0], @LingerProbe[1], Length(LingerProbe));
+  end;
   Check(Ok, Format(
     'stress: server healthy after the storm, %d connections held open',
     [StressLingerCount]));
 
+  StressPhase := 'teardown: stop + waitfor';
   SrvT.Terminate;
   SrvT.Srv.Stop;
   SrvT.WaitFor;
@@ -878,6 +900,7 @@ begin
   if SrvT.FatalException <> nil then
     WriteLn('       server thread died: ',
       Exception(SrvT.FatalException).Message);
+  StressPhase := 'teardown: server free (shutdown drain)';
   SrvT.Srv.Free; // Shutdown quiesces and drains with the linger conns open
   SrvT.Free;
   Check(True, 'stress: shutdown with live connections drained cleanly');
