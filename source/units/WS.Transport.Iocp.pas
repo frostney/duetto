@@ -43,8 +43,11 @@ type
     FSendOffset: DWORD;        // bytes already completed of that post
     FDead: Boolean;
     FCloseRequested: Boolean;  // SubmitClose while a send is in flight
+    FSentAny: Boolean;         // a WSASend completed; peer earned a FIN
+    FFinSent: Boolean;         // graceful close begun; recv drains to EOF
     procedure ArmReceive;
     procedure CloseConnectionSocket;
+    procedure BeginGracefulClose;
     procedure HardClose;
     function ResumeSend: Boolean;
     procedure TryFinalize;
@@ -100,6 +103,7 @@ const
   WSA_FLAG_OVERLAPPED = $00000001;
   SO_UPDATE_ACCEPT_CONTEXT = $700B;
   WinErrorIoPending = 997;
+  SdSend = 1; // shutdown(): SD_SEND
   SO_EXCLUSIVEADDRUSE = Integer(not DWORD(SO_REUSEADDR));
   InfiniteWait = DWORD($FFFFFFFF);
   ListenerCompletionKey = PtrUInt(1);
@@ -137,6 +141,8 @@ function C_WSASend(ASocket: TSocket; ABuffers: PWSIocpBuffer;
   ABufferCount: DWORD; ABytesSent: PDWORD; AFlags: DWORD;
   AOverlapped: POverlapped; ACompletionRoutine: Pointer): Integer; stdcall;
   external WINSOCK2_DLL name 'WSASend';
+function C_shutdown(ASocket: TSocket; AHow: Integer): Integer; stdcall;
+  external WINSOCK2_DLL name 'shutdown';
 function C_CreateIoCompletionPort(AFileHandle, AExistingPort: THandle;
   ACompletionKey: PtrUInt; AConcurrentThreads: DWORD): THandle; stdcall;
   external 'kernel32.dll' name 'CreateIoCompletionPort';
@@ -248,6 +254,24 @@ begin
   TryFinalize;
 end;
 
+// Final bytes are flushed; put a FIN on the wire instead of resetting.
+// closesocket with an armed overlapped WSARecv resets the connection on
+// WinSock — the peer sees RST, and a Windows peer then DISCARDS
+// buffered-but-unread data, losing the very bytes the deferred close
+// existed to deliver (the win64 CI plain-request battery caught exactly
+// this). shutdown(SD_SEND) sends the FIN while the armed receive stays
+// outstanding; the peer's own close completes that receive, and the
+// zero-byte/error completion performs the real teardown via
+// RemoteClosed. A peer that never closes holds the connection until
+// Shutdown's sweep hard-closes it — bounded, and only reachable by
+// peers that already received a complete reply.
+procedure TWSIocpConn.BeginGracefulClose;
+begin
+  if FDead or FFinSent then Exit;
+  FFinSent := True;
+  C_shutdown(FSocket, SdSend);
+end;
+
 procedure TWSIocpConn.SubmitClose;
 begin
   // A send still in flight carries the final bytes (typically a close
@@ -258,7 +282,14 @@ begin
     FCloseRequested := True;
     Exit;
   end;
-  HardClose;
+  // Peers that were sent a reply get a graceful FIN (see
+  // BeginGracefulClose); peers that never earned one — a handshake
+  // flooder, a parse failure before any response — are reset, which
+  // also frees their connection immediately.
+  if (not FDead) and FSentAny then
+    BeginGracefulClose
+  else
+    HardClose;
 end;
 
 { TWSIocpTransport }
@@ -504,6 +535,7 @@ begin
   begin
     if ASucceeded and (not AConn.FDead) then
     begin
+      AConn.FSentAny := True; // this peer has earned a graceful FIN
       // A stream WSASend may complete short under memory pressure; the
       // caller was told the full accepted count, so the tail must go
       // out before anything else touches the send buffer.
@@ -527,7 +559,10 @@ begin
         if not ASucceeded then
           RemoteClosed(AConn)
         else if AConn.FCloseRequested then
-          AConn.HardClose
+          // The deferred close's final bytes just went out; FIN, don't
+          // reset (see BeginGracefulClose). The armed receive drains to
+          // the peer's EOF, whose completion tears the connection down.
+          AConn.BeginGracefulClose
         else if Assigned(OnSendReady) then
           OnSendReady(AConn);
       end
