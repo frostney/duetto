@@ -50,7 +50,7 @@ type
     FRunning: Boolean;
     FNextId: NativeUInt;
 
-    procedure EpollMod(AFd: Integer; AEvents: Cardinal);
+    procedure EpollMod(AConn: TWSEpollConn; AEvents: Cardinal);
     procedure Track(AConn: TWSEpollConn);
     procedure Untrack(AConn: TWSEpollConn);
     procedure AcceptPending;
@@ -115,7 +115,7 @@ begin
         if not FWantWrite then
         begin
           FWantWrite := True;
-          FTransport.EpollMod(FFd, EPOLLIN or EPOLLOUT);
+          FTransport.EpollMod(Self, EPOLLIN or EPOLLOUT);
         end;
         Exit;
       end;
@@ -127,7 +127,7 @@ begin
   if FWantWrite then
   begin
     FWantWrite := False;
-    FTransport.EpollMod(FFd, EPOLLIN);
+    FTransport.EpollMod(Self, EPOLLIN);
   end;
 end;
 
@@ -183,7 +183,10 @@ begin
   FEpFd := epoll_create(1024);
   if FEpFd < 0 then raise Exception.Create('epoll_create failed');
   Ev.events := EPOLLIN;
-  Ev.data.fd := FListenFd;
+  // Special fds ride the same u64 as connection events with a zero
+  // generation tag; Ev is a stack local, so data.fd alone would leave
+  // garbage in the tag half.
+  Ev.data.u64 := QWord(Cardinal(FListenFd));
   epoll_ctl(FEpFd, EPOLL_CTL_ADD, FListenFd, @Ev);
 
   // Stop() must unblock a Run(-1) parked in epoll_wait from another
@@ -192,7 +195,7 @@ begin
   if FWakeFd >= 0 then
   begin
     Ev.events := EPOLLIN;
-    Ev.data.fd := FWakeFd;
+    Ev.data.u64 := QWord(Cardinal(FWakeFd));
     epoll_ctl(FEpFd, EPOLL_CTL_ADD, FWakeFd, @Ev);
   end;
 end;
@@ -290,13 +293,25 @@ begin
   end;
 end;
 
-procedure TWSEpollTransport.EpollMod(AFd: Integer; AEvents: Cardinal);
+// Connection events carry a generation tag alongside the fd: the low
+// 32 bits of epoll_data.u64 are the fd, the high 32 the connection
+// Id's low word. The kernel reuses a closed fd for the next accept, so
+// within one epoll_wait batch a stale event for a dropped connection
+// can name the fd of a connection accepted later in the same round —
+// the tag lets Run tell the two occupants apart and drop the stale
+// event instead of tearing down the newcomer.
+function ConnEventData(AConn: TWSEpollConn): QWord;
+begin
+  Result := (QWord(Cardinal(AConn.Id)) shl 32) or QWord(Cardinal(AConn.FFd));
+end;
+
+procedure TWSEpollTransport.EpollMod(AConn: TWSEpollConn; AEvents: Cardinal);
 var
   Ev: TEPoll_Event;
 begin
   Ev.events := AEvents;
-  Ev.data.fd := AFd;
-  epoll_ctl(FEpFd, EPOLL_CTL_MOD, AFd, @Ev);
+  Ev.data.u64 := ConnEventData(AConn);
+  epoll_ctl(FEpFd, EPOLL_CTL_MOD, AConn.FFd, @Ev);
 end;
 
 procedure TWSEpollTransport.Track(AConn: TWSEpollConn);
@@ -331,7 +346,7 @@ begin
     Conn.Id := FNextId;
     Track(Conn);
     Ev.events := EPOLLIN;
-    Ev.data.fd := Fd;
+    Ev.data.u64 := ConnEventData(Conn);
     epoll_ctl(FEpFd, EPOLL_CTL_ADD, Fd, @Ev);
     if Assigned(OnAccept) then OnAccept(Conn);
   until False;
@@ -377,7 +392,7 @@ begin
     N := epoll_wait(FEpFd, @Evs[0], Length(Evs), ATimeoutMs);
     for I := 0 to N - 1 do
     begin
-      Fd := Evs[I].data.fd;
+      Fd := Integer(Cardinal(Evs[I].data.u64)); // low half: the fd
       if Fd = FWakeFd then
       begin
         fpRead(FWakeFd, Wake, SizeOf(Wake)); // drain the counter
@@ -394,6 +409,12 @@ begin
       end;
       if (Fd >= Length(FConns)) or (FConns[Fd] = nil) then Continue;
       Conn := FConns[Fd];
+      // Generation check: a drop earlier in this batch (OnData, a
+      // posted proc) closed some fd, and a later accept in the same
+      // batch may have reused it — a stale event for the previous
+      // occupant must not touch the newcomer.
+      if Cardinal(Conn.Id) <> Cardinal(Evs[I].data.u64 shr 32) then
+        Continue;
       if (Evs[I].events and (EPOLLERR or EPOLLHUP)) <> 0 then
       begin
         RemoteClosed(Conn);
@@ -402,7 +423,7 @@ begin
       if (Evs[I].events and EPOLLOUT) <> 0 then
       begin
         Conn.FWantWrite := False;
-        EpollMod(Fd, EPOLLIN);
+        EpollMod(Conn, EPOLLIN);
         if Assigned(OnSendReady) then OnSendReady(Conn);
         if FConns[Fd] <> Conn then Continue;
       end;
