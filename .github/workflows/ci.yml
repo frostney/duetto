@@ -13,12 +13,15 @@ name: CI
 # merged tree is green everywhere.
 #
 #   test:     Per-platform native runners. Every leg builds all five
-#             programs and runs the unit suites, wsinterop's
-#             live-socket battery, and the crosscheck against the
-#             python `websockets` reference — the server rides the
-#             platform transport (epoll on Linux, Network.framework on
-#             macOS, where crosscheck is the merge-time conformance
-#             battery since the Autobahn container can't run there).
+#             programs and runs the unit suites; the loopback legs also
+#             run wsinterop's live-socket battery and the crosscheck
+#             against the python `websockets` reference — the server
+#             rides the platform transport (epoll on Linux,
+#             Network.framework on macOS, IOCP on Windows). The
+#             x86_64-darwin leg is the carve-out: GH Intel-macOS VMs
+#             stall nw loopback traffic (issue #11), so it contributes
+#             compile + unit-suite coverage only (loopback-battery:
+#             skip).
 #
 #   autobahn: The Autobahn fuzzing suite (crossbario/autobahn-testsuite
 #             via Docker) in both directions — fuzzingclient against
@@ -26,7 +29,8 @@ name: CI
 #             against build/wsautobahn (client under test, with and
 #             without permessage-deflate). tools/autobahn-check.py
 #             fails the job on any non-acceptable case; the full HTML
-#             reports are uploaded as an artifact either way.#
+#             reports are uploaded as an artifact either way.
+#
 #   autobahn-macos: the same fuzzingclient battery natively on arm64
 #             macOS (no Docker there) via Intel python-2.7 under
 #             Rosetta — the Network.framework transport's Autobahn net.
@@ -205,7 +209,7 @@ jobs:
       - name: lwpt build (all programs)
         run: lwpt build
 
-      - name: lwpt test (five co-located unit suites)
+      - name: lwpt test (six co-located unit suites)
         run: lwpt test
 
       - name: wsinterop (live-socket battery, own client vs own server)
@@ -213,15 +217,20 @@ jobs:
         run: ./build/wsinterop${{ matrix.exe }}
 
       # Cross-implementation net vs the python `websockets` reference,
-      # both directions plus raw-socket violations. On the macOS legs
-      # this is the merge-time conformance battery for the
-      # Network.framework transport — Autobahn needs Docker, which
-      # GitHub's macOS runners don't have.
+      # both directions plus raw-socket violations. On the macOS legs it
+      # complements Autobahn rather than standing in for it: the arm64
+      # leg's Autobahn net runs natively in the separate autobahn-macos
+      # job, because the containerised suite needs Docker and GitHub's
+      # macOS runners don't have it.
       - name: crosscheck vs python websockets (reference implementation)
         if: matrix.loopback-battery != 'skip'
         run: |
+          set -euo pipefail
           PY=python3
-          command -v "$PY" >/dev/null 2>&1 || PY=python   # Windows runners ship `python` only
+          # Execution probe, not `command -v`: Windows ships a Microsoft
+          # Store `python3` alias stub that resolves on PATH but fails
+          # to run, so a presence check would pick the wrong interpreter.
+          "$PY" -c '' >/dev/null 2>&1 || PY=python
           "$PY" -m venv "$RUNNER_TEMP/crosscheck-venv"
           VENV_BIN="$RUNNER_TEMP/crosscheck-venv/bin"
           [ -d "$VENV_BIN" ] || VENV_BIN="$RUNNER_TEMP/crosscheck-venv/Scripts"   # Windows venv layout

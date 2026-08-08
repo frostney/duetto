@@ -5,11 +5,11 @@ name: PR
 # sees.
 #
 #   pr.yml — every PR: native install --frozen + format --check + build
-#            + test + wsinterop on one Linux and one macOS runner (the
-#            two platforms with their own transports — a PR touching
-#            WS.Transport.NetworkFramework gets a real pre-merge
-#            signal; no Autobahn). A win64 cross-compile signal joins
-#            when #3 lands, mirroring lwpt's staging.
+#            + test + wsinterop on one Linux, one macOS and one win64
+#            runner (the three platforms with their own transports — a
+#            PR touching WS.Transport.NetworkFramework or
+#            WS.Transport.Iocp gets a real pre-merge signal; no
+#            Autobahn). i386-win32 stays post-merge in ci.yml.
 #   ci.yml — push to main only: the full per-arch platform matrix plus
 #            the Autobahn suite in both directions.
 #
@@ -164,7 +164,7 @@ jobs:
       - name: lwpt build (compile every [build] entry)
         run: lwpt build
 
-      - name: lwpt test (five co-located unit suites)
+      - name: lwpt test (six co-located unit suites)
         run: lwpt test
 
       - name: wsinterop (live-socket battery, own client vs own server)

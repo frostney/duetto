@@ -11,7 +11,9 @@
 - Substitute the live WebSocket port into the served page at startup so
   the browser knows where duetto is listening.
 - Pair `ws://` with `http://` and `wss://` with `https://` — browsers
-  block the mixed combination.
+  block the mixed combination. Server-side TLS is **macOS only** today
+  (Network.framework); on Linux and Windows terminate TLS in a reverse
+  proxy in front of both listeners.
 - Secure-context gotcha: powerful APIs (WebCodecs and friends) silently
   disappear on plain `http://` over a LAN IP; `localhost` is a secure
   context, LAN IPs are not.
@@ -25,8 +27,13 @@
 
 The host runs two listeners in one process: `fphttpserver` hands out the
 page, duetto handles the WebSocket. `fphttpserver`'s accept loop blocks,
-so it lives on a `TThread` (which needs `cthreads` on Unix — duetto's
-server requires it anyway):
+so it lives on a `TThread` — and that is what pulls in `cthreads` here:
+any FPC program creating a `TThread` on Unix needs it for the RTL's
+threading. duetto does not require it across the board on Linux; a
+single-threaded epoll server never touches another thread. It becomes
+necessary when you call `Conn.Post` from another thread, and on macOS,
+where the Network.framework transport delivers callbacks on GCD
+threads:
 
 ```pascal
 uses
@@ -116,11 +123,22 @@ configuration — only the port needs injecting.
 
 Browsers apply mixed-content rules to WebSockets: a page served over
 `https://` **cannot** open a `ws://` connection. The two listeners must
-match — both plain, or both TLS. For the TLS pair, `TWSServer` takes a
-`TWSTransportTls` record (PKCS#12 identity; native on macOS via
-Network.framework — see the `--pkcs12` flags on `wsecho`), and the
-companion server must serve `https://` too. The other direction
-(`http://` page opening `wss://`) is allowed.
+match — both plain, or both TLS. The other direction (`http://` page
+opening `wss://`) is allowed.
+
+How you get the TLS pair depends on the platform:
+
+- **macOS.** `TWSServer` takes a `TWSTransportTls` record (PKCS#12
+  identity) and the Network.framework transport terminates TLS itself —
+  see the `--pkcs12` flags on `wsecho`. The companion server must serve
+  `https://` too.
+- **Linux and Windows.** The epoll and IOCP transports have no
+  accept-side TLS yet: constructing a server with
+  `TWSTransportTls.Enabled` set **raises** rather than silently serving
+  plaintext (tracked as [duetto#22](https://github.com/frostney/duetto/issues/22)).
+  Put both listeners behind a TLS-terminating reverse proxy (nginx,
+  Caddy, HAProxy) and keep the process itself plain `http://` + `ws://`
+  on loopback.
 
 ## Secure contexts: the disappearing-API trap
 
@@ -147,23 +165,34 @@ the two-port process shape end to end.
 For the single-page case the second listener is optional:
 `TWSServer.OnPlainRequest` is an opt-in hook on the handshake path
 that hands well-formed non-upgrade requests to the host instead of
-refusing them. One origin, one port — and with a TLS identity on the
-listener, `https://` page and `wss://` socket share it, which settles
-the pairing and secure-context sections above by construction:
+refusing them. One origin, one port — and **on macOS**, where the
+listener can carry a TLS identity, the `https://` page and the `wss://`
+socket share it, which settles the pairing and secure-context sections
+above by construction. On Linux and Windows the same single-port shape
+works over plain `http://` + `ws://`; the `https://` half has to come
+from the reverse proxy in front of it:
 
 ```pascal
 function THost.PlainRequest(const AHS: TWSServerHandshake;
   const ARawRequest: RawByteString;
   out AResponse: RawByteString): Boolean;
+var
+  IsHead: Boolean;
 begin
-  Result := SameText(AHS.Method, 'GET') and (AHS.Path = '/');
+  IsHead := SameText(AHS.Method, 'HEAD');
+  Result := (IsHead or SameText(AHS.Method, 'GET')) and (AHS.Path = '/');
   if Result then
+  begin
     AResponse :=
       'HTTP/1.1 200 OK'#13#10 +
       'Content-Type: text/html; charset=utf-8'#13#10 +
       'Content-Length: ' + IntToStr(Length(FPage)) + #13#10 +
-      'Connection: close'#13#10#13#10 +
-      FPage;
+      'Connection: close'#13#10#13#10;
+    // AResponse is written verbatim, so a HEAD reply must carry the
+    // headers a GET would — including Content-Length — but no body.
+    if not IsHead then
+      AResponse := AResponse + FPage;
+  end;
 end;
 
 Ws.OnPlainRequest := Host.PlainRequest;
@@ -185,7 +214,12 @@ The contract is deliberately narrow:
   refusal.
 - **Request access.** `AHS` carries `Method`, `Path` and `Host` as
   parsed by `WS.Handshake`; `WS.Handshake.HeaderValue` reads any other
-  header out of `ARawRequest`.
+  header out of `ARawRequest`. Note the type step: `HeaderValue` is
+  declared `(const ARaw, AName: string): string`, so passing
+  `ARawRequest` (a `RawByteString`) goes through an implicit conversion
+  in Delphi mode. Header names and values are ASCII by RFC 9110, so
+  this is safe for lookup — just don't route non-ASCII request bytes
+  back out through it.
 - **Threading.** The hook fires on the connection's execution context
   like every other callback (ADR-0003).
 

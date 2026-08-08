@@ -10,6 +10,9 @@ asserting RFC 6455 close codes from an independent codebase.
 import asyncio, socket, struct, subprocess, sys, time, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Extension-less on purpose: on Windows these resolve because CreateProcess
+# appends ".exe" to a path without an extension, so one spelling works on
+# every platform the CI matrix covers.
 WSECHO = os.path.join(ROOT, "build", "wsecho")
 WSPROBE = os.path.join(ROOT, "build", "wsprobe")
 
@@ -82,7 +85,9 @@ def read_close_code(s):
                     if ln >= 2 and len(buf) >= 4:
                         return struct.unpack(">H", buf[2:4])[0]
                     if ln == 0: return 0
-    except socket.timeout:
+    # WinSock surfaces an abortive peer close as ConnectionResetError
+    # (an OSError) where POSIX just times out or returns b"".
+    except (socket.timeout, OSError):
         return -1
 
 def violations(port):

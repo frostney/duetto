@@ -41,7 +41,8 @@ lwpt build
 
 For the full program set (`wsinterop`, `wsbench`, `wsautobahn`) and every
 development command, see [docs/quick-start.md](docs/quick-start.md) and
-[docs/tooling.md](docs/tooling.md).
+[docs/tooling.md](docs/tooling.md). For serving a browser page alongside
+the socket, see [docs/companion-http.md](docs/companion-http.md).
 
 ## Background
 

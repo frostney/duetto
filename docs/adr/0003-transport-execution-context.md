@@ -34,8 +34,15 @@ The contract consumers program against, on every platform:
   any-thread entry point — it schedules a proc onto the connection's
   callback context (serialized with its other completions, in
   per-caller order), so server-driven pushes stay inside this contract
-  instead of relaxing it. Posts to a connection that is gone are
-  silently discarded.
+  instead of relaxing it. The discard guarantee is scoped to the
+  documented lifetime window — from `OnOpen` until your
+  `OnClientClose` handler returns: inside it, a post to a connection
+  that is concurrently dropping (or in flight when the server shuts
+  down) is silently discarded and `AProc` never runs. Posting outside
+  that window, or racing `TWSServer.Destroy`, is undefined behaviour —
+  on the Network.framework backend such a race can still deliver
+  `AProc` mid-teardown. See the `Post` contract comment in
+  `source/units/WS.Server.pas`.
 
 This is the same contract uWebSockets and Netty publish. The session
 layer keeps its hot path lock-free by queue confinement; its only lock

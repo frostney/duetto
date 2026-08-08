@@ -11,7 +11,7 @@
 - **`lwpt.cfg` and `lwpt.lock` are generated** by `lwpt install`; never
   hand-edit them. `lwpt.toml` is the manifest you edit.
 - **The `units` array in `lwpt.toml` lists only `source/units`** —
-  lwpt 0.2.0 discovers dep units through nested manifests. Keep
+  lwpt discovers dep units through nested manifests. Keep
   `[format] exclude = [".lwpt/**"]` so the formatter never rewrites
   fetched modules.
 - **Programs parse flags via lwpt's `cli` package** (`CLI.Options`,
@@ -22,8 +22,8 @@
   `source/apps/`, one-off automation in `tools/`, E2E corpora in `tests/`.
 - **`build/` and `tests/autobahn/reports/` are generated** — never commit
   them.
-- **No new dependencies** beyond lwpt's `httpclient` and `testing` packages
-  without explicit maintainer approval.
+- **No new dependencies** beyond lwpt's `httpclient`, `testing`, and `cli`
+  packages without explicit maintainer approval.
 - **`WS.Protocol` owns all RFC 6455 rules.** Protocol behaviour (close
   codes, fragmentation, masking policy, UTF-8 failure) must not leak into
   the client, the server, or the apps.
@@ -57,7 +57,7 @@ tools/autobahn.sh client   # Autobahn fuzzingserver vs wsautobahn (Docker)
 | `source/apps/` | Programs: `wsecho`, `wsprobe`, `wsinterop`, `wsbench`, `wsautobahn` |
 | `tests/autobahn/` | Autobahn testsuite configs (reports/ is generated) |
 | `tools/` | Cross-implementation checks, benchmarks, Autobahn runner |
-| `docs/` | Architecture, quick-start, tooling, code style, deployment |
+| `docs/` | Architecture, quick-start, tooling, code style, deployment, companion HTTP, comparison |
 
 Layering is strictly bottom-up — see [docs/architecture.md](docs/architecture.md).
 `WS.Server` is a platform-neutral session layer over the `WS.Transport`
