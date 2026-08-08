@@ -48,6 +48,12 @@ type
     // the caller walks it and Disposes each node.
     function Drain: PWSPostNode;
 
+    // Cheap unlocked peek: True when something is queued. For the
+    // reactors' once-per-round sweep, so a lost wake cannot strand a
+    // post until Shutdown. Never a substitute for Drain's ownership
+    // transfer — see the implementation for why the race is benign.
+    function HasPending: Boolean;
+
     // Reject every future Push and detach what was pending (same
     // ownership rules as Drain). Idempotent.
     function Stop: PWSPostNode;
@@ -118,6 +124,21 @@ end;
 function TWSPostQueue.Drain: PWSPostNode;
 begin
   Result := Detach;
+end;
+
+function TWSPostQueue.HasPending: Boolean;
+begin
+  // Deliberately unsynchronized. FHead is a naturally aligned pointer,
+  // so the read is atomic on every target duetto builds for — it yields
+  // some head value, never a torn one, and the answer is only ever used
+  // to decide whether to call Drain (which takes the lock and does the
+  // real ownership transfer). Both ways to be wrong are benign:
+  //   - a miss (a Push lands just after the read) costs one round; that
+  //     Push also posted a wake, and the next round sweeps again;
+  //   - a false positive (a Drain took the chain first) costs one empty
+  //     locked Drain.
+  // Nothing here can lose, duplicate, or reorder a node.
+  Result := FHead <> nil;
 end;
 
 function TWSPostQueue.Stop: PWSPostNode;

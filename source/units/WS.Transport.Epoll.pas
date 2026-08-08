@@ -48,6 +48,7 @@ type
     FRecv: TBytes;                   // shared read buffer
     FPosts: TWSPostQueue;            // cross-thread SubmitPost hand-off
     FRunning: Boolean;
+    FShutdownDone: Boolean;
     FNextId: NativeUInt;
 
     procedure EpollMod(AConn: TWSEpollConn; AEvents: Cardinal);
@@ -155,8 +156,9 @@ begin
   FPosts := TWSPostQueue.Create;
   if ATls.Enabled then
     raise Exception.Create(
-      'epoll transport has no TLS yet (tracked as lwpt#70: accept-side ' +
-      'TransportSecurity); run behind a TLS-terminating proxy');
+      'epoll transport has no TLS yet; tracked as duetto#22 (needs ' +
+      'lwpt#85 flow-control in a release). Run behind a ' +
+      'TLS-terminating proxy');
   SetLength(FRecv, 256 * 1024);
 
   FListenFd := fpSocket(AF_INET, SOCK_STREAM, 0);
@@ -216,10 +218,18 @@ end;
 // as dropped (AConn = nil) so the session reclaims their envelopes, and
 // any SubmitPost racing us is refused at Push and dropped by its own
 // caller thread.
+//
+// Idempotent, and explicitly so: the body already was (a stopped queue
+// re-Stops to nil, an emptied table re-scans to nothing), but Destroy
+// calls this after the session may have called it, and the guard makes
+// that contract match the IOCP and Network.framework transports rather
+// than resting on the body staying accidentally re-entrant.
 procedure TWSEpollTransport.Shutdown;
 var
   I: Integer;
 begin
+  if FShutdownDone then Exit;
+  FShutdownDone := True;
   DeliverPosts(FPosts.Stop, True);
   for I := 0 to High(FConns) do
     if FConns[I] <> nil then
@@ -245,6 +255,15 @@ begin
         // The table is fd-indexed; posts are cold path, a scan is fine.
         // Re-scanned per node: the previous OnPost may have torn any
         // connection down.
+        //
+        // Deliberately NO FDead test here, unlike the IOCP and
+        // Network.framework scans: epoll's FDead means only "a send
+        // failed and the session has not been told yet" — the
+        // connection is still tracked and still the session's to use.
+        // Untrack is synchronous (SubmitClose and RemoteClosed remove
+        // the table entry before returning), so this transport has no
+        // pending-finalize state a post could land on. Do not "fix"
+        // this to match the other two.
         for I := 0 to High(FConns) do
           if (FConns[I] <> nil) and (FConns[I].Id = Node^.ConnId) then
           begin
@@ -284,8 +303,17 @@ begin
     Exit;
   end;
   // Wake the reactor through the same eventfd Stop uses; Run drains the
-  // queue on the next round. (Without an eventfd — creation failed —
-  // delivery waits for the next readiness event, like Stop does.)
+  // queue on the next round. The wake is an optimization, not the
+  // delivery mechanism: Run sweeps FPosts once per epoll_wait batch, so
+  // a post is delivered on the next round the reactor makes either way.
+  // That covers both ways the wake can go missing:
+  //   - no eventfd at all (creation failed) — delivery then waits for
+  //     the next epoll_wait return, readiness or timeout, exactly as
+  //     Stop does;
+  //   - the write fails with EAGAIN — the eventfd counter is saturated
+  //     at UINT64_MAX - 1, which means a wake is already posted and
+  //     unread; the round it triggers picks this node up. Self-healing,
+  //     so the return value is deliberately not checked.
   if FWakeFd >= 0 then
   begin
     One := 1;
@@ -364,8 +392,13 @@ end;
 procedure TWSEpollTransport.HandleReadable(AConn: TWSEpollConn);
 var
   Fd, Got: Integer;
+  Gen: NativeUInt;
 begin
   Fd := AConn.FFd;
+  // Identity for the mid-dispatch re-check below is the generation, not
+  // the pointer: AConn may be freed memory by the time we look, so the
+  // Id is captured here, while it is still ours to read.
+  Gen := AConn.Id;
   repeat
     Got := fpRecv(Fd, @FRecv[0], Length(FRecv), 0);
     if Got = 0 then
@@ -375,8 +408,15 @@ begin
     end;
     if Got < 0 then Exit; // EAGAIN
     if Assigned(OnData) then OnData(AConn, @FRecv[0], Got);
-    // The session may have torn the connection down inside OnData.
-    if (Fd >= Length(FConns)) or (FConns[Fd] <> AConn) then Exit;
+    // Invariant: the fd is still ours only while the table occupant is
+    // the same CONNECTION GENERATION we entered with. The session may
+    // have torn this connection down inside OnData, and — since an
+    // accept can run inside a handler (a posted proc reaching back into
+    // the reactor) — the kernel may already have handed the same fd to
+    // a newer connection. A pointer compare would miss that; a
+    // generation compare cannot.
+    if (Fd >= Length(FConns)) or (FConns[Fd] = nil) or
+      (FConns[Fd].Id <> Gen) then Exit;
   until False;
 end;
 
@@ -385,6 +425,7 @@ var
   Evs: array[0..255] of TEPoll_Event;
   N, I, Fd: Integer;
   Conn: TWSEpollConn;
+  Gen: NativeUInt;
   Wake: UInt64;
 begin
   FRunning := True;
@@ -424,12 +465,22 @@ begin
       begin
         Conn.FWantWrite := False;
         EpollMod(Conn, EPOLLIN);
+        // Same invariant as HandleReadable: the fd stays ours only
+        // while the table occupant is the generation we dispatched.
+        // Capture the Id before the callback — Conn may be freed by it.
+        Gen := Conn.Id;
         if Assigned(OnSendReady) then OnSendReady(Conn);
-        if FConns[Fd] <> Conn then Continue;
+        if (FConns[Fd] = nil) or (FConns[Fd].Id <> Gen) then Continue;
       end;
       if (Evs[I].events and EPOLLIN) <> 0 then
         HandleReadable(Conn);
     end;
+    // Wake-independent backstop (once per batch, never per event): a
+    // post whose eventfd wake was lost, or that landed after this
+    // round's drain, would otherwise sit in the queue until the next
+    // readiness event — or until Shutdown, on an idle server. The dirty
+    // HasPending read costs one predictable branch per epoll_wait.
+    if FPosts.HasPending then DeliverPosts(FPosts.Drain, False);
   until (not FRunning) or (ATimeoutMs >= 0);
 end;
 

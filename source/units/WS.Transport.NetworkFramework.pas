@@ -98,6 +98,7 @@ type
     FTlsBlock: TWSBlock;
     FTcpBlock: TWSBlock;
     procedure LoadIdentity(const APath, APassphrase: string);
+    function FindLiveById(AConnId: NativeUInt): TWSNwConn;
     procedure LiveTrack(AConn: TWSNwConn);
     procedure LiveUntrack(AConn: TWSNwConn);
     procedure ConnFinalized(AConn: TWSNwConn);
@@ -302,10 +303,13 @@ end;
 // ---------------------------------------------------------------------------
 
 type
-  // One SubmitPost in flight: heap-owned so the block literal and its
-  // context outlive the posting thread's stack frame (dispatch_async
-  // Block_copies the literal, but the Ctx it captures must survive
-  // until PostInvoke runs). Freed by PostInvoke.
+  // One SubmitPost in flight, heap-owned for the CONTEXT's sake, not
+  // the literal's: dispatch_async Block_copies the literal synchronously
+  // before it returns, so the literal itself need not outlive the call —
+  // but the plain Ctx pointer that copy captured must stay valid until
+  // PostInvoke runs, and that pointer is this record. Freed by
+  // PostInvoke. (Block storage still lives here so the copy source is
+  // one allocation with the context it names.)
   PWSNwPost = ^TWSNwPost;
   TWSNwPost = record
     Transport: TWSNetworkFrameworkTransport;
@@ -419,7 +423,6 @@ var
   P: PWSNwPost;
   T: TWSNetworkFrameworkTransport;
   C: TWSNwConn;
-  I: Integer;
 begin
   EnsureThreadInit;
   P := PWSNwPost(ABlock^.Ctx);
@@ -429,15 +432,9 @@ begin
   // ConnFinalized fires from the cancelled state on this same queue.
   // FDead means SubmitClose/RemoteClosed already ran and the cancelled
   // state is queued behind us: the session has let go, so drop.
-  C := nil;
   T.FLiveLock.Acquire;
   try
-    for I := 0 to T.FLiveCount - 1 do
-      if T.FLive[I].Id = P^.ConnId then
-      begin
-        if not T.FLive[I].FDead then C := T.FLive[I];
-        Break;
-      end;
+    C := T.FindLiveById(P^.ConnId);
   finally
     T.FLiveLock.Release;
   end;
@@ -476,9 +473,30 @@ begin
   Inc(T.FNextId);
   C.Id := T.FNextId;
   InterLockedIncrement(T.FActive);
-  T.LiveTrack(C);
   if Assigned(T.OnAccept) then T.OnAccept(C);
   Nw_connection_set_queue(ANwConn, C.FQueue);
+  // Publishing to the live table is what makes the connection reachable
+  // from SubmitPost, so it happens LAST — after OnAccept has returned
+  // and after set_queue has landed. Both halves matter:
+  //   - OnAccept runs here, on the LISTENER queue. A post that found
+  //     the connection while OnAccept was still running would dispatch
+  //     onto FQueue and execute beside it, breaking the per-connection
+  //     serialization ADR-0003 promises.
+  //   - Before set_queue, FQueue is not yet the connection's execution
+  //     context at all — dispatching there would serialize against
+  //     nothing.
+  // Posts issued before this point are therefore silently dropped. The
+  // SubmitPost contract permits that ("connection already gone"), and
+  // no session-API caller can reach the window: user code first sees a
+  // connection reference in OnOpen, which runs from OnData on this
+  // connection's own queue, strictly after everything here.
+  //
+  // A connection closed inside OnAccept is never published at all. It
+  // still gets its queue, handler, and start, so the cancel SubmitClose
+  // issued still produces a cancelled state and ConnFinalized still
+  // reclaims it exactly once — LiveUntrack simply finds nothing to
+  // remove, which is a no-op by construction, not a double-handle.
+  if not C.FDead then T.LiveTrack(C);
   Nw_connection_set_state_changed_handler(ANwConn,
     MakeBlock(C.FStateBlock, @ConnStateInvoke, C));
   Nw_connection_start(ANwConn);
@@ -661,7 +679,6 @@ procedure TWSNetworkFrameworkTransport.SubmitPost(AConnId: NativeUInt;
 var
   P: PWSNwPost;
   C: TWSNwConn;
-  I: Integer;
 begin
   // Count before the stopping check so Shutdown's drain cannot miss a
   // post that already passed it; PostDone runs on every path.
@@ -671,12 +688,7 @@ begin
   begin
     FLiveLock.Acquire;
     try
-      for I := 0 to FLiveCount - 1 do
-        if FLive[I].Id = AConnId then
-        begin
-          if not FLive[I].FDead then C := FLive[I];
-          Break;
-        end;
+      C := FindLiveById(AConnId);
       if C <> nil then
       begin
         New(P);
@@ -710,6 +722,27 @@ begin
   AConn.Free;
   InterLockedDecrement(FActive);
   Dispatch_semaphore_signal(FDrainSem);
+end;
+
+// Live-table lookup by transport-neutral connection id. THE CALLER MUST
+// HOLD FLiveLock — SubmitPost needs the registry pinned across the
+// dispatch_async that follows, so the lookup deliberately does not take
+// the lock itself. Returns nil when the connection is gone, and also
+// when it is FDead: SubmitClose or RemoteClosed has already run, the
+// session has let go of it, and the cancelled state that frees it is
+// queued — a post landing there must drop.
+function TWSNetworkFrameworkTransport.FindLiveById(
+  AConnId: NativeUInt): TWSNwConn;
+var
+  I: Integer;
+begin
+  Result := nil;
+  for I := 0 to FLiveCount - 1 do
+    if FLive[I].Id = AConnId then
+    begin
+      if not FLive[I].FDead then Result := FLive[I];
+      Break;
+    end;
 end;
 
 procedure TWSNetworkFrameworkTransport.LiveTrack(AConn: TWSNwConn);

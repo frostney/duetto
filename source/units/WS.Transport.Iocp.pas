@@ -2,7 +2,11 @@ unit WS.Transport.Iocp;
 
 // Windows transport: one IOCP thread implementing the WS.Transport
 // completion contract. AcceptEx, WSARecv, and WSASend are always armed
-// overlapped; every callback and deferred free runs on the thread in Run.
+// overlapped; every callback and deferred free runs on the thread in
+// Run — with one documented exception: a DROPPED OnPost (AConn = nil)
+// fires wherever the drop was noticed, which is the posting thread when
+// SubmitPost finds the queue stopped, or the Shutdown thread when
+// Shutdown reclaims what was still pending. See TWSTransportPostEvent.
 
 {$I Shared.inc}
 
@@ -75,6 +79,7 @@ type
       AOverlapped: POverlapped; ABytes: DWORD; ASucceeded: Boolean);
     procedure WaitAndDispatch(ATimeout: DWORD);
     procedure DeliverPosts(AChain: PWSPostNode; ADropped: Boolean);
+    procedure SweepPosts;
   public
     constructor Create(APort: Word; const ATls: TWSTransportTls);
     destructor Destroy; override;
@@ -272,8 +277,9 @@ begin
   FPosts := TWSPostQueue.Create;
   if ATls.Enabled then
     raise Exception.Create(
-      'iocp transport has no TLS yet (tracked as lwpt#70: accept-side ' +
-      'TransportSecurity); run behind a TLS-terminating proxy');
+      'iocp transport has no TLS yet; tracked as duetto#22 (needs ' +
+      'lwpt#85 flow-control in a release). Run behind a ' +
+      'TLS-terminating proxy');
 
   if WSAStartup($0202, Data) <> 0 then
     raise Exception.Create('WSAStartup failed');
@@ -318,7 +324,13 @@ begin
     WinSock2.closesocket(FAcceptSocket);
   if FListenSocket <> INVALID_SOCKET then
     WinSock2.closesocket(FListenSocket);
-  if FCompletionPort <> 0 then CloseHandle(FCompletionPort);
+  // The one place the port is closed (see Shutdown): Shutdown is
+  // idempotent and any-thread, Destroy is the single-owner end of life.
+  if FCompletionPort <> 0 then
+  begin
+    CloseHandle(FCompletionPort);
+    FCompletionPort := 0;
+  end;
   if FWinSockStarted then WSACleanup;
   inherited;
 end;
@@ -352,10 +364,16 @@ begin
   AConn.CloseConnectionSocket;
   // Pin the object until OnClosed returns, including immediate arm
   // failures where there is no completed operation holding the pin.
+  // Released in a finally: a raising OnClosed would otherwise strand
+  // the pin, TryFinalize would never fire, and Shutdown's drain would
+  // spin on FLiveCount forever.
   Inc(AConn.FOutstanding);
-  if Assigned(OnClosed) then OnClosed(AConn);
-  Dec(AConn.FOutstanding);
-  AConn.TryFinalize;
+  try
+    if Assigned(OnClosed) then OnClosed(AConn);
+  finally
+    Dec(AConn.FOutstanding);
+    AConn.TryFinalize;
+  end;
 end;
 
 procedure TWSIocpTransport.ArmAccept;
@@ -420,14 +438,20 @@ begin
         Conn.Id := FNextId;
         Track(Conn);
         // OnAccept is allowed to close. Keep the object alive until the
-        // callback returns, then either reclaim it or arm the first recv.
+        // callback returns, then either reclaim it or arm the first
+        // recv. The tail runs in a finally: a raising OnAccept must not
+        // strand the pin, or TryFinalize never fires and Shutdown's
+        // drain spins forever.
         Inc(Conn.FOutstanding);
-        if Assigned(OnAccept) then OnAccept(Conn);
-        Dec(Conn.FOutstanding);
-        if Conn.FDead then
-          Conn.TryFinalize
-        else
-          Conn.ArmReceive;
+        try
+          if Assigned(OnAccept) then OnAccept(Conn);
+        finally
+          Dec(Conn.FOutstanding);
+          if Conn.FDead then
+            Conn.TryFinalize
+          else
+            Conn.ArmReceive;
+        end;
       end
       else
       begin
@@ -449,18 +473,25 @@ procedure TWSIocpTransport.HandleConnectionCompletion(AConn: TWSIocpConn;
 begin
   if AOverlapped = @AConn.FReceiveOverlapped then
   begin
-    if not AConn.FDead then
-    begin
-      if (not ASucceeded) or (ABytes = 0) then
-        RemoteClosed(AConn)
-      else if Assigned(OnData) then
-        OnData(AConn, @AConn.FReceiveBuffer[0], ABytes);
+    // The completed WSARecv's pin is ours to release. In a finally: a
+    // raising OnData (or OnClosed, underneath RemoteClosed) must not
+    // strand it — TryFinalize would never fire and Shutdown's drain
+    // would spin forever.
+    try
+      if not AConn.FDead then
+      begin
+        if (not ASucceeded) or (ABytes = 0) then
+          RemoteClosed(AConn)
+        else if Assigned(OnData) then
+          OnData(AConn, @AConn.FReceiveBuffer[0], ABytes);
+      end;
+    finally
+      Dec(AConn.FOutstanding);
+      if AConn.FDead then
+        AConn.TryFinalize
+      else
+        AConn.ArmReceive;
     end;
-    Dec(AConn.FOutstanding);
-    if AConn.FDead then
-      AConn.TryFinalize
-    else
-      AConn.ArmReceive;
   end
   else if AOverlapped = @AConn.FSendOverlapped then
   begin
@@ -477,19 +508,28 @@ begin
       end;
     end;
     AConn.FSendInFlight := False;
-    if not AConn.FDead then
-    begin
-      if not ASucceeded then
-        RemoteClosed(AConn)
+    // Only from here is the completed WSASend's pin ours to release —
+    // the ResumeSend path above exits with it deliberately carried over
+    // to the re-armed operation, so the guarded region starts below it.
+    // Everything from here on can reach user code, and a raising
+    // handler must not strand the pin: TryFinalize would never fire and
+    // Shutdown's drain would spin forever.
+    try
+      if not AConn.FDead then
+      begin
+        if not ASucceeded then
+          RemoteClosed(AConn)
+        else if AConn.FCloseRequested then
+          AConn.HardClose
+        else if Assigned(OnSendReady) then
+          OnSendReady(AConn);
+      end
       else if AConn.FCloseRequested then
-        AConn.HardClose
-      else if Assigned(OnSendReady) then
-        OnSendReady(AConn);
-    end
-    else if AConn.FCloseRequested then
-      AConn.HardClose;
-    Dec(AConn.FOutstanding);
-    if AConn.FDead then AConn.TryFinalize;
+        AConn.HardClose;
+    finally
+      Dec(AConn.FOutstanding);
+      if AConn.FDead then AConn.TryFinalize;
+    end;
   end;
 end;
 
@@ -514,6 +554,11 @@ begin
     DeliverPosts(FPosts.Drain, False);
     Exit;
   end;
+  // Stop's wake is a WakeCompletionKey with a nil overlapped and is
+  // consumed right here, together with a timeout's empty return —
+  // there is nothing to dispatch either way, and Run re-tests FRunning.
+  // (That is why no WakeCompletionKey test appears below: it could
+  // never be reached.)
   if Overlapped = nil then Exit;
   if (CompletionKey = ListenerCompletionKey) and
       (Overlapped = @FAcceptOverlapped) then
@@ -521,8 +566,7 @@ begin
     HandleAcceptCompletion(Succeeded);
     Exit;
   end;
-  if (CompletionKey = ListenerCompletionKey) or
-      (CompletionKey = WakeCompletionKey) then Exit;
+  if CompletionKey = ListenerCompletionKey then Exit;
   Conn := TWSIocpConn(Pointer(CompletionKey));
   HandleConnectionCompletion(Conn, Overlapped, Bytes, Succeeded);
 end;
@@ -597,12 +641,22 @@ begin
     if Assigned(OnPost) then OnPost(nil, AData);
     Exit;
   end;
-  // Wake the completion-port thread the same way Stop does. A Push that
-  // won the race against Shutdown but posts after the port closed is
-  // still safe: Shutdown stops the queue before closing the port, so
-  // that node was already reclaimed by the shutdown drain.
+  // Wake the completion-port thread the same way Stop does. Reading
+  // FCompletionPort unsynchronized is sound because the handle now
+  // outlives Shutdown — it is closed in Destroy, not here — so a Push
+  // that won the race against Shutdown still posts to a valid handle
+  // (its node was already reclaimed by the shutdown drain, so the wake
+  // just dequeues into an empty drain). Posting into Destroy itself
+  // remains UB by contract: the caller must have stopped posting before
+  // it frees the transport.
   if FCompletionPort <> 0 then
-    C_PostQueuedCompletionStatus(FCompletionPort, 0, PostCompletionKey, nil);
+    // Quota exhaustion is the documented transient failure mode here;
+    // one retry clears it in practice, and Run's per-round HasPending
+    // sweep is the backstop when it does not.
+    if not C_PostQueuedCompletionStatus(FCompletionPort, 0,
+        PostCompletionKey, nil) then
+      C_PostQueuedCompletionStatus(FCompletionPort, 0,
+        PostCompletionKey, nil);
 end;
 
 procedure TWSIocpTransport.Open;
@@ -612,6 +666,15 @@ begin
   ArmAccept;
 end;
 
+// Wake-independent backstop, once per completion round: a post whose
+// PostQueuedCompletionStatus wake was lost would otherwise sit in the
+// queue until Shutdown. The dirty HasPending read costs one predictable
+// branch per dispatched completion, never one per connection.
+procedure TWSIocpTransport.SweepPosts;
+begin
+  if FPosts.HasPending then DeliverPosts(FPosts.Drain, False);
+end;
+
 procedure TWSIocpTransport.Run(ATimeoutMs: Integer);
 begin
   if FStopping then Exit;
@@ -619,9 +682,13 @@ begin
   if ATimeoutMs < 0 then
     repeat
       WaitAndDispatch(InfiniteWait);
+      SweepPosts;
     until not FRunning
   else
+  begin
     WaitAndDispatch(DWORD(ATimeoutMs));
+    SweepPosts;
+  end;
 end;
 
 procedure TWSIocpTransport.Stop;
@@ -646,8 +713,9 @@ begin
   // Stop the post queue first: pending posts are delivered once as
   // dropped (AConn = nil) so the session reclaims their envelopes, and
   // any SubmitPost racing us is refused at Push and dropped by its own
-  // caller thread. Stale post wakes still in the port dequeue into an
-  // empty drain (harmless) or vanish with CloseHandle below.
+  // caller thread. Stale post wakes still sitting in the port dequeue
+  // into an empty drain (harmless) or are discarded when Destroy closes
+  // the port.
   DeliverPosts(FPosts.Stop, True);
 
   if FListenSocket <> INVALID_SOCKET then
@@ -671,11 +739,12 @@ begin
 
   while FAcceptPending or (FLiveCount > 0) do
     WaitAndDispatch(InfiniteWait);
-  if FCompletionPort <> 0 then
-  begin
-    CloseHandle(FCompletionPort);
-    FCompletionPort := 0;
-  end;
+  // The port handle is deliberately NOT closed here. SubmitPost reads
+  // FCompletionPort without synchronization, and closing it in a
+  // quiesce that any thread may call would put a straggler
+  // PostQueuedCompletionStatus on a freed (or recycled) handle. Destroy
+  // closes it instead — by then the caller has, by contract, stopped
+  // using the transport altogether.
 end;
 
 {$endif}

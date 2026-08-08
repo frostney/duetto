@@ -73,9 +73,26 @@ type
   TWSTransportClosedEvent = procedure(AConn: TWSTransportConn) of object;
   // SubmitPost delivery. AConn <> nil: the target connection, on its
   // execution context. AConn = nil: the post was dropped (connection
-  // gone or transport stopping) and fires on an unspecified context —
-  // the posting thread, the Run thread, or the Shutdown thread — so
-  // the handler may only reclaim AData there.
+  // gone or transport stopping) and fires on whichever context noticed,
+  // which is any one of:
+  //   - the POSTING thread — SubmitPost itself found the connection
+  //     gone, or found the queue already stopped;
+  //   - the RUN / completion thread — the drop was noticed while
+  //     delivering a queued batch;
+  //   - the SHUTDOWN thread — Shutdown reclaimed what was still
+  //     pending;
+  //   - (Network.framework only) the target CONNECTION'S dispatch
+  //     queue — the post was dispatched, then the connection went away
+  //     before the block ran.
+  // A dropped delivery may therefore only reclaim AData; nothing in the
+  // handler may assume a particular thread.
+  //
+  // OnPost is consequently NOT serialized against itself: an inline
+  // drop on a posting thread can run concurrently with a delivery on
+  // the Run thread, and an inline drop can overtake an earlier post
+  // from the SAME caller that is still queued. Per-caller FIFO is a
+  // guarantee of the delivered path only (AConn <> nil, on that
+  // connection's execution context); drops carry no ordering at all.
   TWSTransportPostEvent = procedure(AConn: TWSTransportConn;
     AData: Pointer) of object;
 
@@ -118,9 +135,10 @@ type
     // Thread-safe scheduling hook: deliver OnPost exactly once per
     // call — with the live connection whose Id is AConnId, on that
     // connection's execution context, serialized with its completions
-    // and in per-caller FIFO order; or with AConn = nil when the
-    // connection is already gone or the transport is stopping (see
-    // TWSTransportPostEvent for the dropped-delivery context). AData is
+    // and in per-caller FIFO order (delivered posts only — a dropped
+    // one carries no ordering); or with AConn = nil when the connection
+    // is already gone or the transport is stopping (see
+    // TWSTransportPostEvent for the dropped-delivery contexts). AData is
     // opaque to the transport and is always handed back through OnPost,
     // so the caller can reclaim it — with OnPost unassigned the
     // envelope is silently dropped, so wire OnPost before the first
@@ -133,6 +151,14 @@ type
     // the session frees its per-connection state; the transport frees
     // its connection objects during the drain. Pending posts are
     // dropped (delivered once with AConn = nil), never leaked.
+    //
+    // Network.framework diverges on one point: a post already
+    // dispatched onto a still-live connection's queue when Shutdown
+    // begins may be DELIVERED (AConn <> nil) rather than dropped —
+    // "pending" there means "queued in the transport", and a dispatched
+    // post has left that queue. The drain guarantees every such post
+    // has run to completion before Shutdown returns, so the exactly-once
+    // and no-leak guarantees hold either way.
     procedure Shutdown; virtual; abstract;
 
     // The bound port (kernel-assigned when the transport was created
