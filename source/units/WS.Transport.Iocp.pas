@@ -528,33 +528,54 @@ var
   I: Integer;
 begin
   Node := AChain;
-  while Node <> nil do
-  begin
-    Conn := nil;
-    if not ADropped then
-      // Posts are cold path, a scan is fine. Re-scanned per node: the
-      // previous OnPost may have torn any connection down. FDead conns
-      // are pending finalize — the session has let go of them.
-      for I := 0 to FLiveCount - 1 do
-        if FLive[I].Id = Node^.ConnId then
-        begin
-          if not FLive[I].FDead then Conn := FLive[I];
-          Break;
-        end;
-    if Conn <> nil then
+  try
+    while Node <> nil do
     begin
-      // The posted proc may close the connection; pin the object across
-      // the callback like the accept path does.
-      Inc(Conn.FOutstanding);
-      if Assigned(OnPost) then OnPost(Conn, Node^.Data);
-      Dec(Conn.FOutstanding);
-      if Conn.FDead then Conn.TryFinalize;
-    end
-    else if Assigned(OnPost) then
-      OnPost(nil, Node^.Data);
-    Next := Node^.Next;
-    Dispose(Node);
-    Node := Next;
+      Conn := nil;
+      if not ADropped then
+        // Posts are cold path, a scan is fine. Re-scanned per node: the
+        // previous OnPost may have torn any connection down. FDead conns
+        // are pending finalize — the session has let go of them.
+        for I := 0 to FLiveCount - 1 do
+          if FLive[I].Id = Node^.ConnId then
+          begin
+            if not FLive[I].FDead then Conn := FLive[I];
+            Break;
+          end;
+      Next := Node^.Next;
+      try
+        if Conn <> nil then
+        begin
+          // The posted proc may close the connection; pin the object
+          // across the callback like the accept path does. The pin is
+          // released even if the proc raises — a leaked pin would keep
+          // FOutstanding above zero and hang Shutdown's drain forever.
+          Inc(Conn.FOutstanding);
+          try
+            if Assigned(OnPost) then OnPost(Conn, Node^.Data);
+          finally
+            Dec(Conn.FOutstanding);
+            if Conn.FDead then Conn.TryFinalize;
+          end;
+        end
+        else if Assigned(OnPost) then
+          OnPost(nil, Node^.Data);
+      finally
+        Dispose(Node);
+        Node := Next;
+      end;
+    end;
+  finally
+    // A posted proc that raises unwinds Run like any other handler,
+    // but the rest of the chain must not leak: hand each envelope back
+    // as dropped (nil conn frees it in the session) and reclaim nodes.
+    while Node <> nil do
+    begin
+      Next := Node^.Next;
+      if Assigned(OnPost) then OnPost(nil, Node^.Data);
+      Dispose(Node);
+      Node := Next;
+    end;
   end;
 end;
 

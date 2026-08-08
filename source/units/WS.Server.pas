@@ -87,7 +87,9 @@ type
     // Posts still in flight when the connection drops or the server
     // shuts down are discarded too (AProc never runs; the internal
     // envelope is freed). Posting after your OnClientClose returned,
-    // or racing TWSServer.Destroy, is undefined behaviour.
+    // or racing TWSServer.Destroy, is undefined behaviour (on the
+    // Network.framework backend such a race can still deliver AProc
+    // mid-teardown rather than discarding it).
     procedure Post(AProc: TWSConnProc);
     property Proto: TWSProtocol read FProto;
     property Id: NativeUInt read GetId;
@@ -364,7 +366,7 @@ end;
 procedure TWSServer.PostToConn(AConn: TWSConnection; AProc: TWSConnProc);
 var
   Env: PWSPostEnvelope;
-  TId: NativeUInt;
+  TransportId: NativeUInt;
   Live: Boolean;
   I: Integer;
 begin
@@ -375,7 +377,7 @@ begin
   // the transport-neutral id travels; the transport revalidates it on
   // the connection's own execution context, so a drop that lands
   // between here and delivery just discards the post.
-  TId := 0;
+  TransportId := 0;
   Live := False;
   FLock.Acquire;
   try
@@ -383,7 +385,7 @@ begin
       if FRegistry[I] = AConn then
       begin
         Live := True;
-        TId := AConn.FTConn.Id;
+        TransportId := AConn.FTConn.Id;
         Break;
       end;
   finally
@@ -392,7 +394,7 @@ begin
   if not Live then Exit; // already gone: silently dropped
   New(Env);
   Env^.Proc := AProc;
-  FTransport.SubmitPost(TId, Env);
+  FTransport.SubmitPost(TransportId, Env);
 end;
 
 function TWSServer.DropConn(AConn: TWSConnection): Boolean;

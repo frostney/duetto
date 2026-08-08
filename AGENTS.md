@@ -43,7 +43,7 @@ lwpt install         # resolve deps, regenerate lwpt.cfg + lwpt.lock
 lwpt install --frozen  # CI mode: verify lockfile + committed modules, no network
 lwpt format --check  # formatter gate (no flag = rewrite in place)
 lwpt build           # all programs (Linux, macOS, Windows)
-lwpt test            # five co-located unit suites
+lwpt test            # six co-located unit suites
 ./build/wsinterop    # live-socket battery (all platforms), exit 0 = pass
 tools/autobahn.sh server   # Autobahn fuzzingclient vs wsecho (Linux + Docker)
 tools/autobahn.sh client   # Autobahn fuzzingserver vs wsautobahn (Docker)

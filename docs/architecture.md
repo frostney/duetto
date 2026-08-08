@@ -35,7 +35,7 @@ once on protocol failure, after queueing the appropriate close frame
 | `WS.Transport.Epoll` | Linux transport: nonblocking sockets, one shared 256 KB read buffer, `EPOLLOUT` armed only while a connection has backlog |
 | `WS.Transport.NetworkFramework` | macOS transport (ADR-0002): `nw_listener`/`nw_connection` C API, one serial dispatch queue per connection, native TLS via a PKCS#12 `SecIdentity` |
 | `WS.Transport.Iocp` | Windows transport: one completion-port thread, `AcceptEx`/`WSARecv`/`WSASend` always armed overlapped, copy-on-send, outstanding-operation pinning for deferred frees |
-| `WS.Server` | platform-neutral session layer: handshake accumulation, protocol wiring, flush/backpressure policy over the transport seam |
+| `WS.Server` | platform-neutral session layer: handshake accumulation, protocol wiring, flush/backpressure policy over the transport seam; `SendText`/`SendBinary` return False when the transport dropped (and freed) the connection mid-flush, and `Conn.Post` is the any-thread hand-off for server-driven pushes (ADR-0003 amendment) |
 
 Units higher in the table never depend on units lower down. The programs in
 `source/apps/` depend on the library, never the other way around.

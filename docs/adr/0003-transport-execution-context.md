@@ -30,6 +30,12 @@ The contract consumers program against, on every platform:
   synchronization.
 - Connection methods (`SendText`, `Close`, …) are callable from that
   connection's callback context; `Stop` is callable from any thread.
+- Amendment (2026-08-08, issue #23): `TWSConnection.Post` is the second
+  any-thread entry point — it schedules a proc onto the connection's
+  callback context (serialized with its other completions, in
+  per-caller order), so server-driven pushes stay inside this contract
+  instead of relaxing it. Posts to a connection that is gone are
+  silently discarded.
 
 This is the same contract uWebSockets and Netty publish. The session
 layer keeps its hot path lock-free by queue confinement; its only lock

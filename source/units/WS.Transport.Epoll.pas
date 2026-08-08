@@ -234,23 +234,39 @@ var
   I: Integer;
 begin
   Node := AChain;
-  while Node <> nil do
-  begin
-    Conn := nil;
-    if not ADropped then
-      // The table is fd-indexed; posts are cold path, a scan is fine.
-      // Re-scanned per node: the previous OnPost may have torn any
-      // connection down.
-      for I := 0 to High(FConns) do
-        if (FConns[I] <> nil) and (FConns[I].Id = Node^.ConnId) then
-        begin
-          Conn := FConns[I];
-          Break;
-        end;
-    if Assigned(OnPost) then OnPost(Conn, Node^.Data);
-    Next := Node^.Next;
-    Dispose(Node);
-    Node := Next;
+  try
+    while Node <> nil do
+    begin
+      Conn := nil;
+      if not ADropped then
+        // The table is fd-indexed; posts are cold path, a scan is fine.
+        // Re-scanned per node: the previous OnPost may have torn any
+        // connection down.
+        for I := 0 to High(FConns) do
+          if (FConns[I] <> nil) and (FConns[I].Id = Node^.ConnId) then
+          begin
+            Conn := FConns[I];
+            Break;
+          end;
+      Next := Node^.Next;
+      try
+        if Assigned(OnPost) then OnPost(Conn, Node^.Data);
+      finally
+        Dispose(Node);
+        Node := Next;
+      end;
+    end;
+  finally
+    // A posted proc that raises unwinds Run like any other handler,
+    // but the rest of the chain must not leak: hand each envelope back
+    // as dropped (nil conn frees it in the session) and reclaim nodes.
+    while Node <> nil do
+    begin
+      Next := Node^.Next;
+      if Assigned(OnPost) then OnPost(nil, Node^.Data);
+      Dispose(Node);
+      Node := Next;
+    end;
   end;
 end;
 

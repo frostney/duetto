@@ -33,6 +33,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestPerProducerOrderUnderContention;
+    procedure TestPushRacingStop;
   end;
 
   TPusherThread = class(TThread)
@@ -179,6 +180,7 @@ var
   Node, Head, Next: PWSPostNode;
   I, Total: Integer;
   OrderOk: Boolean;
+  Deadline: QWord;
 begin
   Q := TWSPostQueue.Create;
   try
@@ -195,10 +197,14 @@ begin
 
     // Drain concurrently with the pushers — the consumer side of the
     // real transports — checking that every producer's sequence arrives
-    // in its push order regardless of interleaving.
+    // in its push order regardless of interleaving. Deadline-bounded so
+    // a lost node fails the assertion below instead of hanging the
+    // suite.
     Total := 0;
     OrderOk := True;
-    while Total < Producers * PerProducer do
+    Deadline := GetTickCount64 + 30000;
+    while (Total < Producers * PerProducer) and
+      (GetTickCount64 < Deadline) do
     begin
       Head := Q.Drain;
       if Head = nil then
@@ -241,9 +247,69 @@ begin
   Test('push after stop is refused',               TestPushAfterStopRefused);
 end;
 
+// The shutdown rendezvous property the transports lean on: with
+// producers pushing full-tilt, Stop splits every push into exactly two
+// fates — accepted (its node is in a drained chain or the Stop chain,
+// exactly once) or refused (the producer kept ownership; the node never
+// appears). Nothing is lost, nothing arrives twice, nothing lands after
+// Stop.
+procedure TPostQueueConcurrency.TestPushRacingStop;
+const
+  Producers = 4;
+  PerProducer = 20000;
+var
+  Q: TWSPostQueue;
+  Threads: array[0..Producers - 1] of TPusherThread;
+  Node: PWSPostNode;
+  Head: PWSPostNode;
+  I, Delivered, AcceptedSum: Integer;
+begin
+  Q := TWSPostQueue.Create;
+  try
+    for I := 0 to Producers - 1 do
+    begin
+      Threads[I] := TPusherThread.Create(True);
+      Threads[I].Queue := Q;
+      Threads[I].ProducerId := NativeUInt(I);
+      Threads[I].Count := PerProducer;
+    end;
+    for I := 0 to Producers - 1 do
+      Threads[I].Start;
+
+    // Stop lands mid-flight; the producers keep hammering into the
+    // refusal path until they finish.
+    Sleep(5);
+    Delivered := 0;
+    Head := Q.Stop;
+    Node := Head;
+    while Node <> nil do
+    begin
+      Inc(Delivered);
+      Node := Node^.Next;
+    end;
+    FreeChain(Head);
+
+    AcceptedSum := 0;
+    for I := 0 to Producers - 1 do
+    begin
+      Threads[I].WaitFor;
+      Inc(AcceptedSum, Threads[I].Accepted);
+      Threads[I].Free;
+    end;
+    // Every accepted push is in the Stop chain exactly once...
+    Expect<Integer>(Delivered).ToBe(AcceptedSum);
+    // ...and nothing leaks in after it.
+    Expect<Boolean>(Q.Drain = nil).ToBe(True);
+    Expect<Boolean>(Q.Stop = nil).ToBe(True);
+  finally
+    Q.Free;
+  end;
+end;
+
 procedure TPostQueueConcurrency.SetupTests;
 begin
   Test('per-producer order under contention',      TestPerProducerOrderUnderContention);
+  Test('push racing stop: accepted xor refused',   TestPushRacingStop);
 end;
 
 begin

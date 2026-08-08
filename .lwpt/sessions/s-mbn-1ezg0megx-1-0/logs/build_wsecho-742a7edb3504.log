@@ -1,0 +1,102 @@
+Free Pascal Compiler version 3.2.2 [2025/09/11] for aarch64
+Copyright (c) 1993-2021 by Florian Klaempfl and others
+Target OS: Darwin for AArch64
+Compiling source/apps/wsecho.pas
+Compiling ./.lwpt/modules/cli/packages/cli/source/CLI.Help.pas
+Compiling ./.lwpt/modules/cli/packages/cli/source/CLI.Options.pas
+CLI.Options.pas(193,19) Warning: function result variable of a managed type does not seem to be initialized
+generics.collections.pas(1186,20) Note: Call to subroutine "function TEnumerable<CLI.Options.TOptionBase>.GetEnumerator:TEnumerator$1<CLI.OPTIONS.TOptionBase>;" marked as inline is not inlined
+generics.collections.pas(1309,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1310,5) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+generics.collections.pas(1506,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1507,5) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+generics.collections.pas(1537,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1538,5) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+generics.collections.pas(1626,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1634,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1683,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1685,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+CLI.Options.pas(486,19) Warning: function result variable of a managed type does not seem to be initialized
+generics.collections.pas(144,52) Note: Private type "TCustomPointersEnumerator$2<CLI.OPTIONS.TOptionBase,CLI.OPTIONS.TCustomList$1$crc66958646.PT>.T" never used
+Assembling cli.options
+Compiling ./.lwpt/modules/cli/packages/cli/source/StringBuffer.pas
+StringBuffer.pas(62,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+Assembling stringbuffer
+CLI.Help.pas(75,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+CLI.Help.pas(76,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+CLI.Help.pas(80,7) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+CLI.Help.pas(81,7) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+CLI.Help.pas(82,7) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+CLI.Help.pas(91,9) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+CLI.Help.pas(92,9) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+Assembling cli.help
+Compiling ./.lwpt/modules/cli/packages/cli/source/CLI.Parser.pas
+Assembling cli.parser
+Compiling ./source/units/WS.Server.pas
+Compiling ./source/units/WS.Handshake.pas
+WS.Handshake.pas(140,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(543,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(547,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(548,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(551,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(553,7) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(555,7) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(560,7) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(561,7) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(563,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(565,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(581,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(582,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(583,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(584,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(585,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(587,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(588,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(589,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(590,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(591,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(642,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(643,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(644,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(645,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(646,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(649,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(650,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(652,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Handshake.pas(653,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+Assembling ws.handshake
+Compiling ./source/units/WS.Protocol.pas
+Compiling ./source/units/WS.Deflate.pas
+WS.Deflate.pas(77,3) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+WS.Deflate.pas(160,3) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+WS.Deflate.pas(218,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+Assembling ws.deflate
+Compiling ./source/units/WS.Frame.pas
+Assembling ws.frame
+Compiling ./source/units/WS.Utf8.pas
+WS.Utf8.pas(102,9) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+Assembling ws.utf8
+WS.Protocol.pas(252,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Protocol.pas(259,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Protocol.pas(350,19) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Protocol.pas(411,25) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Protocol.pas(526,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Protocol.pas(561,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Protocol.pas(663,7) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Protocol.pas(544,7) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+Assembling ws.protocol
+Compiling ./source/units/WS.Transport.pas
+Assembling ws.transport
+Compiling ./source/units/WS.Transport.NetworkFramework.pas
+WS.Transport.NetworkFramework.pas(207,3) Note: Local variable "CtxDefaultMessage" is assigned but never used
+Assembling ws.transport.networkframework
+WS.Server.pas(471,9) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+WS.Server.pas(484,11) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+Assembling ws.server
+Assembling wsecho
+Linking /Users/jstein/Documents/Projects/_herakles/worktrees/duetto/open-issues-implementation-43960d/.lwpt/sessions/s-mbn-1ezg0megx-1-0/jobs/wsecho-dev-4b67925da02e/bin/wsecho
+-macosx_version_min has been renamed to -macos_version_min
+ld: warning: -multiply_defined is obsolete
+4845 lines compiled, 1.0 sec
+2 warning(s) issued
+65 note(s) issued

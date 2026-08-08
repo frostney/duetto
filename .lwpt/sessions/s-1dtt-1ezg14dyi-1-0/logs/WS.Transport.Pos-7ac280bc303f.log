@@ -1,0 +1,72 @@
+Free Pascal Compiler version 3.2.2 [2025/09/11] for aarch64
+Copyright (c) 1993-2021 by Florian Klaempfl and others
+Target OS: Darwin for AArch64
+Compiling /Users/jstein/Documents/Projects/_herakles/worktrees/duetto/open-issues-implementation-43960d/source/units/WS.Transport.PostQueue.Test.pas
+Compiling ./.lwpt/modules/testing/packages/testing/source/TestingPascalLibrary.pas
+generics.collections.pas(1186,20) Note: Call to subroutine "function TEnumerable<TestingPascalLibrary.TTestRegistration>.GetEnumerator:TEnumerator$1<TESTINGPASCALLIBRARY.TTestRegistration>;" marked as inline is not inlined
+generics.collections.pas(1309,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1310,5) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+generics.collections.pas(1506,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1507,5) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+generics.collections.pas(1537,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1538,5) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+generics.collections.pas(1626,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1634,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1683,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1685,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1186,20) Note: Call to subroutine "function TEnumerable<TestingPascalLibrary.TTestSuite>.GetEnumerator:TEnumerator$1<TESTINGPASCALLIBRARY.TTestSuite>;" marked as inline is not inlined
+generics.collections.pas(1309,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1310,5) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+generics.collections.pas(1506,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1507,5) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+generics.collections.pas(1537,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1538,5) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+generics.collections.pas(1626,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1634,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1683,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1685,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1186,20) Note: Call to subroutine "function TEnumerable<TestingPascalLibrary.TTestResult>.GetEnumerator:TEnumerator$1<TESTINGPASCALLIBRARY.TTestResult>;" marked as inline is not inlined
+generics.collections.pas(1309,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1310,5) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+generics.collections.pas(1506,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1507,5) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+generics.collections.pas(1537,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1538,5) Note: Call to subroutine "procedure FillChar(var x:<Formal type>;count:Int64;Value:Byte);" marked as inline is not inlined
+generics.collections.pas(1626,3) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1634,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1683,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(1685,5) Note: Call to subroutine "procedure Move(const source:<Formal type>;var dest:<Formal type>;count:Int64);" marked as inline is not inlined
+generics.collections.pas(144,52) Note: Private type "TCustomPointersEnumerator$2<TESTINGPASCALLIBRARY.TTestRegistration,TESTINGPASCALLIBRARY.TCustomList$1$crc20EC5871.PT>.T" never used
+generics.collections.pas(144,52) Note: Private type "TCustomPointersEnumerator$2<TESTINGPASCALLIBRARY.TTestSuite,TESTINGPASCALLIBRARY.TCustomList$1$crc5086ACFE.PT>.T" never used
+generics.collections.pas(144,52) Note: Private type "TCustomPointersEnumerator$2<TESTINGPASCALLIBRARY.TTestResult,TESTINGPASCALLIBRARY.TCustomList$1$crc57EB68E7.PT>.T" never used
+TestingPascalLibrary.pas(126,3) Note: Local variable "CurrentDescribeSuite" not used
+Assembling testingpascallibrary
+Compiling /Users/jstein/Documents/Projects/_herakles/worktrees/duetto/open-issues-implementation-43960d/source/units/WS.Transport.PostQueue.pas
+Assembling ws.transport.postqueue
+Assembling ws.transport.postqueue.test
+Linking /Users/jstein/Documents/Projects/_herakles/worktrees/duetto/open-issues-implementation-43960d/.lwpt/sessions/s-1dtt-1ezg14dyi-1-0/jobs/tests-59830ebc3a41/WS.Transport.Pos-54e638461933/WS.Transport.PostQueue.Test
+-macosx_version_min has been renamed to -macos_version_min
+ld: warning: -multiply_defined is obsolete
+906 lines compiled, 0.8 sec
+37 note(s) issued
+
+Running tests...
+
+  PostQueue: basics
+  PostQueue: concurrency
+
+Test Results:
+=============
+[32m  ✓ [0mPostQueue: basics › FIFO order preserved through drain
+[32m  ✓ [0mPostQueue: basics › drain detaches the chain
+[32m  ✓ [0mPostQueue: basics › stop hands back pending exactly once
+[32m  ✓ [0mPostQueue: basics › push after stop is refused
+[32m  ✓ [0mPostQueue: concurrency › per-producer order under contention (2 ms)
+
+Summary:
+========
+Total:   5 tests
+[32mPassed:  5[0m
+Time:    2 ms
+
+[32mALL TESTS PASSED[0m

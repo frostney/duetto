@@ -441,9 +441,17 @@ begin
   finally
     T.FLiveLock.Release;
   end;
-  if Assigned(T.OnPost) then T.OnPost(C, P^.Data);
-  Dispose(P);
-  T.PostDone;
+  // PostDone must run even if the posted proc raises: a missed
+  // decrement would leave FPostsPending nonzero and spin Shutdown's
+  // drain loop forever. (The exception still propagates into GCD,
+  // which typically terminates the process — but the accounting stays
+  // honest for any path that survives.)
+  try
+    if Assigned(T.OnPost) then T.OnPost(C, P^.Data);
+  finally
+    Dispose(P);
+    T.PostDone;
+  end;
 end;
 
 procedure NewConnInvoke(ABlock: PWSBlock; ANwConn: Pointer); cdecl;

@@ -121,8 +121,11 @@ type
     // and in per-caller FIFO order; or with AConn = nil when the
     // connection is already gone or the transport is stopping (see
     // TWSTransportPostEvent for the dropped-delivery context). AData is
-    // opaque to the transport and is always handed back, so the caller
-    // can reclaim it. Pure scheduling: no bytes, no protocol.
+    // opaque to the transport and is always handed back through OnPost,
+    // so the caller can reclaim it — with OnPost unassigned the
+    // envelope is silently dropped, so wire OnPost before the first
+    // SubmitPost (the session does, before Open). Pure scheduling: no
+    // bytes, no protocol.
     procedure SubmitPost(AConnId: NativeUInt; AData: Pointer); virtual; abstract;
 
     // Quiesce: cancel every connection and block until no completion
