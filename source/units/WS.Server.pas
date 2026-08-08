@@ -54,6 +54,9 @@ type
     FProto: TWSProtocol;
     FHsBuf: RawByteString;     // handshake accumulator
     FDropPending: Boolean;     // protocol failed; drop once output drains
+    FInDelivery: Boolean;      // inside Ingest/OnOpen delivery — drops defer
+    FDropping: Boolean;        // teardown running; re-entrant drops no-op
+    FDropDeferred: Boolean;    // dropped mid-delivery; freed on unwind
     procedure ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
     function GetId: NativeUInt;
   public
@@ -61,17 +64,21 @@ type
     destructor Destroy; override;
     // Callable from this connection's callback context (ADR-0003).
     // False = the transport reported the connection dead during the
-    // flush: the connection was dropped and freed before the call
-    // returned (no OnClientClose follows) and the reference is
-    // dangling — it must not be touched again. True = the connection
-    // is still alive, including the no-op cases (not yet open, already
-    // closing). This matches the pre-seam reactor's drop semantics;
-    // ignoring the result is legal Pascal and keeps old callers valid.
+    // flush: the connection was dropped and the reference must not be
+    // touched again. OnClientClose fires as part of that drop —
+    // nested inside this call when the drop is immediate, or after the
+    // current OnMessage/OnOpen delivery unwinds when it is deferred
+    // (the free is deferred there so pipelined frames cannot be parsed
+    // in freed memory). True = the connection is still alive,
+    // including the no-op cases (not yet open, already closing). This
+    // matches the pre-seam reactor's drop semantics; ignoring the
+    // result is legal Pascal and keeps old callers valid.
     function SendText(P: PByte; ALen: NativeInt): Boolean;
     function SendBinary(P: PByte; ALen: NativeInt): Boolean;
     // Same mid-call drop can occur here (unreported): if the transport
     // declares the connection dead while the close frame flushes, the
-    // connection is freed before Close returns.
+    // connection is freed before Close returns — or, inside an
+    // OnMessage/OnOpen delivery, right after that delivery unwinds.
     procedure Close(ACode: Word = 1000; const AReason: string = '');
     // Runs AProc on this connection's callback context with the same
     // guarantees as OnMessage (ADR-0003): serialized with the
@@ -130,7 +137,8 @@ type
     procedure RegistryRemove(AConn: TWSConnection);
     procedure ReleaseConn(AConn: TWSConnection);
     // Caller-initiated teardown; returns False so drop sites can chain
-    // "Exit(DropConn(...))". The connection is freed on return.
+    // "Exit(DropConn(...))". The connection is freed on return — or,
+    // mid-delivery, as soon as the delivery site unwinds (deferred).
     function DropConn(AConn: TWSConnection): Boolean;
     // Hands pending protocol output to the transport. False = the
     // connection died and was dropped.
@@ -228,6 +236,10 @@ end;
 
 procedure TWSConnection.ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
 begin
+  // A send inside an earlier OnMessage of this same ingest run may have
+  // found the connection dead; the drop is deferred (see DropConn) and
+  // the remaining messages of the run are not the application's to see.
+  if FDropDeferred then Exit;
   if Assigned(FServer.FOnMessage) then
     FServer.FOnMessage(Self, AText, P, ALen);
 end;
@@ -402,6 +414,22 @@ var
   TConn: TWSTransportConn;
 begin
   Result := False;
+  // Mid-delivery (Ingest's frame loop, or OnOpen with the caller still
+  // reading conn state afterwards) the object must not be freed under
+  // its own stack — the use-after-free the win64 stress battery
+  // caught. Defer: the callers' contract (False = do not touch the
+  // reference again) already covers it, and the delivery site performs
+  // the real teardown as soon as it unwinds.
+  if AConn.FInDelivery then
+  begin
+    AConn.FDropDeferred := True;
+    Exit;
+  end;
+  // Re-entrant drop — an OnClientClose handler sending into the dead
+  // connection lands back here mid-teardown; a second ReleaseConn
+  // would double-free.
+  if AConn.FDropping then Exit;
+  AConn.FDropping := True;
   TConn := AConn.FTConn;
   TConn.UserData := nil;
   ReleaseConn(AConn);
@@ -465,15 +493,45 @@ begin
   AConn.FHsBuf := '';
   if not FlushConn(AConn) then Exit;
 
-  if Assigned(FOnOpen) then FOnOpen(AConn);
+  // Same deferral guard as the Ingest run: a send inside OnOpen may
+  // find the peer dead, and the caller still reads Conn state after we
+  // return — the drop must not free the object under it.
+  AConn.FInDelivery := True;
+  try
+    if Assigned(FOnOpen) then FOnOpen(AConn);
+  finally
+    AConn.FInDelivery := False;
+  end;
+  if AConn.FDropDeferred then
+  begin
+    AConn.FDropDeferred := False;
+    Exit(DropConn(AConn)); // False: the caller must not touch Conn
+  end;
   Result := True;
 end;
 
 function TWSServer.IngestAndFlush(AConn: TWSConnection; P: PByte;
   ALen: NativeInt): Boolean;
+var
+  IngestOk: Boolean;
 begin
   Result := False;
-  if not AConn.FProto.Ingest(P, ALen) then
+  // The guard makes DropConn defer while the protocol's frame loop is
+  // live (a send inside OnMessage may find the peer dead with more
+  // pipelined frames still unparsed); the deferred teardown runs here,
+  // with Ingest unwound and the object safe to free.
+  AConn.FInDelivery := True;
+  try
+    IngestOk := AConn.FProto.Ingest(P, ALen);
+  finally
+    AConn.FInDelivery := False;
+  end;
+  if AConn.FDropDeferred then
+  begin
+    AConn.FDropDeferred := False;
+    Exit(DropConn(AConn));
+  end;
+  if not IngestOk then
   begin
     // Get the close frame out, then die. If a prior send is still in
     // flight the transport takes nothing now — defer the drop until

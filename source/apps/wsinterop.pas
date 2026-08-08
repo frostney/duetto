@@ -55,8 +55,23 @@ end;
 
 procedure TServerThread.Execute;
 begin
-  while not Terminated do
-    Srv.Run(50);
+  // A transport/session exception would otherwise vanish into
+  // FatalException until (never-reached) teardown; dump it at throw
+  // time — dev-mode builds carry -gl, so frames resolve to file:line.
+  // This trace is what pinned the mid-ingest use-after-free the win64
+  // stress leg caught.
+  try
+    while not Terminated do
+      Srv.Run(50);
+  except
+    on E: Exception do
+    begin
+      WriteLn('server thread exception: ', E.ClassName, ': ', E.Message);
+      DumpExceptionBackTrace(Output);
+      Flush(Output);
+      raise;
+    end;
+  end;
 end;
 
 var
