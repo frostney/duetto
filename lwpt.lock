@@ -3,21 +3,21 @@ version = 3
 
 [package.httpclient]
 source = "frostney/lwpt"
-resolvedRef = "0.2.0"
-resolvedURL = "https://github.com/frostney/lwpt/archive/0.2.0.tar.gz"
-computedHash = "sha256:ed82f8c383dd4c4b9feb3c4075cfe6ce5803ea913d5ef82b212fbae0102d4c9f"
-archiveHash = "sha256:f0cfd07ec5e2bd5f68cb99311f7722ff16505278a141cd95205f7f879b6400d0"
+resolvedRef = "0.4.0"
+resolvedURL = "https://github.com/frostney/lwpt/archive/0.4.0.tar.gz"
+computedHash = "sha256:dee462ab2e4d873a9d02136e1abfe7510af9a549ba2c507727d4dc68137d29ca"
+archiveHash = "sha256:e46ec4c0cfcf5b5c65d17bc8dc1e785df1b3bc759e9797fb2cce2d1fdbe1506d"
 
 [package.testing]
 source = "frostney/lwpt"
-resolvedRef = "0.2.0"
-resolvedURL = "https://github.com/frostney/lwpt/archive/0.2.0.tar.gz"
-computedHash = "sha256:3f70068a26b9ebd58cf6768c052baec8a455407355ece0b4b16cd37376471cc9"
-archiveHash = "sha256:f0cfd07ec5e2bd5f68cb99311f7722ff16505278a141cd95205f7f879b6400d0"
+resolvedRef = "0.4.0"
+resolvedURL = "https://github.com/frostney/lwpt/archive/0.4.0.tar.gz"
+computedHash = "sha256:560aa140e6c2e5ff6479417f41d02d9b17fc5b89d62a08ca888d13f88ce18793"
+archiveHash = "sha256:e46ec4c0cfcf5b5c65d17bc8dc1e785df1b3bc759e9797fb2cce2d1fdbe1506d"
 
 [package.cli]
 source = "frostney/lwpt"
-resolvedRef = "0.2.0"
-resolvedURL = "https://github.com/frostney/lwpt/archive/0.2.0.tar.gz"
-computedHash = "sha256:8c5771c5dfac28ea124f860495e2143ae0b157f221ab25e8954d9861e12c7fc9"
-archiveHash = "sha256:f0cfd07ec5e2bd5f68cb99311f7722ff16505278a141cd95205f7f879b6400d0"
+resolvedRef = "0.4.0"
+resolvedURL = "https://github.com/frostney/lwpt/archive/0.4.0.tar.gz"
+computedHash = "sha256:4e063157c3da371b408af6a2197811890626c803a1b66e65d4b4d8c2a97880e4"
+archiveHash = "sha256:e46ec4c0cfcf5b5c65d17bc8dc1e785df1b3bc759e9797fb2cce2d1fdbe1506d"

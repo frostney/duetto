@@ -4,7 +4,7 @@
 [package]
 name = "duetto"
 version = "0.3.0"
-# lwpt 0.2.0 discovers dep units through nested manifests, so only
+# lwpt discovers dep units through nested manifests, so only
 # duetto's own source dir is listed here. Dep test files are excluded at
 # fetch time so `lwpt test` (which walks every units dir) only
 # discovers duetto's own suites; [format] likewise excludes .lwpt so the
@@ -16,13 +16,13 @@ units = ["source/units"]
 exclude = [".lwpt/**"]
 
 [dependencies]
-# Resolved from the lwpt 0.2.0 release tag via include filters (one
+# Resolved from the lwpt 0.4.0 release tag via include filters (one
 # filtered fetch per package). httpclient brings HTTPClient +
 # TransportSecurity (TLS) + StringBuffer; cli is the option/parser/help
 # framework the source/apps programs build their flags on.
-httpclient = { source = "frostney/lwpt", version = "^0.2.0", include = ["packages/httpclient/**"], exclude = ["**/*.Test.pas", "**/Tests.*.pas"] }
-testing = { source = "frostney/lwpt", version = "^0.2.0", include = ["packages/testing/**"], exclude = ["**/*.Test.pas"] }
-cli = { source = "frostney/lwpt", version = "^0.2.0", include = ["packages/cli/**"], exclude = ["**/*.Test.pas"] }
+httpclient = { source = "frostney/lwpt", version = "^0.4.0", include = ["packages/httpclient/**"], exclude = ["**/*.Test.pas", "**/Tests.*.pas"] }
+testing = { source = "frostney/lwpt", version = "^0.4.0", include = ["packages/testing/**"], exclude = ["**/*.Test.pas"] }
+cli = { source = "frostney/lwpt", version = "^0.4.0", include = ["packages/cli/**"], exclude = ["**/*.Test.pas"] }
 
 [build]
 wsecho    = { source = "source/apps/wsecho.pas",    output = "build/wsecho" }
