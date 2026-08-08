@@ -22,13 +22,25 @@ type
     procedure Reset;
   end;
 
+  // Classification of a complete request header block, computed as a
+  // by-product of ServerParseRequest for the session layer's single-port
+  // fallback (TWSServer.OnPlainRequest). wrkUpgrade: a WebSocket upgrade
+  // attempt (Upgrade header lists "websocket"), whether or not it
+  // validates. wrkPlain: a well-formed body-less non-upgrade request —
+  // GET or HEAD with no Content-Length and no Transfer-Encoding —
+  // eligible for the fallback. wrkOther: everything else (malformed, or
+  // a non-upgrade request carrying/advertising a body); always refused.
+  TWSRequestKind = (wrkOther, wrkUpgrade, wrkPlain);
+
   TWSServerHandshake = record
-    Path: string;
+    Method: string;             // request-line method as received
+    Path: string;               // request-target as received
     Host: string;
     Key: string;
     Version: Integer;
     Protocols: string;          // raw Sec-WebSocket-Protocol value (app decides)
     Deflate: TWSDeflateParams;  // negotiated result (Enabled=False if none)
+    Kind: TWSRequestKind;       // classification (valid even when parse fails)
     Failure: string;            // set when parse returns False
   end;
 
@@ -38,6 +50,12 @@ function HandshakeFindEnd(ABuf: PByte; ALen: Integer): Integer; overload;
 function HandshakeFindEnd(const S: RawByteString): Integer; overload;
 
 function ComputeAccept(const AKey: string): string;
+
+// Collect every value of header AName (case-insensitive) from a raw
+// header block, joined with ', ' — RFC 7230 list semantics. Exported so
+// OnPlainRequest consumers can query arbitrary headers of the raw
+// request block without a second HTTP parser.
+function HeaderValue(const ARaw, AName: string): string;
 
 // --- server role ---------------------------------------------------------
 function ServerParseRequest(const ARaw: RawByteString; AAllowDeflate: Boolean;
@@ -400,12 +418,13 @@ end;
 // 7230 list folding). Replaces seven full-request rescans on the
 // connection-setup path.
 const
-  SRV_HDR_NAMES: array[0..6] of string = (
+  SRV_HDR_NAMES: array[0..8] of string = (
     'Upgrade', 'Connection', 'Sec-WebSocket-Version', 'Sec-WebSocket-Key',
-    'Host', 'Sec-WebSocket-Protocol', 'Sec-WebSocket-Extensions');
+    'Host', 'Sec-WebSocket-Protocol', 'Sec-WebSocket-Extensions',
+    'Content-Length', 'Transfer-Encoding');
 
 type
-  TSrvHeaders = array[0..6] of string;
+  TSrvHeaders = array[0..8] of string;
 
 function NameIsCI(P: PAnsiChar; L: Integer; const N: string): Boolean;
 var
@@ -492,7 +511,19 @@ begin
     Exit;
   end;
   Method := Copy(RequestLine, 1, SP1 - 1);
+  AHS.Method := Method;
   AHS.Path := Copy(RequestLine, SP1 + 1, SP2 - SP1 - 1);
+  AHS.Host := H[4];
+
+  // Classify before validating: the session layer's single-port
+  // fallback needs to know, even when the checks below fail, whether
+  // this was an upgrade attempt, a body-less plain request, or noise.
+  // (Default() above already left Kind = wrkOther.)
+  if TokenListHas(H[0], 'websocket') then
+    AHS.Kind := wrkUpgrade
+  else if (SameText(Method, 'GET') or SameText(Method, 'HEAD')) and
+    (H[7] = '') and (H[8] = '') then
+    AHS.Kind := wrkPlain;
 
   if not SameText(Method, 'GET') then
   begin
@@ -526,7 +557,6 @@ begin
     Exit;
   end;
 
-  AHS.Host := H[4];
   AHS.Protocols := H[5];
 
   if AAllowDeflate then

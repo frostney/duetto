@@ -17,6 +17,9 @@
   context, LAN IPs are not.
 - Reference implementation:
   [lantaarn](https://github.com/frostney/lantaarn).
+- Single-page hosts can skip the second listener entirely:
+  `TWSServer.OnPlainRequest` answers body-less GET/HEAD from the
+  WebSocket port itself (one response, then close).
 
 ## The two-port layout
 
@@ -139,11 +142,54 @@ remote desktop on duetto — is the worked example of this recipe: its
 page, `%WS_PORT%` substitution), and its `docs/architecture.md` shows
 the two-port process shape end to end.
 
-## Toward a single port
+## Single port: OnPlainRequest
 
-An opt-in raw-HTTP fallback hook on the handshake path —
-`TWSServer.OnPlainRequest` — is being added so a host can answer plain
-GETs from the WebSocket port itself and skip the second listener for
-the single-page case. Until it ships, the two-port layout above is the
-supported pattern; it also remains the right choice whenever the HTTP
-side outgrows one page.
+For the single-page case the second listener is optional:
+`TWSServer.OnPlainRequest` is an opt-in hook on the handshake path
+that hands well-formed non-upgrade requests to the host instead of
+refusing them. One origin, one port — and with a TLS identity on the
+listener, `https://` page and `wss://` socket share it, which settles
+the pairing and secure-context sections above by construction:
+
+```pascal
+function THost.PlainRequest(const AHS: TWSServerHandshake;
+  const ARawRequest: RawByteString;
+  out AResponse: RawByteString): Boolean;
+begin
+  Result := SameText(AHS.Method, 'GET') and (AHS.Path = '/');
+  if Result then
+    AResponse :=
+      'HTTP/1.1 200 OK'#13#10 +
+      'Content-Type: text/html; charset=utf-8'#13#10 +
+      'Content-Length: ' + IntToStr(Length(FPage)) + #13#10 +
+      'Connection: close'#13#10#13#10 +
+      FPage;
+end;
+
+Ws.OnPlainRequest := Host.PlainRequest;
+```
+
+The contract is deliberately narrow:
+
+- **Scope: body-less requests only.** The hook fires for a well-formed
+  GET or HEAD with no `Content-Length` and no `Transfer-Encoding` that
+  is not a WebSocket upgrade attempt. Everything else — requests
+  advertising a body, malformed noise, broken upgrade attempts — keeps
+  the standard refusal, as does every request while the property is
+  unset.
+- **Single-shot.** Return `True` with a complete HTTP/1.1 response in
+  `AResponse` (status line, headers, body; include `Connection: close`
+  so clients expect what follows): the bytes are written verbatim and
+  the connection closes. No keep-alive loop, no routing, no file
+  serving — the host writes raw bytes. Return `False` for the standard
+  refusal.
+- **Request access.** `AHS` carries `Method`, `Path` and `Host` as
+  parsed by `WS.Handshake`; `WS.Handshake.HeaderValue` reads any other
+  header out of `ARawRequest`.
+- **Threading.** The hook fires on the connection's execution context
+  like every other callback (ADR-0003).
+
+The two-port layout above remains the right choice the moment the HTTP
+side outgrows one page — multiple assets, caching, redirects, anything
+that starts to resemble routing belongs in a real HTTP server, not in
+this hook.

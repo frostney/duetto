@@ -5,7 +5,9 @@ unit WS.Server;
 // between the platform transport (WS.Transport, selected per platform
 // below) and that machine. Handshakes are accumulated until the blank
 // line, parsed by WS.Handshake, answered, and the connection flips from
-// "handshaking" to "open".
+// "handshaking" to "open". A well-formed non-upgrade request may
+// instead be answered by the host via OnPlainRequest (single-shot,
+// then close); with the hook unset it is refused exactly as before.
 //
 // Concurrency (ADR-0003): callbacks fire on the transport's execution
 // context — the Run thread on Linux (epoll) and Windows (IOCP),
@@ -95,6 +97,21 @@ type
     P: PByte; Len: NativeInt) of object;
   TWSServerNotify = procedure(AConn: TWSConnection) of object;
 
+  // Answer a plain HTTP request on the WebSocket port (see
+  // TWSServer.OnPlainRequest). AHS carries the request as parsed by
+  // WS.Handshake — Method, Path (the request-target) and Host are
+  // filled; the WebSocket-only fields are not meaningful here.
+  // ARawRequest is the complete header block (request line through the
+  // terminating blank line); query further headers with
+  // WS.Handshake.HeaderValue. Return True with AResponse holding a
+  // complete HTTP/1.1 response — status line, headers, body — and the
+  // bytes are written verbatim, then the connection is closed (include
+  // a 'Connection: close' header so well-behaved clients expect that).
+  // Return False (AResponse ignored) for the standard refusal.
+  TWSPlainRequestEvent = function(const AHS: TWSServerHandshake;
+    const ARawRequest: RawByteString;
+    out AResponse: RawByteString): Boolean of object;
+
   TWSServer = class
   private
     FTransport: TWSTransport;
@@ -105,6 +122,7 @@ type
     FLock: TCriticalSection;
     FOnMessage: TWSServerMessage;
     FOnOpen, FOnClose: TWSServerNotify;
+    FOnPlainRequest: TWSPlainRequestEvent;
 
     procedure RegistryAdd(AConn: TWSConnection);
     procedure RegistryRemove(AConn: TWSConnection);
@@ -115,7 +133,7 @@ type
     // Hands pending protocol output to the transport. False = the
     // connection died and was dropped.
     function FlushConn(AConn: TWSConnection): Boolean;
-    function FinishHandshake(AConn: TWSConnection): Boolean;
+    function FinishHandshake(AConn: TWSConnection; AHdrEnd: Integer): Boolean;
     function IngestAndFlush(AConn: TWSConnection; P: PByte;
       ALen: NativeInt): Boolean;
 
@@ -148,6 +166,20 @@ type
     property OnMessage: TWSServerMessage read FOnMessage write FOnMessage;
     property OnOpen: TWSServerNotify read FOnOpen write FOnOpen;
     property OnClientClose: TWSServerNotify read FOnClose write FOnClose;
+    // Opt-in single-port fallback: fired for a well-formed, body-less
+    // HTTP request (GET or HEAD without Content-Length or
+    // Transfer-Encoding) that is not a WebSocket upgrade attempt.
+    // Upgrade attempts (valid or broken), malformed requests, and
+    // requests advertising a body all keep the standard refusal —
+    // as does everything when the property is unset. Single-shot: the
+    // response is written, then the connection closes; there is no
+    // keep-alive loop, no routing, no file serving. Fires on the
+    // connection's execution context like every other callback
+    // (ADR-0003): the Run thread on Linux/Windows, the connection's
+    // dispatch queue on macOS. On a TLS listener the request arrives
+    // already decrypted, exactly like handshake bytes.
+    property OnPlainRequest: TWSPlainRequestEvent
+      read FOnPlainRequest write FOnPlainRequest;
   end;
 
 {$endif}
@@ -387,7 +419,8 @@ begin
   // OnSendReady when it can take more.
 end;
 
-function TWSServer.FinishHandshake(AConn: TWSConnection): Boolean;
+function TWSServer.FinishHandshake(AConn: TWSConnection;
+  AHdrEnd: Integer): Boolean;
 var
   HS: TWSServerHandshake;
   Resp: RawByteString;
@@ -395,6 +428,24 @@ begin
   Result := False;
   if not ServerParseRequest(AConn.FHsBuf, FAllowDeflate, HS) then
   begin
+    // Single-port fallback: a well-formed body-less non-upgrade request
+    // may be answered by the host (OnPlainRequest). The consumer's
+    // bytes ride a fresh protocol out queue so a partial write shares
+    // the standard backpressure/drain-then-drop path; the connection
+    // closes once they are on the wire (single-shot, no keep-alive).
+    Resp := '';
+    if (HS.Kind = wrkPlain) and Assigned(FOnPlainRequest) and
+      FOnPlainRequest(HS, Copy(AConn.FHsBuf, 1, AHdrEnd), Resp) then
+    begin
+      AConn.FProto := TWSProtocol.Create(wsrServer, HS.Deflate, FMaxMessage);
+      if Length(Resp) > 0 then
+        AConn.FProto.QueueRaw(@Resp[1], Length(Resp));
+      AConn.FHsBuf := '';
+      AConn.FDropPending := True; // drop as soon as the response drains
+      if FlushConn(AConn) and (AConn.FProto.OutPending = 0) then
+        DropConn(AConn);
+      Exit;
+    end;
     Resp := ServerBuildReject(400, HS.Failure);
     AConn.FTConn.SubmitSend(@Resp[1], Length(Resp)); // best effort
     Exit(DropConn(AConn));
@@ -466,6 +517,10 @@ begin
   case Conn.FState of
     wcsHandshake:
       begin
+        // A plain response is draining towards the drop; anything else
+        // the client pipelines (it was told Connection: close) is
+        // discarded.
+        if Conn.FDropPending then Exit;
         Off := Length(Conn.FHsBuf);
         SetLength(Conn.FHsBuf, Off + ALen);
         Move(P^, Conn.FHsBuf[Off + 1], ALen);
@@ -483,7 +538,7 @@ begin
           SetLength(Left, LeftLen);
           Move(Conn.FHsBuf[HdrEnd + 1], Left[0], LeftLen);
         end;
-        if not FinishHandshake(Conn) then Exit;
+        if not FinishHandshake(Conn, HdrEnd) then Exit;
         if (Conn.FState = wcsOpen) and (LeftLen > 0) then
           IngestAndFlush(Conn, @Left[0], LeftLen);
       end;
