@@ -31,3 +31,7 @@ duetto = "frostney/duetto@^0.1.0"
 
 During the sandbox phase the dependency can also be a local path
 (`duetto = "../duetto"`), mirroring how duetto itself consumes lwpt's packages.
+
+Browser-facing consumers also need to serve the page that opens the
+WebSocket — duetto deliberately doesn't do that; see the
+[companion HTTP recipe](companion-http.md).
