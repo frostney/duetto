@@ -3,21 +3,29 @@ program wsinterop;
 // Live-socket battery: duetto TWSClient against duetto TWSServer over real
 // TCP (loopback), plus a raw-socket section that injects protocol
 // violations a conforming client cannot produce and asserts the close
-// codes RFC 6455 (and Autobahn cases 4.x/7.x) require, plus a
-// concurrent-connections stress section — ~32 client threads of
-// echo/burst/clean-close cycles racing abrupt raw-socket drops and
-// server-initiated pushes, ended by a Shutdown with connections still
-// open.
+// codes RFC 6455 (and Autobahn cases 4.x/7.x) require, a plain-request
+// section covering the single-port OnPlainRequest fallback, and a
+// concurrent-connections stress section — 33 client threads (28 echo,
+// 4 abrupt-drop, 1 pusher) of echo/burst/clean-close cycles racing
+// abrupt raw-socket drops and server-initiated pushes, ended by a
+// Shutdown with connections still open.
 //
 // Exit 0 = every check passed.
 
 {$I Shared.inc}
 
 uses
-  {$ifdef UNIX} cthreads, {$endif}
+  {$ifdef UNIX} cthreads, BaseUnix, {$endif}
   syncobjs,
   SysUtils, Classes, Sockets,
   WS.Server, WS.Client, WS.Frame, WS.Handshake;
+
+{$ifdef WINDOWS}
+// Declared here rather than pulling the whole Windows unit into a file
+// that already speaks Sockets: the watchdog needs exactly one symbol.
+procedure ExitProcess(AExitCode: UInt32); stdcall;
+  external 'kernel32' name 'ExitProcess';
+{$endif}
 
 type
   {$ifdef UNIX}
@@ -42,6 +50,26 @@ type
     procedure OnMsg(AConn: TWSConnection; AText: Boolean; P: PByte; Len: NativeInt);
   end;
 
+  // Single-port fallback host for the plain-request section. Answers with
+  // a body derived from the request line, so the client can assert the
+  // exact bytes the server put on the wire, and records what the hook was
+  // handed — the raw block must be the one request that completed, not
+  // whatever else the client pipelined behind it.
+  TPlainHost = class
+  private
+    FLock: TCriticalSection;
+    FHits: Integer;
+    FLastRaw: RawByteString;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    // Matches TWSPlainRequestEvent; runs on the connection's execution
+    // context, hence the lock around the two fields the battery reads.
+    function Answer(const AHS: TWSServerHandshake;
+      const ARawRequest: RawByteString; out AResponse: RawByteString): Boolean;
+    procedure Snapshot(out AHits: Integer; out ALastRaw: RawByteString);
+  end;
+
   TServerThread = class(TThread)
   public
     Srv: TWSServer;
@@ -51,6 +79,61 @@ type
 procedure TEcho.OnMsg(AConn: TWSConnection; AText: Boolean; P: PByte; Len: NativeInt);
 begin
   if AText then AConn.SendText(P, Len) else AConn.SendBinary(P, Len);
+end;
+
+{ TPlainHost }
+
+const
+  PlainBodyTag: RawByteString = 'duetto-plain ';
+
+// The one place the response bytes are defined — the hook returns them,
+// the assertions rebuild them, so a mismatch is a real wire difference.
+function PlainResponse(const AMethod, APath: string): RawByteString;
+var
+  Body: RawByteString;
+begin
+  Body := PlainBodyTag + AMethod + ' ' + APath;
+  Result := 'HTTP/1.1 200 OK'#13#10 +
+    'Content-Type: text/plain'#13#10 +
+    'Connection: close'#13#10 +
+    'Content-Length: ' + IntToStr(Length(Body)) + #13#10#13#10 + Body;
+end;
+
+constructor TPlainHost.Create;
+begin
+  inherited;
+  FLock := TCriticalSection.Create;
+end;
+
+destructor TPlainHost.Destroy;
+begin
+  FLock.Free;
+  inherited;
+end;
+
+function TPlainHost.Answer(const AHS: TWSServerHandshake;
+  const ARawRequest: RawByteString; out AResponse: RawByteString): Boolean;
+begin
+  FLock.Acquire;
+  try
+    Inc(FHits);
+    FLastRaw := ARawRequest;
+  finally
+    FLock.Release;
+  end;
+  AResponse := PlainResponse(AHS.Method, AHS.Path);
+  Result := True;
+end;
+
+procedure TPlainHost.Snapshot(out AHits: Integer; out ALastRaw: RawByteString);
+begin
+  FLock.Acquire;
+  try
+    AHits := FHits;
+    ALastRaw := FLastRaw;
+  finally
+    FLock.Release;
+  end;
 end;
 
 procedure TServerThread.Execute;
@@ -124,7 +207,10 @@ begin
   SA.sin_port := htons(APort);
   SA.sin_addr.s_addr := htonl($7F000001); // 127.0.0.1
   if fpConnect(Result, @SA, SizeOf(SA)) <> 0 then
+  begin
+    CloseSocket(Result); // the descriptor is ours until we raise past it
     raise Exception.Create('raw connect failed');
+  end;
 end;
 
 // Speak the opening handshake on a raw socket; returns leftover bytes
@@ -195,8 +281,12 @@ begin
   until False;
 end;
 
-procedure RawSendFrame(AFd: Tsocket; AOpcode: Byte; const APayload: RawByteString;
-  AMasked: Boolean);
+// False = the peer is already gone (the send failed or went short). Only
+// the abrupt-drop workers act on it; the violation sections below send
+// into a socket the server has just accepted, where a failure would
+// surface as the missing close code they assert anyway.
+function RawSendFrame(AFd: Tsocket; AOpcode: Byte; const APayload: RawByteString;
+  AMasked: Boolean): Boolean;
 var
   Hdr: array[0..WS_MAX_HEADER - 1] of Byte;
   HLen: Integer;
@@ -206,30 +296,52 @@ begin
   Key := $A1B2C3D4;
   HLen := WriteFrameHeader(@Hdr[0], True, False, AOpcode, AMasked, Key,
     Length(APayload));
-  fpSend(AFd, @Hdr[0], HLen, 0);
-  if APayload = '' then Exit;
+  Result := fpSend(AFd, @Hdr[0], HLen, 0) = HLen;
+  if (not Result) or (APayload = '') then Exit;
   SetLength(Body, Length(APayload));
   Move(APayload[1], Body[0], Length(APayload));
   if AMasked then
     ApplyMask(PByte(Body), Length(Body), Key, 0);
-  fpSend(AFd, @Body[0], Length(Body), 0);
+  Result := fpSend(AFd, @Body[0], Length(Body), 0) = Length(Body);
+end;
+
+// Read until the peer closes; AEof distinguishes a real EOF from the
+// 5 s SO_RCVTIMEO expiring (which would mean the server never hung up).
+function RawReadToEof(AFd: Tsocket; out AEof: Boolean): RawByteString;
+var
+  Buf: array[0..4095] of Byte;
+  Got: Integer;
+begin
+  Result := '';
+  repeat
+    Got := fpRecv(AFd, @Buf[0], SizeOf(Buf), 0);
+    if Got <= 0 then Break;
+    SetLength(Result, Length(Result) + Got);
+    Move(Buf[0], Result[Length(Result) - Got + 1], Got);
+  until False;
+  AEof := Got = 0;
 end;
 
 // ---------------------------------------------------------------------------
 // Concurrent-connections stress section
 // ---------------------------------------------------------------------------
-// ~32 client threads against the one server instance: echo workers loop
-// connect / single echo / pipelined burst / clean close, abrupt-drop
-// workers kill raw sockets mid-conversation (no closing handshake), and
-// one pusher thread Posts server-initiated messages into every live
-// connection while the clients are reading. Framing keeps the two
-// streams distinguishable — binary frames are echoes, text frames are
-// pushes — so each worker verifies its echo payloads round-trip intact
-// and in order while push serials stay consecutive per connection.
-// Deterministic seeds, no timing assertions: the wall-clock budget and
-// the cycle caps only bound how long the loops run (whichever ends
-// first), and the only failure clock is a generous stall limit so a
-// wedged stream fails instead of hanging CI.
+// 33 client threads against the one server instance — 28 echo workers
+// looping connect / single echo / pipelined burst / clean close, 4
+// abrupt-drop workers killing raw sockets mid-conversation (no closing
+// handshake), and one pusher thread Posting server-initiated messages
+// into every live connection while the clients are reading. Framing
+// keeps the two streams distinguishable — binary frames are echoes, text
+// frames are pushes — so each worker verifies its echo payloads
+// round-trip intact and in order while push serials stay consecutive per
+// connection.
+//
+// No timing assertions: the wall-clock budget and the cycle caps only
+// bound how long the loops run (whichever ends first), and the only
+// failure clock is a generous stall limit so a wedged stream fails
+// instead of hanging CI. Payloads are derived from (seed, cycle,
+// message index) rather than a random source — reproducible given the
+// same cycle, though which payloads a run actually sends depends on how
+// many cycles the budget allowed.
 
 const
   StressEchoWorkerCount = 28;
@@ -275,11 +387,20 @@ type
     procedure HandleClose(AConn: TWSConnection);
     procedure PushToConn(AConn: TWSConnection);
     procedure PushSweep;
+    procedure Clear;
   end;
 
   TStressWorker = class(TThread)
   public
-    Deadline: QWord;
+    // Points at the main thread's deadline, written immediately after
+    // the last worker starts so the wall-clock budget covers the window
+    // in which every worker is actually running (a worker scheduled late
+    // would otherwise burn its budget before its first cycle). Read per
+    // iteration. Unsynchronised on purpose: the single write moves the
+    // deadline a millisecond or two, so even the torn read a 32-bit leg
+    // could see yields one of the two neighbouring values — and the
+    // cycle caps bound the loops regardless of what it reads.
+    DeadlinePtr: PQWord;
     Cycles: Integer;
     Ok: Boolean;
     FailMsg: string;
@@ -297,6 +418,15 @@ type
     Seed: Integer;
     Url: string;
     Pushes: Integer;
+    // Push-stream correctness is tracked apart from echo correctness so
+    // a serial violation composes into the push check instead of failing
+    // the echo check line.
+    PushOk: Boolean;
+    PushFailMsg: string;
+    // Decremented on exit; the pusher and the drop workers use it to
+    // leave once there is no echo traffic left to race.
+    LiveEchoPtr: PLongInt;
+    procedure MarkPushFailed(const AMsg: string);
     procedure Execute; override;
   end;
 
@@ -304,13 +434,20 @@ type
   public
     Seed: Integer;
     Port: Word;
+    // Caught transient failures (loopback churn). Reported, not fatal —
+    // only a consecutive streak fails the worker.
+    TransientTotal: Integer;
+    LiveEchoPtr: PLongInt;
     procedure Execute; override;
   end;
 
   TStressPusher = class(TThread)
   public
     Tracker: TStressTracker;
-    Deadline: QWord;
+    DeadlinePtr: PQWord;
+    LiveEchoPtr: PLongInt;
+    Ok: Boolean;
+    FailMsg: string;
     procedure Execute; override;
   end;
 
@@ -323,7 +460,11 @@ type
   // hard-exit.
   TStressWatchdog = class(TThread)
   public
-    Done: PBoolean; // written by the main thread, polled here
+    // Written by the main thread, polled here. No atomics: the poll loop
+    // reloads it after Sleep, an opaque call the compiler cannot hoist
+    // the load across, and a missed update costs at most one 250 ms
+    // slice — the flag only ever transitions False -> True.
+    Done: PBoolean;
     Srv: TThread;   // the server thread, for FatalException on expiry
     // Last phase marker the main thread recorded. ShortString on
     // purpose: value semantics, no refcounted heap pointer, so a torn
@@ -352,6 +493,13 @@ begin
         FreeAndNil(Result);
         if Attempt >= StressConnectAttempts then raise;
         Sleep(10 * Attempt);
+      end;
+      // Anything else is not a retryable connect failure, but the client
+      // is still ours until it is returned — free it, then let it out.
+      on E: Exception do
+      begin
+        FreeAndNil(Result);
+        raise;
       end;
     end;
   until False;
@@ -432,6 +580,22 @@ begin
   end;
 end;
 
+// TWSServer.Destroy tears the registry down directly and never fires
+// OnClientClose, so entries the tracker still holds would dangle past
+// the server's free. Nothing reads them afterwards today (the pusher is
+// long joined), but a tracker outliving the server must not be left
+// pointing at freed connections.
+procedure TStressTracker.Clear;
+begin
+  FLock.Acquire;
+  try
+    FConns := nil;
+    FCount := 0;
+  finally
+    FLock.Release;
+  end;
+end;
+
 { TStressWorker }
 
 procedure TStressWorker.MarkFailed(const AMsg: string);
@@ -444,6 +608,15 @@ begin
 end;
 
 { TStressEchoWorker }
+
+procedure TStressEchoWorker.MarkPushFailed(const AMsg: string);
+begin
+  if PushOk then
+  begin
+    PushOk := False;
+    PushFailMsg := AMsg;
+  end;
+end;
 
 function TStressEchoWorker.BuildPayload(AMsgIdx: Integer): TBytes;
 var
@@ -472,7 +645,7 @@ begin
       end;
   if Colon < 2 then
   begin
-    MarkFailed('malformed push frame');
+    MarkPushFailed('malformed push frame');
     Exit;
   end;
   SetLength(SerialText, Colon - 1);
@@ -480,15 +653,17 @@ begin
   Serial := StrToInt64Def(SerialText, -1);
   if Serial <> Int64(FNextPushSerial) then
   begin
-    MarkFailed(Format('push serial %s, expected %d',
+    MarkPushFailed(Format('push serial %s, expected %d',
       [SerialText, Int64(FNextPushSerial)]));
+    // Resynchronise so one gap reports once instead of cascading.
+    if Serial >= 0 then FNextPushSerial := NativeUInt(Serial) + 1;
     Exit;
   end;
   if (Length(AData) - Colon - 1 <> Length(StressPushTail)) or
     not CompareMem(@AData[Colon + 1], @StressPushTail[1],
       Length(StressPushTail)) then
   begin
-    MarkFailed('push tail corrupt');
+    MarkPushFailed('push tail corrupt');
     Exit;
   end;
   Inc(FNextPushSerial);
@@ -501,9 +676,10 @@ procedure TStressEchoWorker.EchoRound(ACli: TWSClient; ACount: Integer;
   var AMsgIdx: Integer);
 var
   Sent: array of TBytes;
-  I, GotCount, StallMs: Integer;
+  I, GotCount: Integer;
   IsText: Boolean;
   Data: TBytes;
+  LastEchoTick: QWord;
 begin
   SetLength(Sent, ACount);
   for I := 0 to ACount - 1 do
@@ -512,31 +688,36 @@ begin
     ACli.SendBinary(@Sent[I][0], Length(Sent[I]));
   end;
   GotCount := 0;
-  StallMs := 0;
+  // Wall clock since the last *echo*, not since the last message of any
+  // kind: the pusher keeps text arriving on this connection throughout,
+  // so a stall clock that any message resets — or one that only ticks on
+  // read timeouts, which pushes prevent from ever happening — would let
+  // a wedged echo stream hide behind live push traffic forever.
+  LastEchoTick := GetTickCount64;
   while Ok and (GotCount < ACount) do
+  begin
     case ACli.ReadMessage(IsText, Data, StressReadSliceMs) of
       wrrMessage:
+        if IsText then
+          VerifyPush(Data)
+        else
         begin
-          StallMs := 0;
-          if IsText then
-            VerifyPush(Data)
-          else if (Length(Data) <> Length(Sent[GotCount])) or
+          LastEchoTick := GetTickCount64;
+          if (Length(Data) <> Length(Sent[GotCount])) or
             not CompareMem(@Data[0], @Sent[GotCount][0], Length(Data)) then
             MarkFailed(Format('echo corrupt (cycle %d, message %d)',
               [Cycles, AMsgIdx + GotCount]))
           else
             Inc(GotCount);
         end;
-      wrrTimeout:
-        begin
-          Inc(StallMs, StressReadSliceMs);
-          if StallMs >= StressStallLimitMs then
-            MarkFailed('echo stream stalled');
-        end;
+      wrrTimeout: ; // nothing readable this slice; the clock below judges
       wrrClosed:
         MarkFailed(Format('connection closed mid-echo (code %d)',
           [ACli.CloseCode]));
     end;
+    if GetTickCount64 - LastEchoTick >= StressStallLimitMs then
+      MarkFailed('echo stream stalled');
+  end;
   Inc(AMsgIdx, ACount);
 end;
 
@@ -546,10 +727,12 @@ var
   MsgIdx: Integer;
 begin
   Ok := True;
+  PushOk := True;
   try
-    while Ok and (GetTickCount64 < Deadline) and
-      (Cycles < StressEchoCycleCap) do
-    begin
+    // repeat, not while: however late this thread is scheduled, it
+    // completes at least one cycle, so Cycles = 0 means the worker never
+    // ran rather than "the budget was already spent when it woke up".
+    repeat
       Cli := StressConnect(Url);
       try
         FNextPushSerial := 0;
@@ -568,11 +751,13 @@ begin
         Cli.Free;
       end;
       Inc(Cycles);
-    end;
+    until (not Ok) or (GetTickCount64 >= DeadlinePtr^) or
+      (Cycles >= StressEchoCycleCap);
   except
     on E: Exception do
       MarkFailed(E.ClassName + ': ' + E.Message);
   end;
+  InterlockedDecrement(LiveEchoPtr^);
 end;
 
 { TStressDropWorker }
@@ -591,9 +776,7 @@ begin
   // starve the shared loopback port range across runs.
   HardClose.OnOff := 1;
   HardClose.Seconds := 0;
-  while Ok and (GetTickCount64 < Deadline) and
-    (Cycles < StressDropCycleCap) do
-  begin
+  repeat
     try
       Fd := RawConnect(Port);
       try
@@ -604,9 +787,11 @@ begin
         begin
           // Two echoes in flight when the socket dies; odd cycles die
           // straight after the 101 so teardown races the open path too.
+          // A send that fails just means this peer died first — that
+          // ends the cycle, it is not a battery failure.
           Payload := 'abrupt-' + IntToStr(Seed) + '-' + IntToStr(Cycles);
-          RawSendFrame(Fd, WS_OP_BINARY, Payload, True);
-          RawSendFrame(Fd, WS_OP_BINARY, Payload, True);
+          if RawSendFrame(Fd, WS_OP_BINARY, Payload, True) then
+            RawSendFrame(Fd, WS_OP_BINARY, Payload, True);
         end;
         // No closing handshake: the RST lands while the echoes (and any
         // pushes) are still in flight server-side.
@@ -621,22 +806,40 @@ begin
         // Loopback churn can drop the odd SYN or handshake read; only a
         // persistent streak is a failure.
         Inc(Transient);
+        Inc(TransientTotal);
         if Transient >= StressConnectAttempts then
           MarkFailed(E.ClassName + ': ' + E.Message);
       end;
     end;
     Sleep(StressDropPauseMs);
-  end;
+    // Once the last echo worker is gone there is no live traffic left to
+    // drop against; the deadline stays the upper bound.
+  until (not Ok) or (GetTickCount64 >= DeadlinePtr^) or
+    (Cycles >= StressDropCycleCap) or (LiveEchoPtr^ <= 0);
 end;
 
 { TStressPusher }
 
 procedure TStressPusher.Execute;
 begin
-  while (not Terminated) and (GetTickCount64 < Deadline) do
-  begin
-    Tracker.PushSweep;
-    Sleep(1);
+  Ok := True;
+  // Same guard as the other workers: an exception here would otherwise
+  // sit in FatalException and read as a silent no-push run.
+  try
+    // Sweeping past the last echo worker's exit only pushes into the
+    // linger connections; the deadline stays the upper bound.
+    while (not Terminated) and (GetTickCount64 < DeadlinePtr^) and
+      (LiveEchoPtr^ > 0) do
+    begin
+      Tracker.PushSweep;
+      Sleep(1);
+    end;
+  except
+    on E: Exception do
+    begin
+      Ok := False;
+      FailMsg := E.ClassName + ': ' + E.Message;
+    end;
   end;
 end;
 
@@ -662,7 +865,16 @@ begin
   else
     WriteLn('       server thread alive (no FatalException)');
   Flush(Output);
-  Halt(2);
+  // Raw process exit, not Halt: Halt runs unit finalization on this
+  // secondary thread while the main thread is wedged inside the very
+  // subsystem being finalized — the watchdog would hang exactly where
+  // it is supposed to cut through. The diagnostics above are already
+  // flushed, so there is nothing left worth unwinding for.
+  {$ifdef WINDOWS}
+  ExitProcess(2);
+  {$else}
+  fpExit(2);
+  {$endif}
 end;
 
 // ---------------------------------------------------------------------------
@@ -692,12 +904,24 @@ var
   EchoWorkers: array[0..StressEchoWorkerCount - 1] of TStressEchoWorker;
   DropWorkers: array[0..StressDropWorkerCount - 1] of TStressDropWorker;
   Linger: array[0..StressLingerCount - 1] of TWSClient;
+  LingerOk: array[0..StressLingerCount - 1] of Boolean;
+  LingerVerified: Integer;
+  LingerBad: string;
   Deadline: QWord;
+  LiveEcho: LongInt;
   Watchdog: TStressWatchdog;
   StressDone: Boolean;
   StressPhase: ShortString;
-  TotalCycles, TotalPushes, TotalDrops: Integer;
-  AllOk: Boolean;
+  TotalCycles, TotalPushes, TotalDrops, TotalTransient: Integer;
+  AllOk, PushAllOk: Boolean;
+  // Plain-request section
+  PlainHost: TPlainHost;
+  PlainSrvT: TServerThread;
+  PlainPort: Word;
+  PlainReq, PlainGot, PlainWant, PlainRaw: RawByteString;
+  PlainHits, PlainHitsBefore: Integer;
+  Eof: Boolean;
+  ReadRes: TWSReadResult;
 begin
   Echo := TEcho.Create;
   Tracker := TStressTracker.Create;
@@ -715,6 +939,19 @@ begin
   WriteLn('server on ', Port);
   Flush(Output);
   LastTick := GetTickCount64;
+
+  // The watchdog covers the whole battery, not just the storm: every
+  // section before it also blocks in unbounded Connect/ReadMessage calls
+  // that a wedged accept path would hang forever. Same overall bound —
+  // it simply starts counting at the first connect instead of the last
+  // section, and the phase marker says where the process got stuck.
+  StressDone := False;
+  StressPhase := 'single-connection sections';
+  Watchdog := TStressWatchdog.Create(True);
+  Watchdog.Done := @StressDone;
+  Watchdog.Srv := SrvT;
+  Watchdog.Phase := @StressPhase;
+  Watchdog.Start;
 
   // --- duetto client vs duetto server ---------------------------------------
   Cli := TWSClient.Create;
@@ -754,6 +991,35 @@ begin
   Check(Cli.CloseCode = 1000, 'clean close echoes 1000');
   Cli.Free;
 
+  // --- bounded ReadMessage (ws:// only) -----------------------------------
+  StressPhase := 'bounded-read section';
+  Cli := TWSClient.Create;
+  Cli.Connect(Url);
+  // Nothing in flight: the bounded form must come back and say so. Only
+  // the outcome is asserted — how quickly it returns is not a contract.
+  Check(Cli.ReadMessage(IsText, Data, 200) = wrrTimeout,
+    'bounded read on an idle stream reports wrrTimeout');
+
+  // ATimeoutMs = 0 is a pure poll, never a wait, so it keeps reporting
+  // wrrTimeout until the echo has actually landed in the queue. Polling
+  // until it does is what proves the queued case returns wrrTimeout's
+  // opposite without the call ever blocking.
+  Cli.SendText(HelloProbe);
+  Deadline := GetTickCount64 + StressStallLimitMs;
+  repeat
+    ReadRes := Cli.ReadMessage(IsText, Data, 0);
+    if ReadRes = wrrTimeout then Sleep(1);
+  until (ReadRes <> wrrTimeout) or (GetTickCount64 >= Deadline);
+  Check((ReadRes = wrrMessage) and IsText and
+    (Length(Data) = Length(HelloProbe)) and
+    CompareMem(@Data[0], @HelloProbe[1], Length(HelloProbe)),
+    'zero-timeout read polls, then delivers the queued message');
+
+  Cli.Close(1000, '');
+  Check(Cli.ReadMessage(IsText, Data, 200) = wrrClosed,
+    'bounded read after a clean close reports wrrClosed');
+  Cli.Free;
+
   // --- permessage-deflate over the wire ----------------------------------
   Cli := TWSClient.Create;
   Cli.Connect(Url, True);
@@ -769,6 +1035,7 @@ begin
   Cli.Free;
 
   // --- raw-socket violations ---------------------------------------------
+  StressPhase := 'violation sections';
   // A client frame without a mask: MUST fail the connection, 1002 (§5.1).
   Fd := RawConnect(Port);
   Left := RawHandshake(Fd);
@@ -803,38 +1070,120 @@ begin
   CloseSocket(Fd);
   Check(Code = 1007, 'invalid UTF-8 text -> close 1007');
 
+  // --- plain HTTP on the WebSocket port (OnPlainRequest) ------------------
+  // A second, short-lived server carries the hook: the fallback is
+  // opt-in, so the main instance must stay hook-less for the refusal
+  // check at the end of this section to mean anything.
+  StressPhase := 'plain-request section';
+  PlainHost := TPlainHost.Create;
+  PlainSrvT := TServerThread.Create(True);
+  PlainSrvT.Srv := TWSServer.Create(0, True);
+  PlainSrvT.Srv.OnPlainRequest := PlainHost.Answer;
+  PlainPort := PlainSrvT.Srv.Port;
+  PlainSrvT.Start;
+
+  // GET: the hook's bytes reach the wire verbatim, and the connection is
+  // closed behind them — single-shot, no keep-alive.
+  Fd := RawConnect(PlainPort);
+  PlainReq := 'GET / HTTP/1.1'#13#10'Host: 127.0.0.1'#13#10#13#10;
+  fpSend(Fd, @PlainReq[1], Length(PlainReq), 0);
+  PlainGot := RawReadToEof(Fd, Eof);
+  CloseSocket(Fd);
+  Check((PlainGot = PlainResponse('GET', '/')) and Eof,
+    'plain GET answered by the hook byte-for-byte, then EOF');
+
+  // HEAD is eligible too (body-less by definition).
+  Fd := RawConnect(PlainPort);
+  PlainReq := 'HEAD /head HTTP/1.1'#13#10'Host: 127.0.0.1'#13#10#13#10;
+  fpSend(Fd, @PlainReq[1], Length(PlainReq), 0);
+  PlainGot := RawReadToEof(Fd, Eof);
+  CloseSocket(Fd);
+  Check((PlainGot = PlainResponse('HEAD', '/head')) and Eof,
+    'plain HEAD reaches the hook');
+
+  // A request advertising a body is never eligible, hook or no hook: the
+  // standard refusal, and the hook is not consulted at all.
+  PlainHost.Snapshot(PlainHitsBefore, PlainRaw);
+  Fd := RawConnect(PlainPort);
+  PlainReq := 'POST / HTTP/1.1'#13#10'Host: 127.0.0.1'#13#10 +
+    'Content-Length: 0'#13#10#13#10;
+  fpSend(Fd, @PlainReq[1], Length(PlainReq), 0);
+  PlainGot := RawReadToEof(Fd, Eof);
+  CloseSocket(Fd);
+  PlainHost.Snapshot(PlainHits, PlainRaw);
+  Check((Copy(PlainGot, 1, 12) = 'HTTP/1.1 400') and
+    (PlainHits = PlainHitsBefore),
+    'plain POST advertising a body refused 400, hook not consulted');
+
+  // Two complete requests in one segment. Single-shot means exactly one
+  // response and then EOF; the pipelined request is discarded, and the
+  // hook is handed only the request block that completed — never the
+  // bytes trailing it.
+  PlainHost.Snapshot(PlainHitsBefore, PlainRaw);
+  Fd := RawConnect(PlainPort);
+  PlainReq := 'GET / HTTP/1.1'#13#10'Host: 127.0.0.1'#13#10#13#10 +
+    'GET /second HTTP/1.1'#13#10'Host: 127.0.0.1'#13#10#13#10;
+  fpSend(Fd, @PlainReq[1], Length(PlainReq), 0);
+  PlainGot := RawReadToEof(Fd, Eof);
+  CloseSocket(Fd);
+  PlainHost.Snapshot(PlainHits, PlainRaw);
+  Check((PlainGot = PlainResponse('GET', '/')) and Eof and
+    (PlainHits = PlainHitsBefore + 1) and (Pos('/second', PlainRaw) = 0),
+    'pipelined plain requests: one response, the second discarded');
+
+  StressPhase := 'plain-request section: teardown';
+  PlainSrvT.Terminate;
+  PlainSrvT.Srv.Stop;
+  PlainSrvT.WaitFor;
+  PlainSrvT.Srv.Free;
+  PlainSrvT.Free;
+  PlainHost.Free;
+
+  // Unset hook (the main server): the same request gets the refusal.
+  Fd := RawConnect(Port);
+  PlainReq := 'GET / HTTP/1.1'#13#10'Host: 127.0.0.1'#13#10#13#10;
+  fpSend(Fd, @PlainReq[1], Length(PlainReq), 0);
+  PlainGot := RawReadToEof(Fd, Eof);
+  CloseSocket(Fd);
+  Check(Copy(PlainGot, 1, 12) = 'HTTP/1.1 400',
+    'plain GET refused 400 when no hook is set');
+
   // --- concurrent-connections stress -------------------------------------
-  StressDone := False;
   StressPhase := 'storm';
-  Watchdog := TStressWatchdog.Create(True);
-  Watchdog.Done := @StressDone;
-  Watchdog.Srv := SrvT;
-  Watchdog.Phase := @StressPhase;
-  Watchdog.Start;
+  // The budget is a floor under the window in which all 33 threads are
+  // live, so it is taken after the last Start below — not here, where a
+  // worker scheduled 200 ms late would find its budget already spent and
+  // record zero cycles. Seeded now only so the value is never garbage.
   Deadline := GetTickCount64 + StressBudgetMs;
+  LiveEcho := StressEchoWorkerCount;
   for I := 0 to High(EchoWorkers) do
   begin
     EchoWorkers[I] := TStressEchoWorker.Create(True);
     EchoWorkers[I].Seed := I;
     EchoWorkers[I].Url := Url;
-    EchoWorkers[I].Deadline := Deadline;
+    EchoWorkers[I].DeadlinePtr := @Deadline;
+    EchoWorkers[I].LiveEchoPtr := @LiveEcho;
   end;
   for I := 0 to High(DropWorkers) do
   begin
     DropWorkers[I] := TStressDropWorker.Create(True);
     DropWorkers[I].Seed := I;
     DropWorkers[I].Port := Port;
-    DropWorkers[I].Deadline := Deadline;
+    DropWorkers[I].DeadlinePtr := @Deadline;
+    DropWorkers[I].LiveEchoPtr := @LiveEcho;
   end;
   Pusher := TStressPusher.Create(True);
   Pusher.Tracker := Tracker;
-  Pusher.Deadline := Deadline;
+  Pusher.DeadlinePtr := @Deadline;
+  Pusher.LiveEchoPtr := @LiveEcho;
 
   for I := 0 to High(EchoWorkers) do
     EchoWorkers[I].Start;
   for I := 0 to High(DropWorkers) do
     DropWorkers[I].Start;
   Pusher.Start;
+  // Every thread now exists; start the clock they all read.
+  Deadline := GetTickCount64 + StressBudgetMs;
 
   for I := 0 to High(EchoWorkers) do
     EchoWorkers[I].WaitFor;
@@ -844,11 +1193,17 @@ begin
   Pusher.WaitFor; // no Post may race the server teardown below
 
   AllOk := True;
+  PushAllOk := True;
   TotalCycles := 0;
   TotalPushes := 0;
   for I := 0 to High(EchoWorkers) do
   begin
-    AllOk := AllOk and EchoWorkers[I].Ok and (EchoWorkers[I].Cycles > 0);
+    // Every worker completes a cycle unless it never ran at all — say so
+    // rather than failing the line with an empty diagnostic.
+    if EchoWorkers[I].Cycles = 0 then
+      EchoWorkers[I].MarkFailed('worker completed no cycles');
+    AllOk := AllOk and EchoWorkers[I].Ok;
+    PushAllOk := PushAllOk and EchoWorkers[I].PushOk;
     Inc(TotalCycles, EchoWorkers[I].Cycles);
     Inc(TotalPushes, EchoWorkers[I].Pushes);
   end;
@@ -859,19 +1214,40 @@ begin
     if not EchoWorkers[I].Ok then
       WriteLn('       echo worker ', I, ': ', EchoWorkers[I].FailMsg);
 
-  Check(TotalPushes > 0, Format(
+  // Push correctness is the push check's business: a serial violation
+  // shows up here, not folded into the echo line above.
+  Check(PushAllOk and (TotalPushes > 0), Format(
     'stress: %d pushes interleaved, serials consecutive per connection',
     [TotalPushes]));
+  for I := 0 to High(EchoWorkers) do
+    if not EchoWorkers[I].PushOk then
+      WriteLn('       echo worker ', I, ' push stream: ',
+        EchoWorkers[I].PushFailMsg);
+  if not Pusher.Ok then
+    WriteLn('       pusher thread: ', Pusher.FailMsg);
+  if Pusher.FatalException <> nil then
+    WriteLn('       pusher thread died: ',
+      Exception(Pusher.FatalException).Message);
+  Check(Pusher.Ok and (Pusher.FatalException = nil),
+    'stress: pusher thread survived the storm');
 
   AllOk := True;
   TotalDrops := 0;
+  TotalTransient := 0;
   for I := 0 to High(DropWorkers) do
   begin
-    AllOk := AllOk and DropWorkers[I].Ok and (DropWorkers[I].Cycles > 0);
+    if DropWorkers[I].Cycles = 0 then
+      DropWorkers[I].MarkFailed('worker completed no cycles');
+    AllOk := AllOk and DropWorkers[I].Ok;
     Inc(TotalDrops, DropWorkers[I].Cycles);
+    Inc(TotalTransient, DropWorkers[I].TransientTotal);
   end;
-  Check(AllOk, Format('stress: %d abrupt drops absorbed mid-traffic',
-    [TotalDrops]));
+  // Transient failures are reported, not asserted on: loopback churn
+  // makes the odd connect or handshake read fail, and only a consecutive
+  // streak (the 5-in-a-row rule in the worker) fails the battery.
+  Check(AllOk, Format(
+    'stress: %d abrupt drops absorbed mid-traffic (%d transient retries)',
+    [TotalDrops, TotalTransient]));
   for I := 0 to High(DropWorkers) do
     if not DropWorkers[I].Ok then
       WriteLn('       drop worker ', I, ': ', DropWorkers[I].FailMsg);
@@ -886,24 +1262,43 @@ begin
   // connections open so the teardown below is a Shutdown with live
   // connections — the drain must complete and the process exit cleanly.
   StressPhase := 'storm joined; workers freed';
-  Ok := True;
-  for I := 0 to High(Linger) do
-  begin
-    StressPhase := 'linger connect ' + IntToStr(I);
-    Linger[I] := StressConnect(Url);
-    StressPhase := 'linger send ' + IntToStr(I);
-    Linger[I].SendText(LingerProbe);
+  LingerVerified := 0;
+  LingerBad := '';
+  // Runs on the main thread, so a connect that exhausts its retries
+  // would abort the process before the summary; catch it and turn it
+  // into the failure this check exists to report.
+  try
+    for I := 0 to High(Linger) do
+    begin
+      StressPhase := 'linger connect ' + IntToStr(I);
+      Linger[I] := StressConnect(Url);
+      StressPhase := 'linger send ' + IntToStr(I);
+      Linger[I].SendText(LingerProbe);
+    end;
+    // Every connection is read and judged on its own: a short-circuit
+    // would leave the later reads unrun while claiming all of them.
+    for I := 0 to High(Linger) do
+    begin
+      StressPhase := 'linger read ' + IntToStr(I);
+      LingerOk[I] := (Linger[I].ReadMessage(IsText, Data,
+        StressStallLimitMs) = wrrMessage) and IsText and
+        (Length(Data) = Length(LingerProbe)) and
+        CompareMem(@Data[0], @LingerProbe[1], Length(LingerProbe));
+      if LingerOk[I] then
+        Inc(LingerVerified)
+      else
+        LingerBad := LingerBad + ' ' + IntToStr(I);
+    end;
+    if LingerBad <> '' then
+      WriteLn('       linger connections that did not echo:', LingerBad);
+    Check(LingerVerified = StressLingerCount, Format(
+      'stress: server healthy after the storm, %d/%d connections echoed ' +
+      'and held open', [LingerVerified, StressLingerCount]));
+  except
+    on E: Exception do
+      Check(False, 'stress: server healthy after the storm (' +
+        E.Message + ')');
   end;
-  for I := 0 to High(Linger) do
-  begin
-    StressPhase := 'linger read ' + IntToStr(I);
-    Ok := Ok and (Linger[I].ReadMessage(IsText, Data, StressStallLimitMs) =
-      wrrMessage) and IsText and (Length(Data) = Length(LingerProbe)) and
-      CompareMem(@Data[0], @LingerProbe[1], Length(LingerProbe));
-  end;
-  Check(Ok, Format(
-    'stress: server healthy after the storm, %d connections held open',
-    [StressLingerCount]));
 
   StressPhase := 'teardown: stop + waitfor';
   SrvT.Terminate;
@@ -915,10 +1310,27 @@ begin
   if SrvT.FatalException <> nil then
     WriteLn('       server thread died: ',
       Exception(SrvT.FatalException).Message);
+  Check(SrvT.FatalException = nil, 'stress: server thread survived the storm');
+  // TWSServer.Destroy tears its registry down without firing
+  // OnClientClose, so the tracker would keep pointers to connections the
+  // free below reclaims. Drop them while they are still valid.
+  Tracker.Clear;
   StressPhase := 'teardown: server free (shutdown drain)';
   SrvT.Srv.Free; // Shutdown quiesces and drains with the linger conns open
   SrvT.Free;
-  Check(True, 'stress: shutdown with live connections drained cleanly');
+  // The drain is only "clean" if the peers actually saw it: Destroy
+  // frees registry connections without a closing handshake, so each
+  // linger client should observe abrupt closure — wrrClosed, with no
+  // close code to assert.
+  Ok := True;
+  for I := 0 to High(Linger) do
+  begin
+    StressPhase := 'teardown: linger closure ' + IntToStr(I);
+    Ok := Ok and (Linger[I] <> nil) and
+      (Linger[I].ReadMessage(IsText, Data, StressStallLimitMs) = wrrClosed);
+  end;
+  Check(Ok, Format('stress: shutdown with %d live connections drained ' +
+    'cleanly, every peer saw the close', [StressLingerCount]));
   StressDone := True;
   Watchdog.WaitFor; // exits within one 250 ms poll slice
   Watchdog.Free;

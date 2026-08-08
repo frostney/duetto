@@ -1,11 +1,14 @@
 { WS.Transport.PostQueue.Test — the queue is the only piece of the
   cross-thread Post machinery that is platform-neutral, so it gets the
   direct coverage: FIFO order, drain ownership, the Stop rendezvous
-  (pending nodes handed back exactly once, later pushes refused), and a
-  hammering multi-producer run asserting mutual exclusion plus
-  per-producer order — the ordering guarantee TWSConnection.Post
-  documents. Transport delivery on top of it is exercised by wsinterop
-  over real sockets. }
+  (pending nodes handed back exactly once, later pushes refused), and two
+  hammering multi-producer runs that assert the observable properties the
+  locking exists for — no accepted push is lost or duplicated, and each
+  producer's sequence arrives in exactly the order it pushed (the
+  ordering guarantee TWSConnection.Post documents). Mutual exclusion is
+  never asserted directly, only through those consequences. Transport
+  delivery on top of the queue is exercised by wsinterop over real
+  sockets. }
 
 program WS.Transport.PostQueue.Test;
 
@@ -42,6 +45,20 @@ type
     ProducerId: NativeUInt;
     Count: Integer;
     Accepted: Integer;
+    procedure Execute; override;
+  end;
+
+  // Pushes its sequence until the queue refuses, so Stop is guaranteed a
+  // live producer to race. Cap is a runaway guard, not the expected exit.
+  TRacingPusherThread = class(TThread)
+  public
+    Queue: TWSPostQueue;
+    ProducerId: NativeUInt;
+    Cap: Integer;
+    // Published with InterlockedIncrement so the main thread can watch
+    // the producers spin up before it lands Stop; final after WaitFor.
+    Accepted: LongInt;
+    HitCap: Boolean;
     procedure Execute; override;
   end;
 
@@ -169,6 +186,25 @@ begin
       Inc(Accepted);
 end;
 
+procedure TRacingPusherThread.Execute;
+var
+  Seq: Integer;
+begin
+  Accepted := 0;
+  HitCap := False;
+  // Sequence and counter move in lockstep, so the accepted sequences are
+  // exactly 0 .. Accepted-1 — the property the Stop chain is checked
+  // against.
+  Seq := 0;
+  while Seq < Cap do
+  begin
+    if not Queue.Push(ProducerId, Pointer(PtrUInt(Seq))) then Exit;
+    Inc(Seq);
+    InterlockedIncrement(Accepted);
+  end;
+  HitCap := True;
+end;
+
 procedure TPostQueueConcurrency.TestPerProducerOrderUnderContention;
 const
   Producers = 4;
@@ -178,8 +214,8 @@ var
   Threads: array[0..Producers - 1] of TPusherThread;
   NextSeq: array[0..Producers - 1] of PtrUInt;
   Node, Head, Next: PWSPostNode;
-  I, Total: Integer;
-  OrderOk: Boolean;
+  I, Producer, Total: Integer;
+  OrderOk, AcceptedOk: Boolean;
   Deadline: QWord;
 begin
   Q := TWSPostQueue.Create;
@@ -216,21 +252,27 @@ begin
       while Node <> nil do
       begin
         Inc(Total);
-        I := Integer(Node^.ConnId);
-        OrderOk := OrderOk and (PtrUInt(Node^.Data) = NextSeq[I]);
-        Inc(NextSeq[I]);
+        Producer := Integer(Node^.ConnId);
+        OrderOk := OrderOk and (PtrUInt(Node^.Data) = NextSeq[Producer]);
+        Inc(NextSeq[Producer]);
         Next := Node^.Next;
         Dispose(Node);
         Node := Next;
       end;
     end;
 
+    // Join and free every producer before asserting anything: a raised
+    // assertion here would otherwise skip the remaining joins and let
+    // the finally below free the queue under threads still pushing into
+    // it — a use-after-free instead of a red test.
+    AcceptedOk := True;
     for I := 0 to Producers - 1 do
     begin
       Threads[I].WaitFor;
-      Expect<Integer>(Threads[I].Accepted).ToBe(PerProducer);
+      AcceptedOk := AcceptedOk and (Threads[I].Accepted = PerProducer);
       Threads[I].Free;
     end;
+    Expect<Boolean>(AcceptedOk).ToBe(True);
     Expect<Integer>(Total).ToBe(Producers * PerProducer);
     Expect<Boolean>(OrderOk).ToBe(True);
     Expect<Boolean>(Q.Drain = nil).ToBe(True);
@@ -249,56 +291,108 @@ end;
 
 // The shutdown rendezvous property the transports lean on: with
 // producers pushing full-tilt, Stop splits every push into exactly two
-// fates — accepted (its node is in a drained chain or the Stop chain,
-// exactly once) or refused (the producer kept ownership; the node never
+// fates — accepted (its node is in the Stop chain, exactly once, in push
+// order) or refused (the producer kept ownership; the node never
 // appears). Nothing is lost, nothing arrives twice, nothing lands after
 // Stop.
+//
+// Both vacuous outcomes are designed out. The producers push until the
+// queue refuses rather than a fixed count, so they cannot finish before
+// Stop and leave the refusal path unexercised; and the main thread waits
+// for every producer to get well past a spin-up threshold before it
+// Stops, so Stop cannot land before the producers were scheduled. The
+// run is asserted to have ended by refusal, never by the runaway cap.
 procedure TPostQueueConcurrency.TestPushRacingStop;
 const
   Producers = 4;
-  PerProducer = 20000;
+  // Runaway guard only: reaching it means Stop never refused, which the
+  // HitCap assertion below turns into a red test.
+  PushCap = 500000;
+  SpinUpPushes = 1000;
+  SpinUpLimitMs = 30000;
 var
   Q: TWSPostQueue;
-  Threads: array[0..Producers - 1] of TPusherThread;
-  Node: PWSPostNode;
-  Head: PWSPostNode;
-  I, Delivered, AcceptedSum: Integer;
+  Threads: array[0..Producers - 1] of TRacingPusherThread;
+  NextSeq: array[0..Producers - 1] of PtrUInt;
+  Node, Head, Next: PWSPostNode;
+  I, Producer, Delivered, AcceptedSum: Integer;
+  SpunUp, ExactOk, RefusedOk, CountOk: Boolean;
+  Deadline: QWord;
 begin
   Q := TWSPostQueue.Create;
   try
     for I := 0 to Producers - 1 do
     begin
-      Threads[I] := TPusherThread.Create(True);
+      Threads[I] := TRacingPusherThread.Create(True);
       Threads[I].Queue := Q;
       Threads[I].ProducerId := NativeUInt(I);
-      Threads[I].Count := PerProducer;
+      Threads[I].Cap := PushCap;
+      NextSeq[I] := 0;
     end;
     for I := 0 to Producers - 1 do
       Threads[I].Start;
 
-    // Stop lands mid-flight; the producers keep hammering into the
-    // refusal path until they finish.
-    Sleep(5);
-    Delivered := 0;
-    Head := Q.Stop;
-    Node := Head;
-    while Node <> nil do
+    // Wait for every producer to be demonstrably mid-flight, then Stop.
+    SpunUp := False;
+    Deadline := GetTickCount64 + SpinUpLimitMs;
+    while (not SpunUp) and (GetTickCount64 < Deadline) do
     begin
-      Inc(Delivered);
-      Node := Node^.Next;
+      SpunUp := True;
+      for I := 0 to Producers - 1 do
+        SpunUp := SpunUp and (Threads[I].Accepted > SpinUpPushes);
+      if not SpunUp then Sleep(1);
     end;
-    FreeChain(Head);
+    Head := Q.Stop;
 
+    // Join and free every producer before asserting: an assertion that
+    // raised here would skip the remaining joins and let the finally
+    // below free the queue under live producers.
     AcceptedSum := 0;
+    RefusedOk := True;
     for I := 0 to Producers - 1 do
     begin
       Threads[I].WaitFor;
       Inc(AcceptedSum, Threads[I].Accepted);
-      Threads[I].Free;
+      RefusedOk := RefusedOk and not Threads[I].HitCap;
+      NextSeq[I] := 0;
     end;
-    // Every accepted push is in the Stop chain exactly once...
+
+    // No pre-Stop drain, so the Stop chain must hold every accepted
+    // push: per producer exactly the sequences 0 .. Accepted-1, each
+    // once, in push order. Walking it and expecting the next sequence
+    // per producer checks order, absence of loss and absence of
+    // duplication in one pass; the per-producer totals below close it.
+    Delivered := 0;
+    ExactOk := True;
+    Node := Head;
+    while Node <> nil do
+    begin
+      Inc(Delivered);
+      Producer := Integer(Node^.ConnId);
+      if (Producer < 0) or (Producer >= Producers) then
+        ExactOk := False
+      else
+      begin
+        ExactOk := ExactOk and (PtrUInt(Node^.Data) = NextSeq[Producer]);
+        Inc(NextSeq[Producer]);
+      end;
+      Next := Node^.Next;
+      Dispose(Node);
+      Node := Next;
+    end;
+    CountOk := True;
+    for I := 0 to Producers - 1 do
+      CountOk := CountOk and (NextSeq[I] = PtrUInt(Threads[I].Accepted));
+    for I := 0 to Producers - 1 do
+      Threads[I].Free;
+
+    Expect<Boolean>(SpunUp).ToBe(True);        // Stop landed mid-flight
+    Expect<Boolean>(RefusedOk).ToBe(True);     // ended by refusal, not cap
+    Expect<Boolean>(AcceptedSum > 0).ToBe(True);
     Expect<Integer>(Delivered).ToBe(AcceptedSum);
-    // ...and nothing leaks in after it.
+    Expect<Boolean>(ExactOk).ToBe(True);
+    Expect<Boolean>(CountOk).ToBe(True);
+    // Nothing leaks in after Stop.
     Expect<Boolean>(Q.Drain = nil).ToBe(True);
     Expect<Boolean>(Q.Stop = nil).ToBe(True);
   finally
