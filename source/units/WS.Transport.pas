@@ -12,7 +12,10 @@ unit WS.Transport;
 // Network.framework transport. Per-connection completions are always
 // serialized; completions for DIFFERENT connections may run
 // concurrently. Connection methods (SubmitSend, SubmitClose) are
-// callable only from that connection's callback context.
+// callable only from that connection's callback context. The two
+// cross-thread entry points are Stop and SubmitPost — the latter is
+// the scheduling hook that hands work to a connection's context from
+// any thread.
 //
 // Buffer rules: the pointer handed to OnData is transport-owned and
 // valid only for the duration of the callback. SubmitSend accepts up to
@@ -68,6 +71,13 @@ type
     ALen: NativeInt) of object;
   TWSTransportReadyEvent = procedure(AConn: TWSTransportConn) of object;
   TWSTransportClosedEvent = procedure(AConn: TWSTransportConn) of object;
+  // SubmitPost delivery. AConn <> nil: the target connection, on its
+  // execution context. AConn = nil: the post was dropped (connection
+  // gone or transport stopping) and fires on an unspecified context —
+  // the posting thread, the Run thread, or the Shutdown thread — so
+  // the handler may only reclaim AData there.
+  TWSTransportPostEvent = procedure(AConn: TWSTransportConn;
+    AData: Pointer) of object;
 
   // Server-side TLS for transports whose platform stack carries it
   // natively (Network.framework). Identity arrives as a PKCS#12 file —
@@ -85,6 +95,7 @@ type
     FOnData: TWSTransportDataEvent;
     FOnSendReady: TWSTransportReadyEvent;
     FOnClosed: TWSTransportClosedEvent;
+    FOnPost: TWSTransportPostEvent;
   protected
     procedure SetPort(AValue: Word);
   public
@@ -104,10 +115,21 @@ type
     // with no session attached.
     procedure Open; virtual;
 
+    // Thread-safe scheduling hook: deliver OnPost exactly once per
+    // call — with the live connection whose Id is AConnId, on that
+    // connection's execution context, serialized with its completions
+    // and in per-caller FIFO order; or with AConn = nil when the
+    // connection is already gone or the transport is stopping (see
+    // TWSTransportPostEvent for the dropped-delivery context). AData is
+    // opaque to the transport and is always handed back, so the caller
+    // can reclaim it. Pure scheduling: no bytes, no protocol.
+    procedure SubmitPost(AConnId: NativeUInt; AData: Pointer); virtual; abstract;
+
     // Quiesce: cancel every connection and block until no completion
     // can ever fire again. Must be called (with Run returned) before
     // the session frees its per-connection state; the transport frees
-    // its connection objects during the drain.
+    // its connection objects during the drain. Pending posts are
+    // dropped (delivered once with AConn = nil), never leaked.
     procedure Shutdown; virtual; abstract;
 
     // The bound port (kernel-assigned when the transport was created
@@ -118,6 +140,7 @@ type
     property OnData: TWSTransportDataEvent read FOnData write FOnData;
     property OnSendReady: TWSTransportReadyEvent read FOnSendReady write FOnSendReady;
     property OnClosed: TWSTransportClosedEvent read FOnClosed write FOnClosed;
+    property OnPost: TWSTransportPostEvent read FOnPost write FOnPost;
   end;
 
 function WSTransportNoTls: TWSTransportTls;

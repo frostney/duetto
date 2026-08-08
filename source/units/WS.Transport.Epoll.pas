@@ -23,7 +23,8 @@ uses
 
   Linux,
   Sockets,
-  WS.Transport;
+  WS.Transport,
+  WS.Transport.PostQueue;
 
 type
   TWSEpollTransport = class;
@@ -42,9 +43,10 @@ type
   TWSEpollTransport = class(TWSTransport)
   private
     FListenFd, FEpFd: Integer;
-    FWakeFd: Integer;          // eventfd; Stop() writes, Run() wakes
+    FWakeFd: Integer;          // eventfd; Stop()/SubmitPost write, Run() wakes
     FConns: array of TWSEpollConn;   // fd-indexed
     FRecv: TBytes;                   // shared read buffer
+    FPosts: TWSPostQueue;            // cross-thread SubmitPost hand-off
     FRunning: Boolean;
     FNextId: NativeUInt;
 
@@ -54,12 +56,14 @@ type
     procedure AcceptPending;
     procedure HandleReadable(AConn: TWSEpollConn);
     procedure RemoteClosed(AConn: TWSEpollConn);
+    procedure DeliverPosts(AChain: PWSPostNode; ADropped: Boolean);
   public
     constructor Create(APort: Word; const ATls: TWSTransportTls);
     destructor Destroy; override;
     procedure Run(ATimeoutMs: Integer = -1); override;
     procedure Stop; override;
     procedure Shutdown; override;
+    procedure SubmitPost(AConnId: NativeUInt; AData: Pointer); override;
   end;
 
 {$endif}
@@ -148,6 +152,7 @@ begin
   FListenFd := -1;
   FEpFd := -1;
   FWakeFd := -1;
+  FPosts := TWSPostQueue.Create;
   if ATls.Enabled then
     raise Exception.Create(
       'epoll transport has no TLS yet (tracked as lwpt#70: accept-side ' +
@@ -195,6 +200,7 @@ end;
 destructor TWSEpollTransport.Destroy;
 begin
   Shutdown;
+  FPosts.Free;
   if FWakeFd >= 0 then FileClose(FWakeFd);
   if FEpFd >= 0 then FileClose(FEpFd);
   if FListenFd >= 0 then CloseSocket(FListenFd);
@@ -202,15 +208,70 @@ begin
 end;
 
 // Single-threaded (the Run thread is the only execution context and Run
-// has returned by contract), so quiescing is just closing every
-// connection.
+// has returned by contract), so quiescing is closing every connection —
+// but first the post queue is stopped: pending posts are delivered once
+// as dropped (AConn = nil) so the session reclaims their envelopes, and
+// any SubmitPost racing us is refused at Push and dropped by its own
+// caller thread.
 procedure TWSEpollTransport.Shutdown;
 var
   I: Integer;
 begin
+  DeliverPosts(FPosts.Stop, True);
   for I := 0 to High(FConns) do
     if FConns[I] <> nil then
       FConns[I].SubmitClose;
+end;
+
+// Run-thread only (or Shutdown, with Run returned): serialized with
+// every other completion by construction. ADropped skips the conn
+// lookup so shutdown reclaims envelopes without touching connections.
+procedure TWSEpollTransport.DeliverPosts(AChain: PWSPostNode;
+  ADropped: Boolean);
+var
+  Node, Next: PWSPostNode;
+  Conn: TWSEpollConn;
+  I: Integer;
+begin
+  Node := AChain;
+  while Node <> nil do
+  begin
+    Conn := nil;
+    if not ADropped then
+      // The table is fd-indexed; posts are cold path, a scan is fine.
+      // Re-scanned per node: the previous OnPost may have torn any
+      // connection down.
+      for I := 0 to High(FConns) do
+        if (FConns[I] <> nil) and (FConns[I].Id = Node^.ConnId) then
+        begin
+          Conn := FConns[I];
+          Break;
+        end;
+    if Assigned(OnPost) then OnPost(Conn, Node^.Data);
+    Next := Node^.Next;
+    Dispose(Node);
+    Node := Next;
+  end;
+end;
+
+procedure TWSEpollTransport.SubmitPost(AConnId: NativeUInt; AData: Pointer);
+var
+  One: UInt64;
+begin
+  if not FPosts.Push(AConnId, AData) then
+  begin
+    // Stopped: dropped on the calling thread.
+    if Assigned(OnPost) then OnPost(nil, AData);
+    Exit;
+  end;
+  // Wake the reactor through the same eventfd Stop uses; Run drains the
+  // queue on the next round. (Without an eventfd — creation failed —
+  // delivery waits for the next readiness event, like Stop does.)
+  if FWakeFd >= 0 then
+  begin
+    One := 1;
+    fpWrite(FWakeFd, One, SizeOf(One));
+  end;
 end;
 
 procedure TWSEpollTransport.EpollMod(AFd: Integer; AEvents: Cardinal);
@@ -304,7 +365,11 @@ begin
       if Fd = FWakeFd then
       begin
         fpRead(FWakeFd, Wake, SizeOf(Wake)); // drain the counter
-        Continue; // the loop condition sees FRunning = False
+        // The eventfd serves two producers: Stop (the loop condition
+        // sees FRunning = False) and SubmitPost (deliver now, on this
+        // thread, serialized with every other completion).
+        DeliverPosts(FPosts.Drain, False);
+        Continue;
       end;
       if Fd = FListenFd then
       begin

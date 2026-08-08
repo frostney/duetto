@@ -31,6 +31,7 @@ once on protocol failure, after queueing the appropriate close frame
 | `WS.Protocol` | the sans-I/O machine above |
 | `WS.Client` | blocking client, `ws://` and `wss://` (TLS via lwpt's TransportSecurity) |
 | `WS.Transport` | the completion-shaped transport contract (ADR-0001): submit sends/closes, receive data/lifecycle completions on the transport's execution context (ADR-0003) |
+| `WS.Transport.PostQueue` | thread-safe FIFO behind the reactor transports' `SubmitPost` (cross-thread `Conn.Post` hand-off); the Network.framework transport posts straight onto its per-connection GCD queues instead |
 | `WS.Transport.Epoll` | Linux transport: nonblocking sockets, one shared 256 KB read buffer, `EPOLLOUT` armed only while a connection has backlog |
 | `WS.Transport.NetworkFramework` | macOS transport (ADR-0002): `nw_listener`/`nw_connection` C API, one serial dispatch queue per connection, native TLS via a PKCS#12 `SecIdentity` |
 | `WS.Transport.Iocp` | Windows transport: one completion-port thread, `AcceptEx`/`WSARecv`/`WSASend` always armed overlapped, copy-on-send, outstanding-operation pinning for deferred frees |

@@ -15,7 +15,8 @@ uses
   Windows,
 
   WinSock2,
-  WS.Transport;
+  WS.Transport,
+  WS.Transport.PostQueue;
 
 const
   IocpReceiveBufferSize = 64 * 1024;
@@ -64,6 +65,7 @@ type
     FNextId: NativeUInt;
     FLive: array of TWSIocpConn;
     FLiveCount: Integer;
+    FPosts: TWSPostQueue;      // cross-thread SubmitPost hand-off
     procedure ArmAccept;
     procedure Track(AConn: TWSIocpConn);
     procedure Untrack(AConn: TWSIocpConn);
@@ -72,6 +74,7 @@ type
     procedure HandleConnectionCompletion(AConn: TWSIocpConn;
       AOverlapped: POverlapped; ABytes: DWORD; ASucceeded: Boolean);
     procedure WaitAndDispatch(ATimeout: DWORD);
+    procedure DeliverPosts(AChain: PWSPostNode; ADropped: Boolean);
   public
     constructor Create(APort: Word; const ATls: TWSTransportTls);
     destructor Destroy; override;
@@ -79,6 +82,7 @@ type
     procedure Stop; override;
     procedure Open; override;
     procedure Shutdown; override;
+    procedure SubmitPost(AConnId: NativeUInt; AData: Pointer); override;
   end;
 
 {$endif}
@@ -95,6 +99,7 @@ const
   InfiniteWait = DWORD($FFFFFFFF);
   ListenerCompletionKey = PtrUInt(1);
   WakeCompletionKey = PtrUInt(2);
+  PostCompletionKey = PtrUInt(3); // SubmitPost wake: drain FPosts
   LiveTableGrowth = 64;
   AcceptAddressLength = SizeOf(TSockAddrIn) + 16;
 
@@ -264,6 +269,7 @@ begin
   inherited Create;
   FListenSocket := INVALID_SOCKET;
   FAcceptSocket := INVALID_SOCKET;
+  FPosts := TWSPostQueue.Create;
   if ATls.Enabled then
     raise Exception.Create(
       'iocp transport has no TLS yet (tracked as lwpt#70: accept-side ' +
@@ -307,6 +313,7 @@ end;
 destructor TWSIocpTransport.Destroy;
 begin
   Shutdown;
+  FPosts.Free;
   if FAcceptSocket <> INVALID_SOCKET then
     WinSock2.closesocket(FAcceptSocket);
   if FListenSocket <> INVALID_SOCKET then
@@ -489,6 +496,14 @@ begin
   Overlapped := nil;
   Succeeded := C_GetQueuedCompletionStatus(FCompletionPort, Bytes,
     CompletionKey, Overlapped, ATimeout);
+  // Post wakes carry a nil overlapped, so this check precedes the nil
+  // guard. (On timeout GetQueuedCompletionStatus leaves the key
+  // untouched — it stays the 0 initialized above.)
+  if CompletionKey = PostCompletionKey then
+  begin
+    DeliverPosts(FPosts.Drain, False);
+    Exit;
+  end;
   if Overlapped = nil then Exit;
   if (CompletionKey = ListenerCompletionKey) and
       (Overlapped = @FAcceptOverlapped) then
@@ -500,6 +515,63 @@ begin
       (CompletionKey = WakeCompletionKey) then Exit;
   Conn := TWSIocpConn(Pointer(CompletionKey));
   HandleConnectionCompletion(Conn, Overlapped, Bytes, Succeeded);
+end;
+
+// Completion-thread only (or Shutdown, with Run returned): serialized
+// with every other completion by construction. ADropped skips the conn
+// lookup so shutdown reclaims envelopes without touching connections.
+procedure TWSIocpTransport.DeliverPosts(AChain: PWSPostNode;
+  ADropped: Boolean);
+var
+  Node, Next: PWSPostNode;
+  Conn: TWSIocpConn;
+  I: Integer;
+begin
+  Node := AChain;
+  while Node <> nil do
+  begin
+    Conn := nil;
+    if not ADropped then
+      // Posts are cold path, a scan is fine. Re-scanned per node: the
+      // previous OnPost may have torn any connection down. FDead conns
+      // are pending finalize — the session has let go of them.
+      for I := 0 to FLiveCount - 1 do
+        if FLive[I].Id = Node^.ConnId then
+        begin
+          if not FLive[I].FDead then Conn := FLive[I];
+          Break;
+        end;
+    if Conn <> nil then
+    begin
+      // The posted proc may close the connection; pin the object across
+      // the callback like the accept path does.
+      Inc(Conn.FOutstanding);
+      if Assigned(OnPost) then OnPost(Conn, Node^.Data);
+      Dec(Conn.FOutstanding);
+      if Conn.FDead then Conn.TryFinalize;
+    end
+    else if Assigned(OnPost) then
+      OnPost(nil, Node^.Data);
+    Next := Node^.Next;
+    Dispose(Node);
+    Node := Next;
+  end;
+end;
+
+procedure TWSIocpTransport.SubmitPost(AConnId: NativeUInt; AData: Pointer);
+begin
+  if not FPosts.Push(AConnId, AData) then
+  begin
+    // Stopped: dropped on the calling thread.
+    if Assigned(OnPost) then OnPost(nil, AData);
+    Exit;
+  end;
+  // Wake the completion-port thread the same way Stop does. A Push that
+  // won the race against Shutdown but posts after the port closed is
+  // still safe: Shutdown stops the queue before closing the port, so
+  // that node was already reclaimed by the shutdown drain.
+  if FCompletionPort <> 0 then
+    C_PostQueuedCompletionStatus(FCompletionPort, 0, PostCompletionKey, nil);
 end;
 
 procedure TWSIocpTransport.Open;
@@ -539,6 +611,13 @@ begin
   FShutdownDone := True;
   FStopping := True;
   FRunning := False;
+
+  // Stop the post queue first: pending posts are delivered once as
+  // dropped (AConn = nil) so the session reclaims their envelopes, and
+  // any SubmitPost racing us is refused at Push and dropped by its own
+  // caller thread. Stale post wakes still in the port dequeue into an
+  // empty drain (harmless) or vanish with CloseHandle below.
+  DeliverPosts(FPosts.Stop, True);
 
   if FListenSocket <> INVALID_SOCKET then
   begin

@@ -15,6 +15,9 @@ unit WS.Server;
 // in user handlers needs the user's own synchronization. The hot path
 // here is confined to one connection and stays lock-free; the only lock
 // guards the connection registry on accept/close (cold path).
+// TWSConnection.Post is the one cross-thread hand-off: it schedules a
+// proc onto the connection's callback context via the transport seam,
+// so server-driven pushes need no locks of their own.
 
 {$I Shared.inc}
 
@@ -32,8 +35,14 @@ uses
 
 type
   TWSServer = class;
+  TWSConnection = class;
 
   TWSConnState = (wcsHandshake, wcsOpen, wcsClosing);
+
+  // FPC 3.2.2 has no anonymous methods ("reference to"), so a plain
+  // method pointer is the closure type: two raw pointers, nothing to
+  // heap-manage, and it carries the object state a push source needs.
+  TWSConnProc = procedure(AConn: TWSConnection) of object;
 
   TWSConnection = class
   private
@@ -48,14 +57,36 @@ type
   public
     UserData: Pointer;
     destructor Destroy; override;
-    // Callable from this connection's callback context (ADR-0003). If
-    // the transport reports the connection dead during the flush, the
-    // connection is dropped and freed before the call returns (no
-    // OnClientClose follows) — do not touch it afterwards. This matches
-    // the pre-seam reactor's semantics.
-    procedure SendText(P: PByte; ALen: NativeInt);
-    procedure SendBinary(P: PByte; ALen: NativeInt);
+    // Callable from this connection's callback context (ADR-0003).
+    // False = the transport reported the connection dead during the
+    // flush: the connection was dropped and freed before the call
+    // returned (no OnClientClose follows) and the reference is
+    // dangling — it must not be touched again. True = the connection
+    // is still alive, including the no-op cases (not yet open, already
+    // closing). This matches the pre-seam reactor's drop semantics;
+    // ignoring the result is legal Pascal and keeps old callers valid.
+    function SendText(P: PByte; ALen: NativeInt): Boolean;
+    function SendBinary(P: PByte; ALen: NativeInt): Boolean;
+    // Same mid-call drop can occur here (unreported): if the transport
+    // declares the connection dead while the close frame flushes, the
+    // connection is freed before Close returns.
     procedure Close(ACode: Word = 1000; const AReason: string = '');
+    // Runs AProc on this connection's callback context with the same
+    // guarantees as OnMessage (ADR-0003): serialized with the
+    // connection's other callbacks, in post order per calling thread.
+    // Callable from ANY thread — the one cross-thread hand-off the API
+    // has; SendText/SendBinary/Close inside AProc behave exactly as
+    // they do inside OnMessage.
+    //
+    // Lifetime contract: hold connection references only from OnOpen
+    // until your OnClientClose handler returns — inside that window
+    // Self is guaranteed allocated, and Post on a connection that is
+    // concurrently dropping is safe: the post is silently discarded.
+    // Posts still in flight when the connection drops or the server
+    // shuts down are discarded too (AProc never runs; the internal
+    // envelope is freed). Posting after your OnClientClose returned,
+    // or racing TWSServer.Destroy, is undefined behaviour.
+    procedure Post(AProc: TWSConnProc);
     property Proto: TWSProtocol read FProto;
     property Id: NativeUInt read GetId;
   end;
@@ -88,10 +119,17 @@ type
     function IngestAndFlush(AConn: TWSConnection; P: PByte;
       ALen: NativeInt): Boolean;
 
+    // Post rendezvous: validates AConn against the registry under the
+    // registry lock, then hands the transport a connection-id-keyed
+    // envelope — never a connection pointer a foreign thread could
+    // race against a free.
+    procedure PostToConn(AConn: TWSConnection; AProc: TWSConnProc);
+
     procedure HandleAccept(ATConn: TWSTransportConn);
     procedure HandleData(ATConn: TWSTransportConn; P: PByte; ALen: NativeInt);
     procedure HandleSendReady(ATConn: TWSTransportConn);
     procedure HandleClosed(ATConn: TWSTransportConn);
+    procedure HandlePost(ATConn: TWSTransportConn; AData: Pointer);
     function GetPort: Word;
   public
     constructor Create(APort: Word; AAllowDeflate: Boolean = True;
@@ -133,6 +171,14 @@ const
   HandshakeMaxBytes = 16 * 1024;
   RegistryGrowth = 64;
 
+type
+  // What travels through the transport's SubmitPost: a method pointer
+  // is two pointers, one too many for the opaque AData slot.
+  PWSPostEnvelope = ^TWSPostEnvelope;
+  TWSPostEnvelope = record
+    Proc: TWSConnProc;
+  end;
+
 { TWSConnection }
 
 destructor TWSConnection.Destroy;
@@ -152,22 +198,29 @@ begin
     FServer.FOnMessage(Self, AText, P, ALen);
 end;
 
-procedure TWSConnection.SendText(P: PByte; ALen: NativeInt);
+function TWSConnection.SendText(P: PByte; ALen: NativeInt): Boolean;
 begin
+  Result := True;
   if FState = wcsOpen then
   begin
     FProto.SendText(P, ALen);
-    FServer.FlushConn(Self);
+    Result := FServer.FlushConn(Self);
   end;
 end;
 
-procedure TWSConnection.SendBinary(P: PByte; ALen: NativeInt);
+function TWSConnection.SendBinary(P: PByte; ALen: NativeInt): Boolean;
 begin
+  Result := True;
   if FState = wcsOpen then
   begin
     FProto.SendBinary(P, ALen);
-    FServer.FlushConn(Self);
+    Result := FServer.FlushConn(Self);
   end;
+end;
+
+procedure TWSConnection.Post(AProc: TWSConnProc);
+begin
+  FServer.PostToConn(Self, AProc);
 end;
 
 procedure TWSConnection.Close(ACode: Word; const AReason: string);
@@ -208,6 +261,7 @@ begin
   FTransport.OnData := HandleData;
   FTransport.OnSendReady := HandleSendReady;
   FTransport.OnClosed := HandleClosed;
+  FTransport.OnPost := HandlePost;
   FTransport.Open;
 end;
 
@@ -273,6 +327,40 @@ begin
   if (AConn.FState <> wcsHandshake) and Assigned(FOnClose) then
     FOnClose(AConn);
   AConn.Free;
+end;
+
+procedure TWSServer.PostToConn(AConn: TWSConnection; AProc: TWSConnProc);
+var
+  Env: PWSPostEnvelope;
+  TId: NativeUInt;
+  Live: Boolean;
+  I: Integer;
+begin
+  // Rendezvous under the registry lock: pointer-compare first — a
+  // dropping connection is unregistered before it is freed, and the
+  // free cannot start while we hold the lock — and dereference only a
+  // connection that is provably still registered. Past this point only
+  // the transport-neutral id travels; the transport revalidates it on
+  // the connection's own execution context, so a drop that lands
+  // between here and delivery just discards the post.
+  TId := 0;
+  Live := False;
+  FLock.Acquire;
+  try
+    for I := 0 to FRegistryCount - 1 do
+      if FRegistry[I] = AConn then
+      begin
+        Live := True;
+        TId := AConn.FTConn.Id;
+        Break;
+      end;
+  finally
+    FLock.Release;
+  end;
+  if not Live then Exit; // already gone: silently dropped
+  New(Env);
+  Env^.Proc := AProc;
+  FTransport.SubmitPost(TId, Env);
 end;
 
 function TWSServer.DropConn(AConn: TWSConnection): Boolean;
@@ -432,6 +520,24 @@ begin
   ATConn.UserData := nil;
   ReleaseConn(Conn);
   // The transport frees ATConn after this callback returns.
+end;
+
+procedure TWSServer.HandlePost(ATConn: TWSTransportConn; AData: Pointer);
+var
+  Env: PWSPostEnvelope;
+  Conn: TWSConnection;
+begin
+  Env := PWSPostEnvelope(AData);
+  try
+    if ATConn = nil then Exit; // dropped in transit (conn gone/shutdown)
+    Conn := TWSConnection(ATConn.UserData);
+    if Conn = nil then Exit;   // session already let go of it
+    // AProc may legitimately end with the connection dropped and freed
+    // (a Send returning False); nothing below touches Conn again.
+    Env^.Proc(Conn);
+  finally
+    Dispose(Env);
+  end;
 end;
 
 function TWSServer.GetPort: Word;

@@ -85,6 +85,7 @@ type
     FTempKeychain: Pointer;    // private import keychain (see LoadIdentity)
     FListenerState: Integer;
     FActive: LongInt;          // live nw connections (finalize pending)
+    FPostsPending: LongInt;    // SubmitPost deliveries not yet completed
     FNextId: NativeUInt;       // listener-queue confined
     FStopping: Boolean;
     FOpen: Boolean;            // accepts refused until the session wires up
@@ -100,6 +101,7 @@ type
     procedure LiveTrack(AConn: TWSNwConn);
     procedure LiveUntrack(AConn: TWSNwConn);
     procedure ConnFinalized(AConn: TWSNwConn);
+    procedure PostDone;
   public
     constructor Create(APort: Word; const ATls: TWSTransportTls);
     destructor Destroy; override;
@@ -107,6 +109,7 @@ type
     procedure Stop; override;
     procedure Open; override;
     procedure Shutdown; override;
+    procedure SubmitPost(AConnId: NativeUInt; AData: Pointer); override;
   end;
 
 {$endif}
@@ -147,6 +150,7 @@ const
   NW_CONNECTION_STATE_CANCELLED = 5;
 
 function Dispatch_queue_create(ALabel: PAnsiChar; AAttr: Pointer): Pointer; cdecl; external name 'dispatch_queue_create';
+procedure Dispatch_async(AQueue, ABlock: Pointer); cdecl; external name 'dispatch_async';
 procedure Dispatch_release(AObj: Pointer); cdecl; external name 'dispatch_release';
 function Dispatch_semaphore_create(AValue: NativeInt): Pointer; cdecl; external name 'dispatch_semaphore_create';
 function Dispatch_semaphore_wait(ASem: Pointer; ATimeout: UInt64): NativeInt; cdecl; external name 'dispatch_semaphore_wait';
@@ -297,6 +301,19 @@ end;
 // Block invoke trampolines (cdecl; first argument is the block itself)
 // ---------------------------------------------------------------------------
 
+type
+  // One SubmitPost in flight: heap-owned so the block literal and its
+  // context outlive the posting thread's stack frame (dispatch_async
+  // Block_copies the literal, but the Ctx it captures must survive
+  // until PostInvoke runs). Freed by PostInvoke.
+  PWSNwPost = ^TWSNwPost;
+  TWSNwPost = record
+    Transport: TWSNetworkFrameworkTransport;
+    ConnId: NativeUInt;
+    Data: Pointer;
+    Block: TWSBlock;
+  end;
+
 procedure TlsConfigInvoke(ABlock: PWSBlock; AOptions: Pointer); cdecl;
 var
   T: TWSNetworkFrameworkTransport;
@@ -395,6 +412,38 @@ begin
     C.RemoteClosed
   else if Assigned(C.FTransport.OnSendReady) then
     C.FTransport.OnSendReady(C);
+end;
+
+procedure PostInvoke(ABlock: PWSBlock); cdecl;
+var
+  P: PWSNwPost;
+  T: TWSNetworkFrameworkTransport;
+  C: TWSNwConn;
+  I: Integer;
+begin
+  EnsureThreadInit;
+  P := PWSNwPost(ABlock^.Ctx);
+  T := P^.Transport;
+  // Revalidate on the connection's own serial queue: if the conn is
+  // still in the live table it cannot finalize while this block runs —
+  // ConnFinalized fires from the cancelled state on this same queue.
+  // FDead means SubmitClose/RemoteClosed already ran and the cancelled
+  // state is queued behind us: the session has let go, so drop.
+  C := nil;
+  T.FLiveLock.Acquire;
+  try
+    for I := 0 to T.FLiveCount - 1 do
+      if T.FLive[I].Id = P^.ConnId then
+      begin
+        if not T.FLive[I].FDead then C := T.FLive[I];
+        Break;
+      end;
+  finally
+    T.FLiveLock.Release;
+  end;
+  if Assigned(T.OnPost) then T.OnPost(C, P^.Data);
+  Dispose(P);
+  T.PostDone;
 end;
 
 procedure NewConnInvoke(ABlock: PWSBlock; ANwConn: Pointer); cdecl;
@@ -583,9 +632,66 @@ begin
   // nw_connection_cancel is thread-safe and idempotent.
   for I := 0 to High(Doomed) do
     Nw_connection_cancel(Doomed[I].FNw);
-  while InterLockedExchangeAdd(FActive, 0) > 0 do
+  // Drain live connections AND in-flight posts: a posted block queued
+  // behind a cancelled state still touches this object when it runs,
+  // so Shutdown may not return (and Destroy may not free the locks)
+  // until every SubmitPost has delivered.
+  while (InterLockedExchangeAdd(FActive, 0) > 0) or
+      (InterLockedExchangeAdd(FPostsPending, 0) > 0) do
     Dispatch_semaphore_wait(FDrainSem,
       Dispatch_time(0, DrainPollMs * NsPerMs));
+end;
+
+procedure TWSNetworkFrameworkTransport.PostDone;
+begin
+  InterLockedDecrement(FPostsPending);
+  Dispatch_semaphore_signal(FDrainSem);
+end;
+
+procedure TWSNetworkFrameworkTransport.SubmitPost(AConnId: NativeUInt;
+  AData: Pointer);
+var
+  P: PWSNwPost;
+  C: TWSNwConn;
+  I: Integer;
+begin
+  // Count before the stopping check so Shutdown's drain cannot miss a
+  // post that already passed it; PostDone runs on every path.
+  InterLockedIncrement(FPostsPending);
+  C := nil;
+  if not FStopping then
+  begin
+    FLiveLock.Acquire;
+    try
+      for I := 0 to FLiveCount - 1 do
+        if FLive[I].Id = AConnId then
+        begin
+          if not FLive[I].FDead then C := FLive[I];
+          Break;
+        end;
+      if C <> nil then
+      begin
+        New(P);
+        P^.Transport := Self;
+        P^.ConnId := AConnId;
+        P^.Data := AData;
+        // dispatch_async copies the block and retains the queue before
+        // returning; holding FLiveLock here keeps ConnFinalized from
+        // releasing that queue underneath the enqueue. GCD's serial
+        // queue gives per-caller FIFO and serialization with the
+        // connection's other completions for free.
+        Dispatch_async(C.FQueue, MakeBlock(P^.Block, @PostInvoke, P));
+      end;
+    finally
+      FLiveLock.Release;
+    end;
+  end;
+  if C = nil then
+  begin
+    // Gone or stopping: dropped on the calling thread.
+    if Assigned(OnPost) then OnPost(nil, AData);
+    PostDone;
+  end;
 end;
 
 procedure TWSNetworkFrameworkTransport.ConnFinalized(AConn: TWSNwConn);
