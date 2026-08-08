@@ -55,8 +55,21 @@ end;
 
 procedure TServerThread.Execute;
 begin
-  while not Terminated do
-    Srv.Run(50);
+  // SPIKE (do not merge): dump the transport exception's backtrace at
+  // throw time — dev-mode builds carry -gl, so frames resolve to
+  // file:line on the CI runner.
+  try
+    while not Terminated do
+      Srv.Run(50);
+  except
+    on E: Exception do
+    begin
+      WriteLn('server thread exception: ', E.ClassName, ': ', E.Message);
+      DumpExceptionBackTrace(Output);
+      Flush(Output);
+      raise;
+    end;
+  end;
 end;
 
 var
