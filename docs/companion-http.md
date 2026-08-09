@@ -128,17 +128,23 @@ opening `wss://`) is allowed.
 
 How you get the TLS pair depends on the platform:
 
-- **macOS.** `TWSServer` takes a `TWSTransportTls` record (PKCS#12
-  identity) and the Network.framework transport terminates TLS itself —
-  see the `--pkcs12` flags on `wsecho`. The companion server must serve
-  `https://` too.
-- **Linux and Windows.** The epoll and IOCP transports have no
-  accept-side TLS yet: constructing a server with
-  `TWSTransportTls.Enabled` set **raises** rather than silently serving
-  plaintext (tracked as [duetto#22](https://github.com/frostney/duetto/issues/22)).
-  Put both listeners behind a TLS-terminating reverse proxy (nginx,
-  Caddy, HAProxy) and keep the process itself plain `http://` + `ws://`
-  on loopback.
+`TWSServer` takes a `TWSTransportTls` record (a PKCS#12 identity plus
+optional flow-control tuning) on every platform, and the transport
+terminates TLS itself — see the `--pkcs12` flags on `wsecho`. Whichever
+platform you are on, the companion server must serve `https://` too.
+
+- **macOS.** Network.framework terminates TLS inside the platform stack
+  (ADR-0002); only the identity fields of the record are read.
+- **Linux and Windows.** The epoll and IOCP transports terminate TLS
+  over lwpt's memory-BIO accept API
+  ([duetto#22](https://github.com/frostney/duetto/issues/22)), so
+  OpenSSL 3 has to be loadable at runtime: `libssl.so.3` /
+  `libcrypto.so.3` from the usual library paths on Linux, and
+  `libssl-3-x64.dll` / `libcrypto-3-x64.dll` from the executable's own
+  directory or `System32` on Windows (`%PATH%` is deliberately not
+  searched). Without them the server context fails to build, and a
+  TLS-terminating reverse proxy (nginx, Caddy, HAProxy) in front of a
+  plain `http://` + `ws://` pair on loopback remains a valid shape.
 
 ## Secure contexts: the disappearing-API trap
 
@@ -165,12 +171,12 @@ the two-port process shape end to end.
 For the single-page case the second listener is optional:
 `TWSServer.OnPlainRequest` is an opt-in hook on the handshake path
 that hands well-formed non-upgrade requests to the host instead of
-refusing them. One origin, one port — and **on macOS**, where the
-listener can carry a TLS identity, the `https://` page and the `wss://`
+refusing them. One origin, one port — and because the listener can carry
+a TLS identity on every platform, the `https://` page and the `wss://`
 socket share it, which settles the pairing and secure-context sections
-above by construction. On Linux and Windows the same single-port shape
-works over plain `http://` + `ws://`; the `https://` half has to come
-from the reverse proxy in front of it:
+above by construction. The same single-port shape works over plain
+`http://` + `ws://` when TLS is terminated by a reverse proxy in front
+of it instead:
 
 ```pascal
 function THost.PlainRequest(const AHS: TWSServerHandshake;

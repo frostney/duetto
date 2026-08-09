@@ -9,12 +9,13 @@ program wsecho;
 //
 // Prints "listening on <port>" once ready so harnesses can wait for it
 // (--port=0 binds an ephemeral port and reports the real one).
-// --pkcs12 serves wss:// with the identity in FILE — native on macOS
-// (Network.framework) and on Linux, where the epoll transport
-// terminates TLS itself over lwpt's memory-BIO accept API (duetto#22).
-// The IOCP (Windows) transport still rejects an enabled TLS record; its
-// half of duetto#22 mirrors the epoll wiring and is pending. Terminate
-// TLS in a reverse proxy on Windows until it lands.
+// --pkcs12 serves wss:// with the identity in FILE, natively on every
+// platform (duetto#22): macOS terminates TLS inside Network.framework,
+// while the epoll (Linux) and IOCP (Windows) transports terminate it
+// themselves over lwpt's memory-BIO accept API. The two OpenSSL-backed
+// transports need libssl/libcrypto 3 at runtime — on Windows that means
+// libssl-3-x64.dll and libcrypto-3-x64.dll reachable from the
+// executable's directory or System32.
 
 {$I Shared.inc}
 

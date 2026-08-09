@@ -12,11 +12,11 @@ program wsinterop;
 //
 // On Linux there is also a wss:// section (duetto#22): a second server
 // with server TLS terminated by the epoll transport itself, driven from
-// a runtime-generated CA + leaf identity. It is Linux-only on purpose —
-// the epoll transport is the thing under test, and the macOS client
-// rides SecureTransport, which cannot be handed a throwaway CA without
-// keychain surgery. It skips with a clear line when the openssl CLI is
-// not installed, so a local macOS/Windows run stays green.
+// a runtime-generated CA + leaf identity. It is Linux-only because of
+// what the CLIENT half needs, not the server half — see the skip line
+// at the section itself for why macOS and Windows are excluded. It also
+// skips with a clear line when the openssl CLI is not installed, so a
+// local macOS/Windows run stays green.
 //
 // Exit 0 = every check passed.
 
@@ -1480,11 +1480,24 @@ begin
     'plain GET refused 400 when no hook is set');
 
   // --- server TLS terminated by the transport (duetto#22) -----------------
-  // Linux only: the epoll transport is what this section exercises, and
-  // the macOS client rides SecureTransport, which will not trust a
-  // runtime CA without keychain surgery. A third server carries it —
-  // the flow-control watermarks are deliberately squeezed to lwpt's
-  // floor here, which is not what a plaintext-adjacent listener wants.
+  // Linux only, and the reason is the CLIENT half of the battery on the
+  // other two platforms — both fd-owning transports now terminate wss://
+  // themselves. lwpt's blocking client rides SecureTransport on macOS and
+  // SChannel on Windows; neither reads SSL_CERT_FILE, so a throwaway CA
+  // can only be trusted by writing it into the machine's own trust store
+  // (keychain surgery / `certutil -addstore Root`), which a test binary
+  // has no business doing to the machine it runs on. Windows carries a
+  // second blocker on top: the OpenSSL-backed server accept needs
+  // libssl-3/libcrypto-3 loadable from the executable's directory or
+  // System32 (LOAD_LIBRARY_SEARCH_DEFAULT_DIRS — %PATH% is not searched),
+  // which no CI runner supplies, and the 32-bit build has no 32-bit
+  // OpenSSL 3 to find at all. The IOCP wiring is covered by the Autobahn
+  // and plaintext batteries plus the platform-neutral
+  // WS.Transport.TlsServer suite instead.
+  //
+  // A third server carries the section — the flow-control watermarks are
+  // deliberately squeezed to lwpt's floor here, which is not what a
+  // plaintext-adjacent listener wants.
   {$ifdef LINUX}
   StressPhase := 'tls section';
   TlsDir := IncludeTrailingPathDelimiter(GetTempDir) + 'duetto-interop-tls-' +
@@ -1661,9 +1674,15 @@ begin
     end;
   end;
   {$else}
-  WriteLn('skip - tls: the wss section is Linux-only (it exercises the ',
-    'epoll transport; macOS server TLS is Network.framework and the ',
-    'macOS client cannot trust a runtime CA)');
+  // Every transport terminates wss:// now; what is missing here is a way
+  // for the battery's own CLIENT to trust a throwaway CA without editing
+  // the machine's trust store (SecureTransport on macOS, SChannel on
+  // Windows), plus loadable OpenSSL 3 libraries for the server half on
+  // Windows.
+  WriteLn('skip - tls: the wss section is Linux-only (the macOS/Windows ',
+    'clients ride SecureTransport/SChannel and would need the test CA ',
+    'written into the machine trust store; the Windows server half also ',
+    'needs libssl-3/libcrypto-3 beside the executable)');
   {$endif}
 
   // --- concurrent-connections stress -------------------------------------
