@@ -221,11 +221,24 @@ jobs:
       # The lockfile is still committed, so a clean online install against
       # the same release tag must not move it — assert that, or a future
       # 0.5.x silently forking the dep tree across legs would go unnoticed.
-      - name: lwpt install (Windows, then assert lockfile unmoved)
+      - name: lwpt install (Windows, then assert resolution unmoved)
         if: matrix.frozen-install == 'skip'
         run: |
           lwpt install
-          git diff --exit-code lwpt.lock
+          # The 0.5.0 constraintFingerprint is platform-line-ending-
+          # dependent (lwpt#168), so a clean install legitimately rewrites
+          # it on CRLF Windows — that is the reason this leg is online, not
+          # drift. Real drift is a changed resolved ref/commit/URL; fail
+          # only on those, ignoring the fingerprint line.
+          drift="$(git diff lwpt.lock | grep -E '^[+-]' \
+            | grep -vE '^(\+\+\+|---) ' | grep -v 'constraintFingerprint' \
+            || true)"
+          if [ -n "$drift" ]; then
+            echo "::error::lwpt.lock resolution drifted on Windows:"
+            echo "$drift"
+            exit 1
+          fi
+          git checkout -- lwpt.lock
 
       - name: lwpt format --check (one runner)
         if: matrix.format-check == true
