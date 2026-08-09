@@ -43,7 +43,7 @@ lwpt install         # resolve deps, regenerate lwpt.cfg + lwpt.lock
 lwpt install --frozen  # CI mode: verify lockfile + committed modules, no network
 lwpt format --check  # formatter gate (no flag = rewrite in place)
 lwpt build           # all programs (Linux, macOS, Windows)
-lwpt test            # six co-located unit suites
+lwpt test            # seven co-located unit suites
 ./build/wsinterop    # live-socket battery (all platforms), exit 0 = pass
 tools/autobahn.sh server   # Autobahn fuzzingclient vs wsecho (Linux + Docker)
 tools/autobahn.sh client   # Autobahn fuzzingserver vs wsautobahn (Docker)
@@ -53,7 +53,7 @@ tools/autobahn.sh client   # Autobahn fuzzingserver vs wsautobahn (Docker)
 
 | Path | Role |
 | --- | --- |
-| `source/units/` | Library: `WS.Frame`, `WS.Utf8`, `WS.Handshake`, `WS.Deflate`, `WS.Protocol` (sans-I/O core), `WS.Client`, `WS.Transport(.Epoll/.NetworkFramework/.Iocp)`, `WS.Server` (session layer) |
+| `source/units/` | Library: `WS.Frame`, `WS.Utf8`, `WS.Handshake`, `WS.Deflate`, `WS.Protocol` (sans-I/O core), `WS.Client`, `WS.Transport(.Epoll/.NetworkFramework/.Iocp)`, `WS.Transport.TlsServer` (server TLS for the fd-owning transports), `WS.Server` (session layer) |
 | `source/apps/` | Programs: `wsecho`, `wsprobe`, `wsinterop`, `wsbench`, `wsautobahn` |
 | `tests/autobahn/` | Autobahn testsuite configs (reports/ is generated) |
 | `tools/` | Cross-implementation checks, benchmarks, Autobahn runner |

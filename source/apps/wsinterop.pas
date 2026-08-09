@@ -10,6 +10,14 @@ program wsinterop;
 // abrupt raw-socket drops and server-initiated pushes, ended by a
 // Shutdown with connections still open.
 //
+// On Linux there is also a wss:// section (duetto#22): a second server
+// with server TLS terminated by the epoll transport itself, driven from
+// a runtime-generated CA + leaf identity. It is Linux-only on purpose —
+// the epoll transport is the thing under test, and the macOS client
+// rides SecureTransport, which cannot be handed a throwaway CA without
+// keychain surgery. It skips with a clear line when the openssl CLI is
+// not installed, so a local macOS/Windows run stays green.
+//
 // Exit 0 = every check passed.
 
 {$I Shared.inc}
@@ -18,7 +26,8 @@ uses
   {$ifdef UNIX} cthreads, BaseUnix, {$endif}
   syncobjs,
   SysUtils, Classes, Sockets,
-  WS.Server, WS.Client, WS.Frame, WS.Handshake;
+  TransportSecurity,
+  WS.Client, WS.Frame, WS.Handshake, WS.Server, WS.Transport;
 
 {$ifdef WINDOWS}
 // Declared here rather than pulling the whole Windows unit into a file
@@ -184,7 +193,14 @@ end;
 // Raw socket helpers for the violation section
 // ---------------------------------------------------------------------------
 
-function RawConnect(APort: Word): Tsocket;
+// AReadTimeout = False leaves the socket without SO_RCVTIMEO. The TLS
+// probe needs that: lwpt's blocking OpenSSL read treats a receive
+// timeout as "retry" and would spin on it forever, where a plain block
+// simply waits for the bytes or the hangup (the battery watchdog is the
+// backstop). ARecvBuf > 0 shrinks SO_RCVBUF before the connect, which
+// is how the backpressure probe forces the SERVER's egress to stall.
+function RawConnectEx(APort: Word; AReadTimeout: Boolean;
+  ARecvBuf: Integer = 0): Tsocket;
 var
   SA: TInetSockAddr;
   {$ifdef WINDOWS}
@@ -194,14 +210,19 @@ var
   {$endif}
 begin
   Result := fpSocket(AF_INET, SOCK_STREAM, 0);
-  {$ifdef WINDOWS}
-  TimeoutMs := 5000;
-  fpSetSockOpt(Result, SOL_SOCKET, SO_RCVTIMEO, @TimeoutMs,
-    SizeOf(TimeoutMs));
-  {$else}
-  TV.Seconds := 5; TV.Microseconds := 0;
-  fpSetSockOpt(Result, SOL_SOCKET, SO_RCVTIMEO, @TV, SizeOf(TV));
-  {$endif}
+  if ARecvBuf > 0 then
+    fpSetSockOpt(Result, SOL_SOCKET, SO_RCVBUF, @ARecvBuf, SizeOf(ARecvBuf));
+  if AReadTimeout then
+  begin
+    {$ifdef WINDOWS}
+    TimeoutMs := 5000;
+    fpSetSockOpt(Result, SOL_SOCKET, SO_RCVTIMEO, @TimeoutMs,
+      SizeOf(TimeoutMs));
+    {$else}
+    TV.Seconds := 5; TV.Microseconds := 0;
+    fpSetSockOpt(Result, SOL_SOCKET, SO_RCVTIMEO, @TV, SizeOf(TV));
+    {$endif}
+  end;
   FillChar(SA, SizeOf(SA), 0);
   SA.sin_family := AF_INET;
   SA.sin_port := htons(APort);
@@ -211,6 +232,11 @@ begin
     CloseSocket(Result); // the descriptor is ours until we raise past it
     raise Exception.Create('raw connect failed');
   end;
+end;
+
+function RawConnect(APort: Word): Tsocket;
+begin
+  Result := RawConnectEx(APort, True);
 end;
 
 // Speak the opening handshake on a raw socket; returns leftover bytes
@@ -281,12 +307,10 @@ begin
   until False;
 end;
 
-// False = the peer is already gone (the send failed or went short). Only
-// the abrupt-drop workers act on it; the violation sections below send
-// into a socket the server has just accepted, where a failure would
-// surface as the missing close code they assert anyway.
-function RawSendFrame(AFd: Tsocket; AOpcode: Byte; const APayload: RawByteString;
-  AMasked: Boolean): Boolean;
+// One complete frame as bytes — the wire form both the raw-socket and
+// the TLS probe senders push, so the two cannot drift apart.
+function BuildFrameBytes(AOpcode: Byte; const APayload: RawByteString;
+  AMasked: Boolean): RawByteString;
 var
   Hdr: array[0..WS_MAX_HEADER - 1] of Byte;
   HLen: Integer;
@@ -296,13 +320,27 @@ begin
   Key := $A1B2C3D4;
   HLen := WriteFrameHeader(@Hdr[0], True, False, AOpcode, AMasked, Key,
     Length(APayload));
-  Result := fpSend(AFd, @Hdr[0], HLen, 0) = HLen;
-  if (not Result) or (APayload = '') then Exit;
+  SetLength(Result, HLen + Length(APayload));
+  Move(Hdr[0], Result[1], HLen);
+  if APayload = '' then Exit;
   SetLength(Body, Length(APayload));
   Move(APayload[1], Body[0], Length(APayload));
   if AMasked then
     ApplyMask(PByte(Body), Length(Body), Key, 0);
-  Result := fpSend(AFd, @Body[0], Length(Body), 0) = Length(Body);
+  Move(Body[0], Result[HLen + 1], Length(Body));
+end;
+
+// False = the peer is already gone (the send failed or went short). Only
+// the abrupt-drop workers act on it; the violation sections below send
+// into a socket the server has just accepted, where a failure would
+// surface as the missing close code they assert anyway.
+function RawSendFrame(AFd: Tsocket; AOpcode: Byte; const APayload: RawByteString;
+  AMasked: Boolean): Boolean;
+var
+  Wire: RawByteString;
+begin
+  Wire := BuildFrameBytes(AOpcode, APayload, AMasked);
+  Result := fpSend(AFd, @Wire[1], Length(Wire), 0) = Length(Wire);
 end;
 
 // Read until the peer closes; AEof distinguishes a real EOF from the
@@ -321,6 +359,282 @@ begin
   until False;
   AEof := Got = 0;
 end;
+
+// ---------------------------------------------------------------------------
+// Server TLS section helpers (Linux; duetto#22)
+// ---------------------------------------------------------------------------
+
+{$ifdef LINUX}
+
+const
+  TlsPassphrase = 'duetto-interop';
+  // Deliberately at lwpt's floor so a 512 KiB message is chopped into
+  // ~30 input windows: every one of them exercises the accepted-prefix
+  // re-offer path, and a single lost, duplicated or reordered byte
+  // would break the record stream outright.
+  TlsInputHighWater = 17 * 1024;
+  TlsOutputCapacity = 17 * 1024;
+  // Short enough to assert against inside a battery, long enough that a
+  // loaded CI box cannot trip it with a real handshake.
+  TlsHandshakeDeadlineMs = 700;
+  TlsInboundBudget = 20 * 1024;
+  TlsBigEchoBytes = 512 * 1024;
+  TlsCloseBoundMs = 4000;
+  // Backpressure probe: a deliberately tiny receive buffer on the
+  // client side so the SERVER's socket backs up after a few kilobytes
+  // of echo, which is what stalls its decryption and fills the
+  // encrypted-input window. The burst total stays far below the
+  // send-side headroom (server receive buffer plus client send buffer)
+  // so the probe's own write never blocks against the paused server.
+  TlsBurstRecvBuf = 64 * 1024;
+  TlsBurstLeadSize = 256 * 1024;
+  TlsBurstTailCount = 8;
+  TlsBurstTailSize = 4096;
+  // MSG_NOSIGNAL: the flood probe keeps writing into a socket the
+  // server is entitled to drop mid-write, and SIGPIPE would kill the
+  // battery instead of failing a check.
+  TlsSendFlags = $4000;
+
+// setenv, not the RTL: OpenSSL reads SSL_CERT_FILE through libc getenv
+// when SSL_CTX_set_default_verify_paths loads the trust store, so the
+// value has to land in the C environment (and before the first client
+// TLS use, which is why the whole section runs after it).
+function C_setenv(AName: PAnsiChar; AValue: PAnsiChar;
+  AOverwrite: Integer): Integer; cdecl; external name 'setenv';
+
+function TlsOpenSslPresent: Boolean;
+begin
+  try
+    Result := ExecuteProcess('/bin/sh',
+      ['-c', 'command -v openssl >/dev/null 2>&1']) = 0;
+  except
+    Result := False;
+  end;
+end;
+
+// A throwaway CA and a leaf it signs, in ADir. Strict identity
+// validation in lwpt rejects self-signed leaves, so a real two-level
+// chain is required; the leaf carries serverAuth plus the localhost /
+// 127.0.0.1 names the client verifies against.
+function TlsGenerateIdentity(const ADir: string): Boolean;
+var
+  Cnf: TStringList;
+  Script: string;
+begin
+  Result := False;
+  if not ForceDirectories(ADir) then Exit;
+  Cnf := TStringList.Create;
+  try
+    Cnf.Add('[ext]');
+    // The literal-IP DNS entry is deliberate: OpenSSL's hostname check
+    // (the only one lwpt's client configures) matches DNS names by
+    // string, never IP SANs, and the battery must reach the listener
+    // without depending on a resolver that a bare container may not
+    // have. Test-certificate liberty, nothing a real identity would do.
+    Cnf.Add('subjectAltName = DNS:localhost, DNS:127.0.0.1, IP:127.0.0.1');
+    Cnf.Add('basicConstraints = CA:FALSE');
+    Cnf.Add('keyUsage = digitalSignature, keyEncipherment');
+    Cnf.Add('extendedKeyUsage = serverAuth');
+    try
+      Cnf.SaveToFile(ADir + 'leaf.cnf');
+    except
+      Exit;
+    end;
+  finally
+    Cnf.Free;
+  end;
+  Script :=
+    'set -e; cd "' + ADir + '"; ' +
+    'openssl req -x509 -newkey rsa:2048 -sha256 -days 2 -nodes ' +
+    '-keyout ca.key -out ca.crt -subj /CN=duetto-interop-ca ' +
+    '-addext basicConstraints=critical,CA:TRUE ' +
+    '-addext keyUsage=critical,keyCertSign,cRLSign; ' +
+    'openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key ' +
+    '-out leaf.csr -subj /CN=localhost; ' +
+    'openssl x509 -req -in leaf.csr -CA ca.crt -CAkey ca.key ' +
+    '-CAcreateserial -out leaf.crt -days 2 -sha256 ' +
+    '-extfile leaf.cnf -extensions ext; ' +
+    'openssl pkcs12 -export -out identity.p12 -inkey leaf.key ' +
+    '-in leaf.crt -certfile ca.crt -passout pass:' + TlsPassphrase;
+  try
+    // Braces, not a trailing redirect: the redirect has to cover every
+    // command in the script, and openssl chatters on both streams.
+    ExecuteProcess('/bin/sh',
+      ['-c', '{ ' + Script + '; } >' + ADir + 'openssl.log 2>&1']);
+  except
+    Exit;
+  end;
+  Result := FileExists(ADir + 'identity.p12') and FileExists(ADir + 'ca.crt');
+end;
+
+// Raw TLS probe. TWSClient closes its socket as part of Close(), so an
+// orderly TLS shutdown is invisible from there; this speaks the
+// opening handshake and the frame layer directly over lwpt's client
+// TLS so the close_notify can be observed.
+function TlsProbeWrite(var ATls: TTransportSecurityConnection;
+  const AData: RawByteString): Boolean;
+begin
+  Result := TransportSecurityWrite(ATls, @AData[1], Length(AData)) =
+    Length(AData);
+end;
+
+function TlsProbeHandshake(var ATls: TTransportSecurityConnection;
+  APort: Word): TBytes;
+var
+  Req, Raw: RawByteString;
+  Buf: array[0..4095] of Byte;
+  Got, HdrEnd: Integer;
+begin
+  Result := nil;
+  Req := ClientBuildRequest('127.0.0.1:' + IntToStr(APort), '/',
+    ClientGenerateKey, False);
+  if not TlsProbeWrite(ATls, Req) then
+    raise Exception.Create('tls probe: handshake send failed');
+  Raw := '';
+  repeat
+    Got := TransportSecurityRead(ATls, Buf, SizeOf(Buf));
+    if Got <= 0 then raise Exception.Create('tls probe: connection lost');
+    SetLength(Raw, Length(Raw) + Got);
+    Move(Buf[0], Raw[Length(Raw) - Got + 1], Got);
+    HdrEnd := HandshakeFindEnd(Raw);
+  until HdrEnd > 0;
+  if Pos('101', Copy(Raw, 1, 16)) = 0 then
+    raise Exception.Create('tls probe: no 101');
+  SetLength(Result, Length(Raw) - HdrEnd);
+  if Length(Result) > 0 then
+    Move(Raw[HdrEnd + 1], Result[0], Length(Result));
+end;
+
+function TlsProbeReadCloseCode(var ATls: TTransportSecurityConnection;
+  const ALeftover: TBytes): Word;
+var
+  Buf: TBytes;
+  Len, Got, Used: NativeInt;
+  H: TWSFrameHeader;
+  R: TWSParseResult;
+begin
+  Result := 0;
+  Buf := Copy(ALeftover);
+  Len := Length(Buf);
+  repeat
+    R := ParseFrameHeader(PByte(Buf), Len, H);
+    if R = wprOK then
+    begin
+      Used := H.HeaderLen;
+      if Len - Used < H.PayloadLen then
+        R := wprNeedMore
+      else if H.Opcode = WS_OP_CLOSE then
+      begin
+        if H.PayloadLen >= 2 then
+          Exit((Buf[Used] shl 8) or Buf[Used + 1])
+        else
+          Exit(0);
+      end
+      else
+      begin
+        Delete(Buf, 0, Used + H.PayloadLen);
+        Dec(Len, Used + H.PayloadLen);
+        Continue;
+      end;
+    end;
+    if R = wprProtocolError then Exit(0);
+    SetLength(Buf, Len + 4096);
+    Got := TransportSecurityRead(ATls, PByte(@Buf[Len])^, 4096);
+    if Got <= 0 then Exit(0);
+    Len := Len + Got;
+    SetLength(Buf, Len);
+  until False;
+end;
+
+// True when the peer's TLS layer shut down in an orderly way: lwpt's
+// blocking read returns 0 on close_notify and RAISES on a reset or a
+// bare FIN, so this is exactly the distinction the check needs.
+function TlsProbeSawCloseNotify(var ATls: TTransportSecurityConnection): Boolean;
+var
+  Buf: array[0..255] of Byte;
+begin
+  try
+    Result := TransportSecurityRead(ATls, Buf, SizeOf(Buf)) = 0;
+  except
+    Result := False;
+  end;
+end;
+
+// One burst message, distinct per index so a reordered or duplicated
+// echo cannot pass the compare.
+function TlsBurstPayload(AIndex, ASize: Integer): RawByteString;
+var
+  I: Integer;
+begin
+  SetLength(Result, ASize);
+  for I := 1 to ASize do
+    Result[I] := AnsiChar(Byte((AIndex * 7 + I * 31 + 13) and $FF));
+end;
+
+// Verify the next echoes, in order, against the payloads their indices
+// generate. Used by the backpressure probe, where every byte has to
+// come back exactly once and in sequence across an input pause.
+function TlsProbeVerifyEchoes(var ATls: TTransportSecurityConnection;
+  const ALeftover: TBytes; const ASizes: array of Integer): Boolean;
+var
+  Buf: TBytes;
+  Len, Got, Used: NativeInt;
+  H: TWSFrameHeader;
+  R: TWSParseResult;
+  Index: Integer;
+  Want: RawByteString;
+begin
+  Buf := Copy(ALeftover);
+  Len := Length(Buf);
+  Index := 0;
+  while Index <= High(ASizes) do
+  begin
+    R := ParseFrameHeader(PByte(Buf), Len, H);
+    if (R = wprOK) and (Len - H.HeaderLen >= H.PayloadLen) then
+    begin
+      Used := H.HeaderLen;
+      if H.Opcode = WS_OP_BINARY then
+      begin
+        Want := TlsBurstPayload(Index, ASizes[Index]);
+        if (H.PayloadLen <> ASizes[Index]) or
+          (not CompareMem(@Buf[Used], @Want[1], ASizes[Index])) then
+          Exit(False);
+        Inc(Index);
+      end;
+      Delete(Buf, 0, Used + H.PayloadLen);
+      Dec(Len, Used + H.PayloadLen);
+      Continue;
+    end;
+    if R = wprProtocolError then Exit(False);
+    SetLength(Buf, Len + 65536);
+    Got := TransportSecurityRead(ATls, PByte(@Buf[Len])^, 65536);
+    if Got <= 0 then Exit(False);
+    Len := Len + Got;
+    SetLength(Buf, Len);
+  end;
+  Result := True;
+end;
+
+// Wait for the server to hang up on a raw (non-TLS) socket. Returns the
+// elapsed milliseconds, or -1 when it never did within ABoundMs.
+function RawWaitForClose(AFd: Tsocket; ABoundMs: Integer): Integer;
+var
+  Buf: array[0..1023] of Byte;
+  Got: Integer;
+  Start: QWord;
+begin
+  Start := GetTickCount64;
+  repeat
+    // EOF (0) and RST (-1) both mean "dropped"; the socket carries a
+    // 5 s SO_RCVTIMEO, so anything under the (much smaller) bound the
+    // caller asserts can only be a real drop.
+    Got := fpRecv(AFd, @Buf[0], SizeOf(Buf), 0);
+    if Got <= 0 then Exit(Integer(GetTickCount64 - Start));
+  until GetTickCount64 - Start > QWord(ABoundMs);
+  Result := -1;
+end;
+
+{$endif}
 
 // ---------------------------------------------------------------------------
 // Concurrent-connections stress section
@@ -924,6 +1238,21 @@ var
   PlainHits, PlainHitsBefore: Integer;
   Eof: Boolean;
   ReadRes: TWSReadResult;
+  {$ifdef LINUX}
+  // Server-TLS section
+  TlsDir, TlsUrl: string;
+  TlsCfg: TWSTransportTls;
+  TlsSrvT: TServerThread;
+  TlsCli: TWSClient;
+  TlsPort: Word;
+  TlsProbe: TTransportSecurityConnection;
+  TlsProbeFd: Tsocket;
+  TlsLeft, Garbage: TBytes;
+  TlsSizes: array of Integer;
+  TlsCode: Word;
+  TlsElapsed: Integer;
+  TlsOk: Boolean;
+  {$endif}
 begin
   Echo := TEcho.Create;
   Tracker := TStressTracker.Create;
@@ -1149,6 +1478,193 @@ begin
   CloseSocket(Fd);
   Check(Copy(PlainGot, 1, 12) = 'HTTP/1.1 400',
     'plain GET refused 400 when no hook is set');
+
+  // --- server TLS terminated by the transport (duetto#22) -----------------
+  // Linux only: the epoll transport is what this section exercises, and
+  // the macOS client rides SecureTransport, which will not trust a
+  // runtime CA without keychain surgery. A third server carries it —
+  // the flow-control watermarks are deliberately squeezed to lwpt's
+  // floor here, which is not what a plaintext-adjacent listener wants.
+  {$ifdef LINUX}
+  StressPhase := 'tls section';
+  TlsDir := IncludeTrailingPathDelimiter(GetTempDir) + 'duetto-interop-tls-' +
+    IntToStr(FpGetPid) + PathDelim;
+  if not TlsOpenSslPresent then
+    WriteLn('skip - tls: openssl CLI not installed; wss section skipped')
+  else if not TlsGenerateIdentity(TlsDir) then
+    WriteLn('skip - tls: openssl could not build a test identity (see ',
+      TlsDir, 'openssl.log); wss section skipped')
+  else
+  begin
+    // Before the first client TLS use in this process: the client's
+    // OpenSSL context loads its trust store once, at connect time.
+    C_setenv('SSL_CERT_FILE', PAnsiChar(AnsiString(TlsDir + 'ca.crt')), 1);
+
+    TlsCfg := WSTransportNoTls;
+    TlsCfg.Enabled := True;
+    TlsCfg.Pkcs12Path := TlsDir + 'identity.p12';
+    TlsCfg.Pkcs12Passphrase := TlsPassphrase;
+    TlsCfg.InputHighWater := TlsInputHighWater;
+    TlsCfg.OutputCapacity := TlsOutputCapacity;
+    TlsCfg.HandshakeDeadlineMs := TlsHandshakeDeadlineMs;
+    TlsCfg.InboundHandshakeBudget := TlsInboundBudget;
+    TlsSrvT := TServerThread.Create(True);
+    TlsSrvT.Srv := TWSServer.Create(0, TlsCfg, True);
+    TlsSrvT.Srv.OnMessage := Echo.OnMsg;
+    TlsPort := TlsSrvT.Srv.Port;
+    // The leaf carries 127.0.0.1 as a DNS SAN as well as an IP one, so
+    // the client's hostname check passes without a name lookup — the
+    // rest of the battery dials the loopback address for the same
+    // reason.
+    TlsUrl := Format('wss://127.0.0.1:%d/', [TlsPort]);
+    TlsSrvT.Start;
+
+    TlsCli := TWSClient.Create;
+    TlsCli.Connect(TlsUrl);
+    TlsCli.SendText(HelloProbe);
+    Check(TlsCli.ReadMessage(IsText, Data) and IsText and
+      (Length(Data) = Length(HelloProbe)) and
+      CompareMem(@Data[0], @HelloProbe[1], Length(HelloProbe)),
+      'tls: wss handshake and text echo');
+
+    for I := 0 to 2 do
+      TlsCli.SendText(PipelinedMsgs[I]);
+    Ok := True;
+    for I := 0 to 2 do
+    begin
+      S := PipelinedMsgs[I];
+      Ok := Ok and TlsCli.ReadMessage(IsText, Data) and IsText and
+        (Length(Data) = Length(S)) and CompareMem(@Data[0], @S[1], Length(S));
+    end;
+    Check(Ok, 'tls: three pipelined messages over wss, in order');
+
+    // The flow-control proof. With the encrypted input window at
+    // lwpt's floor, every 256 KB socket read is accepted a fraction at
+    // a time and the remainder re-offered from the carry buffer; with
+    // the output capacity at the floor, the echo is absorbed in ~30
+    // capacity-sized bites re-offered through OnSendReady. Any byte
+    // lost, duplicated or reordered on either side breaks the record
+    // stream long before the payload compare.
+    SetLength(Big, TlsBigEchoBytes);
+    for I := 0 to High(Big) do
+      Big[I] := Byte((I * 131 + 17) and $FF);
+    TlsCli.SendBinary(@Big[0], Length(Big));
+    Check(TlsCli.ReadMessage(IsText, Data) and (not IsText) and
+      (Length(Data) = Length(Big)) and
+      CompareMem(@Data[0], @Big[0], Length(Big)),
+      Format('tls: %d KiB echo intact and in order through %d-byte ' +
+      'input/output windows', [TlsBigEchoBytes div 1024, TlsInputHighWater]));
+
+    TlsCli.Close(1000, 'done');
+    Check(TlsCli.CloseCode = 1000, 'tls: clean close echoes 1000 over wss');
+    TlsCli.Free;
+
+    // close_notify before FIN, observed from a probe that keeps its
+    // socket open past the WebSocket close: lwpt's blocking read
+    // returns 0 on an orderly TLS shutdown and raises on a reset.
+    StressPhase := 'tls section: close_notify probe';
+    TlsProbeFd := RawConnectEx(TlsPort, False);
+    StartTransportSecurity(TlsProbe, TlsProbeFd, '127.0.0.1');
+    TlsOk := TlsProbe.Active;
+    TlsLeft := TlsProbeHandshake(TlsProbe, TlsPort);
+    TlsOk := TlsOk and TlsProbeWrite(TlsProbe,
+      BuildFrameBytes(WS_OP_CLOSE, #$03#$E8, True));
+    TlsCode := TlsProbeReadCloseCode(TlsProbe, TlsLeft);
+    TlsOk := TlsOk and (TlsCode = 1000) and TlsProbeSawCloseNotify(TlsProbe);
+    CloseTransportSecurity(TlsProbe);
+    CloseSocket(TlsProbeFd);
+    Check(TlsOk, 'tls: graceful close flushes close_notify before FIN');
+
+    // A throttled peer. The probe's receive buffer is a fraction of the
+    // echo it is about to earn, and it writes everything — one large
+    // message plus a pipelined tail of small ones — before reading a
+    // byte, so the server is holding several messages' worth of output
+    // while more input keeps arriving. That is the transport's
+    // re-offer accounting under maximum overlap; every message coming
+    // back whole and in order is what says nothing was dropped,
+    // duplicated or reordered.
+    //
+    // Neither write can wedge: the lead message is fully consumed
+    // before its echo begins, and the tail is small enough to sit in
+    // the socket buffers of a server that has stopped reading.
+    StressPhase := 'tls section: throttled peer';
+    TlsProbeFd := RawConnectEx(TlsPort, False, TlsBurstRecvBuf);
+    StartTransportSecurity(TlsProbe, TlsProbeFd, '127.0.0.1');
+    TlsLeft := TlsProbeHandshake(TlsProbe, TlsPort);
+    SetLength(TlsSizes, TlsBurstTailCount + 1);
+    TlsSizes[0] := TlsBurstLeadSize;
+    for I := 1 to TlsBurstTailCount do
+      TlsSizes[I] := TlsBurstTailSize;
+    TlsOk := True;
+    for I := 0 to TlsBurstTailCount do
+    begin
+      S := BuildFrameBytes(WS_OP_BINARY, TlsBurstPayload(I, TlsSizes[I]),
+        True);
+      TlsOk := TlsOk and TlsProbeWrite(TlsProbe, S);
+    end;
+    TlsOk := TlsOk and TlsProbeVerifyEchoes(TlsProbe, TlsLeft, TlsSizes);
+    CloseTransportSecurity(TlsProbe);
+    CloseSocket(TlsProbeFd);
+    Check(TlsOk, Format('tls: %d KiB + %d x %d B pipelined behind a %d KiB ' +
+      'receive window, every echo intact and in order',
+      [TlsBurstLeadSize div 1024, TlsBurstTailCount, TlsBurstTailSize,
+      TlsBurstRecvBuf div 1024]));
+
+    // Slow loris: a plausible record header, then silence. Nothing in
+    // the TLS engine can time this out — only the reactor's deadline.
+    StressPhase := 'tls section: handshake deadline';
+    Fd := RawConnect(TlsPort);
+    S := #$16#$03#$01#$00#$C0;
+    fpSend(Fd, @S[1], Length(S), TlsSendFlags);
+    TlsElapsed := RawWaitForClose(Fd, TlsCloseBoundMs + 2000);
+    CloseSocket(Fd);
+    Check((TlsElapsed >= 0) and (TlsElapsed < TlsCloseBoundMs),
+      Format('tls: silent peer dropped by the %d ms handshake deadline ' +
+      '(after %d ms)', [TlsHandshakeDeadlineMs, TlsElapsed]));
+
+    // Volume guard: far more ciphertext than any handshake needs, in
+    // one burst. The connection dies bounded instead of buffering it.
+    StressPhase := 'tls section: inbound budget';
+    Fd := RawConnect(TlsPort);
+    SetLength(Garbage, 256 * 1024);
+    for I := 0 to High(Garbage) do
+      Garbage[I] := Byte((I * 61 + 3) and $FF);
+    fpSend(Fd, @Garbage[0], Length(Garbage), TlsSendFlags);
+    TlsElapsed := RawWaitForClose(Fd, TlsCloseBoundMs + 2000);
+    CloseSocket(Fd);
+    Check((TlsElapsed >= 0) and (TlsElapsed < TlsCloseBoundMs),
+      Format('tls: %d KiB pre-handshake flood dropped against a %d KiB ' +
+      'budget (after %d ms)', [Length(Garbage) div 1024,
+      TlsInboundBudget div 1024, TlsElapsed]));
+
+    // Both guards fire per connection, not per listener.
+    StressPhase := 'tls section: survivor';
+    TlsCli := TWSClient.Create;
+    TlsCli.Connect(TlsUrl);
+    TlsCli.SendText(HelloProbe);
+    Ok := TlsCli.ReadMessage(IsText, Data) and IsText and
+      (Length(Data) = Length(HelloProbe));
+    TlsCli.Close(1000, '');
+    TlsCli.Free;
+    Check(Ok, 'tls: the listener still serves wss after both guards fired');
+
+    StressPhase := 'tls section: teardown';
+    TlsSrvT.Terminate;
+    TlsSrvT.Srv.Stop;
+    TlsSrvT.WaitFor;
+    TlsSrvT.Srv.Free;
+    TlsSrvT.Free;
+    try
+      ExecuteProcess('/bin/sh', ['-c', 'rm -rf "' + TlsDir + '"']);
+    except
+      // A leftover temp directory is not a battery failure.
+    end;
+  end;
+  {$else}
+  WriteLn('skip - tls: the wss section is Linux-only (it exercises the ',
+    'epoll transport; macOS server TLS is Network.framework and the ',
+    'macOS client cannot trust a runtime CA)');
+  {$endif}
 
   // --- concurrent-connections stress -------------------------------------
   StressPhase := 'storm';

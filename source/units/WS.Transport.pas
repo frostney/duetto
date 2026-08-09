@@ -96,13 +96,70 @@ type
   TWSTransportPostEvent = procedure(AConn: TWSTransportConn;
     AData: Pointer) of object;
 
-  // Server-side TLS for transports whose platform stack carries it
-  // natively (Network.framework). Identity arrives as a PKCS#12 file —
-  // the one file-based input Apple's Security framework imports cleanly.
+  // Server-side TLS configuration. Identity arrives as a PKCS#12 file —
+  // the one file-based input Apple's Security framework imports cleanly,
+  // and the shape lwpt's TransportSecurity server context takes too.
+  //
+  // Two families of backend consume this record:
+  //
+  //   - Network.framework (macOS) terminates TLS inside the platform
+  //     stack. It reads Enabled/Pkcs12Path/Pkcs12Passphrase and IGNORES
+  //     every field below them: the flow-control watermarks, the
+  //     handshake deadline and the inbound budget are properties of the
+  //     OpenSSL memory-BIO pipeline that only the fd-owning transports
+  //     drive. nw_connection does its own buffering and its own
+  //     handshake timeout.
+  //   - epoll (Linux) and IOCP (Windows) terminate TLS themselves over
+  //     lwpt's TransportSecurity server API (WS.Transport.TlsServer).
+  //     Every field here applies.
+  //
+  // All the tuning fields take 0 to mean "the default" so
+  // WSTransportNoTls — and any zero-initialized record — is a valid
+  // configuration.
   TWSTransportTls = record
     Enabled: Boolean;
     Pkcs12Path: string;
     Pkcs12Passphrase: string;
+
+    // Encrypted-input high watermark, in bytes: how much ciphertext one
+    // connection may hold undigested before the transport stops reading
+    // its socket. 0 = lwpt's default (64 KiB). Must sit within lwpt's
+    // TLS_SERVER_MIN/MAX_INPUT_CAPACITY (17 KiB … 256 KiB) — the floor
+    // is one maximum-size TLS record, so a connection can always make
+    // progress. OpenSSL backends only.
+    InputHighWater: Integer;
+
+    // Encrypted-input low watermark, in bytes: intake resumes only once
+    // buffered ciphertext has fallen back to this. The hysteresis that
+    // keeps a busy connection from toggling EPOLLIN on every record.
+    // 0 = half the resolved high watermark. Must be below it.
+    // OpenSSL backends only.
+    InputLowWater: Integer;
+
+    // Encrypted-output capacity, in bytes: the ceiling on ciphertext
+    // produced but not yet handed to the socket. Bounds how much
+    // plaintext one SubmitSend can absorb (the rest is re-offered
+    // through OnSendReady). 0 = lwpt's default (64 KiB); range is
+    // TLS_SERVER_MIN/MAX_OUTPUT_CAPACITY (17 KiB … 256 KiB).
+    // Independent of the input capacities. OpenSSL backends only.
+    OutputCapacity: Integer;
+
+    // Reactor-owned monotonic budget, in milliseconds, from accept until
+    // the TLS handshake completes. A connection that has not finished by
+    // then is aborted. 0 = WSTlsDefaultHandshakeDeadlineMs (10 s).
+    // The slow-loris guard on the clock axis. OpenSSL backends only.
+    HandshakeDeadlineMs: Integer;
+
+    // Total ciphertext, in bytes, one connection may push at the server
+    // BEFORE its handshake completes; exceeding it aborts the
+    // connection. 0 = WSTlsDefaultInboundHandshakeBudget (64 KiB — an
+    // order of magnitude above any real ClientHello/certificate flight).
+    // The slow-loris guard on the volume axis: it stops a peer from
+    // trickling well-formed-looking records forever, which the deadline
+    // alone would only catch after the full timeout, and stops a
+    // garbage flood from being re-offered indefinitely.
+    // OpenSSL backends only.
+    InboundHandshakeBudget: Integer;
   end;
 
   TWSTransport = class
@@ -181,6 +238,11 @@ begin
   Result.Enabled := False;
   Result.Pkcs12Path := '';
   Result.Pkcs12Passphrase := '';
+  Result.InputHighWater := 0;
+  Result.InputLowWater := 0;
+  Result.OutputCapacity := 0;
+  Result.HandshakeDeadlineMs := 0;
+  Result.InboundHandshakeBudget := 0;
 end;
 
 procedure TWSTransport.Open;
