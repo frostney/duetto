@@ -50,11 +50,17 @@ type
 
   // Pushes its sequence until the queue refuses, so Stop is guaranteed a
   // live producer to race. Cap is a runaway guard, not the expected exit.
+  // Producers spin on StartGate before the first push: releasing them
+  // together makes the pre-Stop window a fixed few milliseconds for
+  // every producer, so no early starter can reach the cap while the
+  // scheduler is still warming a late one up (the exact interleaving a
+  // slow Windows VM produced — Sleep(1) there rounds to ~16 ms).
   TRacingPusherThread = class(TThread)
   public
     Queue: TWSPostQueue;
     ProducerId: NativeUInt;
     Cap: Integer;
+    StartGate: PBoolean;
     // Published with InterlockedIncrement so the main thread can watch
     // the producers spin up before it lands Stop; final after WaitFor.
     Accepted: LongInt;
@@ -192,6 +198,10 @@ var
 begin
   Accepted := 0;
   HitCap := False;
+  // ThreadSwitch is an opaque RTL call, so the gate read cannot be
+  // hoisted out of the loop.
+  while not StartGate^ do
+    ThreadSwitch;
   // Sequence and counter move in lockstep, so the accepted sequences are
   // exactly 0 .. Accepted-1 — the property the Stop chain is checked
   // against.
@@ -306,20 +316,23 @@ procedure TPostQueueConcurrency.TestPushRacingStop;
 const
   Producers = 4;
   // Runaway guard only: reaching it means Stop never refused, which the
-  // HitCap assertion below turns into a red test.
-  PushCap = 500000;
-  SpinUpPushes = 1000;
-  SpinUpLimitMs = 30000;
+  // HitCap assertion below turns into a red test. Sized so it is
+  // unreachable inside the fixed pre-Stop window: every push crosses
+  // one shared critical section, which bounds the aggregate well below
+  // Cap-per-producer in tens of milliseconds.
+  PushCap = 2000000;
+  RaceWindowMs = 10;
 var
   Q: TWSPostQueue;
   Threads: array[0..Producers - 1] of TRacingPusherThread;
   NextSeq: array[0..Producers - 1] of PtrUInt;
   Node, Head, Next: PWSPostNode;
   I, Producer, Delivered, AcceptedSum: Integer;
-  SpunUp, ExactOk, RefusedOk, CountOk: Boolean;
-  Deadline: QWord;
+  ExactOk, RefusedOk, CountOk: Boolean;
+  Gate: Boolean;
 begin
   Q := TWSPostQueue.Create;
+  Gate := False;
   try
     for I := 0 to Producers - 1 do
     begin
@@ -327,21 +340,19 @@ begin
       Threads[I].Queue := Q;
       Threads[I].ProducerId := NativeUInt(I);
       Threads[I].Cap := PushCap;
+      Threads[I].StartGate := @Gate;
       NextSeq[I] := 0;
     end;
     for I := 0 to Producers - 1 do
       Threads[I].Start;
 
-    // Wait for every producer to be demonstrably mid-flight, then Stop.
-    SpunUp := False;
-    Deadline := GetTickCount64 + SpinUpLimitMs;
-    while (not SpunUp) and (GetTickCount64 < Deadline) do
-    begin
-      SpunUp := True;
-      for I := 0 to Producers - 1 do
-        SpunUp := SpunUp and (Threads[I].Accepted > SpinUpPushes);
-      if not SpunUp then Sleep(1);
-    end;
+    // Release every producer at once, give them a fixed window to
+    // hammer, then land Stop mid-flight. A producer the scheduler
+    // starves for the whole window is simply refused at its first push
+    // (Accepted = 0) — still a valid outcome of the rendezvous, never a
+    // false failure.
+    Gate := True;
+    Sleep(RaceWindowMs);
     Head := Q.Stop;
 
     // Join and free every producer before asserting: an assertion that
@@ -386,7 +397,6 @@ begin
     for I := 0 to Producers - 1 do
       Threads[I].Free;
 
-    Expect<Boolean>(SpunUp).ToBe(True);        // Stop landed mid-flight
     Expect<Boolean>(RefusedOk).ToBe(True);     // ended by refusal, not cap
     Expect<Boolean>(AcceptedSum > 0).ToBe(True);
     Expect<Integer>(Delivered).ToBe(AcceptedSum);
