@@ -127,6 +127,16 @@ type
     // TLS_SERVER_MIN/MAX_INPUT_CAPACITY (17 KiB … 256 KiB) — the floor
     // is one maximum-size TLS record, so a connection can always make
     // progress. OpenSSL backends only.
+    //
+    // It is also the PER-ROUND SOCKET READ BOUND on a TLS connection.
+    // lwpt accepts at most this much per feed and the transport carries
+    // the remainder in a per-connection buffer, so reading a whole
+    // transport-sized buffer (256 KiB on epoll, 64 KiB on IOCP) would
+    // let a flooding peer pin [read size − watermark] bytes per
+    // connection on top of the bound configured here — and pin a
+    // different amount on each backend. Clamping the read to the
+    // watermark makes this one number the whole per-connection inbound
+    // bound, identically on both.
     InputHighWater: Integer;
 
     // Encrypted-input low watermark, in bytes: intake resumes only once
@@ -148,6 +158,12 @@ type
     // the TLS handshake completes. A connection that has not finished by
     // then is aborted. 0 = WSTlsDefaultHandshakeDeadlineMs (10 s).
     // The slow-loris guard on the clock axis. OpenSSL backends only.
+    //
+    // The graceful-close drain REUSES this budget as its own deadline:
+    // pushing close_notify out and waiting for the peer's FIN is the
+    // same "a peer that went quiet must not pin an fd forever" problem
+    // on the same time scale, and a second knob for it would be a
+    // configuration surface with no distinct decision behind it.
     HandshakeDeadlineMs: Integer;
 
     // Total ciphertext, in bytes, one connection may push at the server
@@ -177,6 +193,14 @@ type
     // long (the epoll transport additionally completes at most one
     // readiness round per call; queue-driven transports do their work on
     // their own queues and simply wait here).
+    //
+    // "At most" is literal, and server TLS makes it observable: while
+    // any connection carries a TLS deadline (a handshake pending, a
+    // close_notify draining) the fd-owning transports bound their park
+    // so the deadline can be swept. A bounded Run(N) may therefore
+    // return EARLY — never later — and a host that treats the call as a
+    // fixed-length tick must re-check its own clock rather than count
+    // Run returns.
     procedure Run(ATimeoutMs: Integer = -1); virtual; abstract;
 
     // Thread-safe. Unblocks Run and stops accepting new connections.

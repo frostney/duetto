@@ -16,6 +16,16 @@ program wsecho;
 // transports need libssl/libcrypto 3 at runtime — on Windows that means
 // libssl-3-x64.dll and libcrypto-3-x64.dll reachable from the
 // executable's directory or System32.
+//
+// There are deliberately no knobs for the TLS flow-control policy: the
+// program serves with every TWSTransportTls tuning field left at 0,
+// which is lwpt's own default shape — a 64 KiB encrypted-input
+// watermark (also the per-round socket read bound) with a 32 KiB
+// resume watermark, 64 KiB of encrypted-output capacity, a 10 s
+// handshake deadline and a 64 KiB pre-handshake inbound budget.
+// Squeezing those is a listener-tuning decision an echo/conformance
+// target has no opinion about; wsinterop is where the extremes are
+// exercised.
 
 {$I Shared.inc}
 

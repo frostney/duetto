@@ -380,6 +380,13 @@ const
   TlsInboundBudget = 20 * 1024;
   TlsBigEchoBytes = 512 * 1024;
   TlsCloseBoundMs = 4000;
+  // Bytes pipelined immediately behind the close frame in the
+  // RST-safety check. Sized against two bounds: comfortably more than
+  // one clamped read window (TlsInputHighWater), so the server cannot
+  // have consumed them all before its drain begins and they are
+  // genuinely UNREAD when it closes; and small enough to sit in the
+  // loopback socket buffers, so the probe's own write never blocks.
+  TlsClosePipelineBytes = 128 * 1024;
   // Backpressure probe: a deliberately tiny receive buffer on the
   // client side so the SERVER's socket backs up after a few kilobytes
   // of echo, which is what stalls its decryption and fills the
@@ -1491,9 +1498,18 @@ begin
   // libssl-3/libcrypto-3 loadable from the executable's directory or
   // System32 (LOAD_LIBRARY_SEARCH_DEFAULT_DIRS — %PATH% is not searched),
   // which no CI runner supplies, and the 32-bit build has no 32-bit
-  // OpenSSL 3 to find at all. The IOCP wiring is covered by the Autobahn
-  // and plaintext batteries plus the platform-neutral
-  // WS.Transport.TlsServer suite instead.
+  // OpenSSL 3 to find at all.
+  //
+  // Say the consequence plainly: WINDOWS HAS NO RUNTIME TLS COVERAGE.
+  // The win64 CI leg proves the IOCP TLS code COMPILES, and the
+  // WS.Transport.TlsServer suite covers what is platform-neutral —
+  // policy resolution and the carry buffer — but not one byte of
+  // Windows server TLS is exercised against a real socket anywhere.
+  // Closing that gap is achievable follow-up work: a win64-only leg
+  // with vendored OpenSSL 3 DLLs next to the executable and the
+  // throwaway CA pushed into the runner's store with
+  // `certutil -addstore Root` is safe on a disposable runner, which is
+  // exactly what a developer machine is not.
   //
   // A third server carries the section — the flow-control watermarks are
   // deliberately squeezed to lwpt's floor here, which is not what a
@@ -1587,6 +1603,52 @@ begin
     CloseTransportSecurity(TlsProbe);
     CloseSocket(TlsProbeFd);
     Check(TlsOk, 'tls: graceful close flushes close_notify before FIN');
+
+    // The same close, with a trailer pipelined right behind the close
+    // frame — bytes the server is still holding UNREAD when its drain
+    // starts. That is the case the check above cannot see, because a
+    // probe that goes quiet leaves an empty receive queue: close() on a
+    // socket with unread bytes sends RST instead of FIN, and a peer
+    // that receives RST may discard its own buffered receive data,
+    // alert included. Surviving this is what says the drain half-closes
+    // and reads the rest away rather than closing outright.
+    StressPhase := 'tls section: close_notify behind a pipelined trailer';
+    // lwpt's blocking client write has no MSG_NOSIGNAL knob, and this
+    // probe deliberately keeps writing into a socket a broken server
+    // would reset mid-write. Ignoring SIGPIPE turns that into an EPIPE
+    // the code below reports as a red check instead of a signal that
+    // kills the battery outright — measured: without the transport's
+    // drain this section takes the process down with exit 141.
+    fpSignal(SIGPIPE, SignalHandler(SIG_IGN));
+    TlsProbeFd := RawConnectEx(TlsPort, False);
+    StartTransportSecurity(TlsProbe, TlsProbeFd, '127.0.0.1');
+    TlsOk := False;
+    try
+      TlsLeft := TlsProbeHandshake(TlsProbe, TlsPort);
+      // One write, so the trailer is already in flight while the server
+      // is still digesting the first clamped input window — no sleep,
+      // no reliance on the server losing a race.
+      TlsOk := TlsProbe.Active and TlsProbeWrite(TlsProbe,
+        BuildFrameBytes(WS_OP_CLOSE, #$03#$E8, True) +
+        BuildFrameBytes(WS_OP_BINARY,
+        TlsBurstPayload(0, TlsClosePipelineBytes), True));
+      TlsCode := TlsProbeReadCloseCode(TlsProbe, TlsLeft);
+      TlsOk := TlsOk and (TlsCode = 1000) and TlsProbeSawCloseNotify(TlsProbe);
+    except
+      // A reset in place of an orderly shutdown surfaces as an exception
+      // out of lwpt's blocking client. That IS the failure this check
+      // exists to catch, so name it and go red.
+      on E: Exception do
+      begin
+        TlsOk := False;
+        WriteLn('       pipelined-close probe: ', E.Message);
+      end;
+    end;
+    CloseTransportSecurity(TlsProbe);
+    CloseSocket(TlsProbeFd);
+    Check(TlsOk, Format('tls: close_notify survives %d KiB pipelined behind ' +
+      'the close frame (unread input must not turn the FIN into an RST)',
+      [TlsClosePipelineBytes div 1024]));
 
     // A throttled peer. The probe's receive buffer is a fraction of the
     // echo it is about to earn, and it writes everything — one large

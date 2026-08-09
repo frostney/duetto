@@ -27,6 +27,13 @@ unit WS.Transport.Iocp;
 //   - the next WSARecv suppressed while lwpt reports encrypted-input
 //     backpressure, re-armed on lwpt's own low-water hysteresis — the
 //     Windows counterpart of the epoll reactor dropping EPOLLIN;
+//   - the WSARecv length clamped to the configured encrypted-input
+//     watermark, so that one number bounds a TLS connection's whole
+//     inbound footprint rather than just lwpt's share of it;
+//   - a self-posted completion that carries an OnSendReady debt no I/O
+//     is left to carry (SendReadyCompletionKey, see
+//     EnsureSendReadyCarrier) — the one thing level-triggered readiness
+//     hands the epoll reactor for free and a completion port does not;
 //   - a deferred close: close_notify has to reach the socket before the
 //     FIN, which can outlive the SubmitClose that asked for it.
 
@@ -86,6 +93,12 @@ type
     // output, and a send completion that skipped the callback there
     // strands the connection with no completion left to restart it.
     FSendReadyOwed: Boolean;
+    // A SendReadyCompletionKey packet for this connection is in the
+    // port and has not been dequeued yet, OR was dequeued and produced
+    // no forward progress. Cleared only by a REAL I/O completion, which
+    // is what keeps the carrier one-shot: a session that cannot make
+    // progress goes quiet instead of spinning the port.
+    FSendReadyPosted: Boolean;
     FTimed: Boolean;           // counted in the transport's deadline sweep
     FDeadline: QWord;          // close-drain deadline (monotonic)
     procedure ArmReceive;
@@ -103,6 +116,7 @@ type
     function TlsIngest(P: PByte; ALen: NativeInt): TWSTlsIngestResult;
     procedure ArmTlsReceive;
     procedure ResumeTlsReceive;
+    procedure EnsureSendReadyCarrier;
     procedure BeginTlsClose;
     procedure StepTlsClose;
     procedure RunDeferredClose;
@@ -133,6 +147,8 @@ type
     FTlsContext: TTransportSecurityServerContext;
     FTlsPolicy: TWSTlsPolicy;
     FTimedCount: Integer;      // connections carrying a live deadline
+    FTlsReadLen: DWORD;        // per-round WSARecv bound on a TLS conn
+    FNextSweepTick: QWord;     // deadline sweeps are amortized on the clock
     procedure ArmAccept;
     procedure Track(AConn: TWSIocpConn);
     procedure Untrack(AConn: TWSIocpConn);
@@ -142,7 +158,10 @@ type
       AOverlapped: POverlapped; ABytes: DWORD; ASucceeded: Boolean);
     procedure HandleReceivedTls(AConn: TWSIocpConn; ABytes: DWORD);
     procedure HandleSendCompletionTls(AConn: TWSIocpConn);
-    procedure SweepTlsDeadlines;
+    procedure PostSendReady(AConn: TWSIocpConn);
+    procedure DeliverSendReady(AConnId: NativeUInt);
+    procedure SweepTlsDeadlines(ANowTick: QWord);
+    procedure MaybeSweepTlsDeadlines;
     function DeadlineBoundedWait(ATimeout: DWORD): DWORD;
     procedure WaitAndDispatch(ATimeout: DWORD);
     procedure DeliverPosts(AChain: PWSPostNode; ADropped: Boolean);
@@ -173,6 +192,12 @@ const
   ListenerCompletionKey = PtrUInt(1);
   WakeCompletionKey = PtrUInt(2);
   PostCompletionKey = PtrUInt(3); // SubmitPost wake: drain FPosts
+  // Self-posted OnSendReady carrier. The packet's "overlapped" slot is
+  // not a pointer at all — it carries the connection's Id, because the
+  // connection may be freed between the post and the dequeue and a raw
+  // pointer would then be dangling. Dispatch looks the Id up in FLive,
+  // exactly like the post drain does.
+  SendReadyCompletionKey = PtrUInt(4);
   LiveTableGrowth = 64;
   AcceptAddressLength = SizeOf(TSockAddrIn) + 16;
   // Granularity of the TLS deadline sweep. Only ever shortens a wait
@@ -265,7 +290,15 @@ var
 begin
   if FDead then Exit;
   FillChar(FReceiveOverlapped, SizeOf(FReceiveOverlapped), 0);
-  Buffer.Len := SizeOf(FReceiveBuffer);
+  // A TLS connection reads at most one encrypted-input watermark per
+  // round: lwpt accepts no more than that per feed and the remainder
+  // would sit in the per-connection carry buffer, so a full-buffer
+  // read would let a flooding peer pin the configured bound PLUS the
+  // difference. Same clamp, same reasoning, as the epoll reactor's.
+  if FTls <> nil then
+    Buffer.Len := FTransport.FTlsReadLen
+  else
+    Buffer.Len := SizeOf(FReceiveBuffer);
   Buffer.Buf := PAnsiChar(@FReceiveBuffer[0]);
   Flags := 0;
   Inc(FOutstanding);
@@ -459,10 +492,15 @@ begin
   end;
   // A short accept owes the caller an OnSendReady whatever caused it —
   // a send already in flight, or the encrypted-output capacity running
-  // out while the socket stayed writable. Either way lwpt had
-  // ciphertext to hand over, so a WSASend is outstanding and its
-  // completion is what pays the debt.
-  if Result < ALen then FSendReadyOwed := True;
+  // out while the socket stayed writable. Usually lwpt had ciphertext
+  // to hand over, so a WSASend is outstanding and its completion is
+  // what pays the debt; EnsureSendReadyCarrier covers the states where
+  // it did not.
+  if Result < ALen then
+  begin
+    FSendReadyOwed := True;
+    EnsureSendReadyCarrier;
+  end;
 end;
 
 // Arm the next receive unless lwpt's encrypted input is still
@@ -503,6 +541,39 @@ begin
   if FRecvSuppressed then ArmTlsReceive;
 end;
 
+// The OnSendReady debt needs a CARRIER — some completion that will run
+// HandleSendCompletionTls and pay it. Normally the short accept came
+// with ciphertext lwpt handed the socket, so a WSASend is outstanding
+// and its completion is the carrier. Two states owe the caller with
+// nothing on the wire and nothing queued:
+//
+//   - an offer made before the session activated (Encrypt refuses
+//     everything until the handshake is done);
+//   - a write retry lwpt could not resume, parked on tssWantRead, so
+//     ResumeWrite returns having produced no ciphertext at all.
+//
+// The epoll reactor survives both for free: level-triggered EPOLLOUT
+// on a writable socket manufactures an event every round. A completion
+// port manufactures nothing, so the debt would sit unpaid with no I/O
+// left to restart the connection. Post the completion ourselves.
+//
+// INVARIANT: at most one carrier is outstanding per connection, and
+// FSendReadyPosted is cleared only by a real I/O completion (see
+// HandleConnectionCompletion). A session that is genuinely stuck
+// therefore gets exactly one carrier per real completion — it goes
+// quiet waiting for the input that unblocks it, instead of spinning
+// the port on a debt it cannot pay.
+procedure TWSIocpConn.EnsureSendReadyCarrier;
+begin
+  if FDead or FClosing or (FTls = nil) then Exit;
+  if (not FSendReadyOwed) or FSendReadyPosted then Exit;
+  // Something IS coming back: an in-flight send, or ciphertext the next
+  // flush will put in flight.
+  if FSendInFlight or (FTls.PendingCiphertext > 0) then Exit;
+  FSendReadyPosted := True;
+  FTransport.PostSendReady(Self);
+end;
+
 procedure TWSIocpConn.BeginTlsClose;
 begin
   FClosing := True;
@@ -523,8 +594,9 @@ begin
   StepTlsClose;
 end;
 
-// One step of the close_notify drain. Runs from BeginTlsClose, from a
-// send completion, and from the deadline sweep's bound.
+// One step of the close_notify drain. Runs from BeginTlsClose and from
+// a send completion — never from the deadline sweep, which does not
+// step a stalled drain but ends it (HardClose on the close deadline).
 procedure TWSIocpConn.StepTlsClose;
 begin
   if FTls.DrainClose then
@@ -579,6 +651,12 @@ begin
     FTlsPolicy := WSTlsResolvePolicy(ATls);
     FTlsContext := WSTlsCreateServerContext(ATls, FTlsPolicy);
   end;
+  // See ArmReceive: on a TLS connection this, not the buffer size, is
+  // the per-round read bound.
+  FTlsReadLen := IocpReceiveBufferSize;
+  if (FTlsContext <> nil) and
+    (DWORD(FTlsPolicy.InputHighWater) < FTlsReadLen) then
+    FTlsReadLen := DWORD(FTlsPolicy.InputHighWater);
 
   if WSAStartup($0202, Data) <> 0 then
     raise Exception.Create('WSAStartup failed');
@@ -817,6 +895,12 @@ end;
 procedure TWSIocpTransport.HandleConnectionCompletion(AConn: TWSIocpConn;
   AOverlapped: POverlapped; ABytes: DWORD; ASucceeded: Boolean);
 begin
+  // A real I/O completion is the only thing that clears the carrier
+  // token: it is the round in which something outside this process
+  // could have changed, so a debt still unpaid after it deserves a
+  // fresh carrier. Clearing it in the carrier's own delivery instead
+  // would let a permanently stuck session re-post forever.
+  AConn.FSendReadyPosted := False;
   if AOverlapped = @AConn.FReceiveOverlapped then
   begin
     // The completed WSARecv's pin is ours to release. In a finally: a
@@ -842,7 +926,13 @@ begin
       if AConn.FDead then
         AConn.TryFinalize
       else if AConn.FTls <> nil then
-        AConn.ArmTlsReceive
+      begin
+        // Carrier bookkeeping FIRST: an arm that fails synchronously
+        // reaps the connection through RemoteClosed, and nothing may
+        // touch the object after that.
+        AConn.EnsureSendReadyCarrier;
+        AConn.ArmTlsReceive;
+      end
       else
         AConn.ArmReceive;
     end;
@@ -981,22 +1071,88 @@ begin
     if Assigned(OnSendReady) then OnSendReady(AConn);
     if AConn.FDead or AConn.FClosing then Exit;
   end;
+  // Before ResumeTlsReceive, which can reap the connection on an arm
+  // failure. A re-offer inside the callback above may have gone short
+  // against a state with nothing on the wire; that debt needs a carrier
+  // just as much as the first one did.
+  AConn.EnsureSendReadyCarrier;
   AConn.ResumeTlsReceive;
 end;
 
-// Reactor-owned deadlines, swept once per completion round and only
-// while at least one connection carries one. Two kinds:
+// Put the OnSendReady carrier in the port (see EnsureSendReadyCarrier).
+// The Id rides the overlapped slot rather than a pointer to the
+// connection: the packet can outlive the object it names, and the
+// dispatch resolves it by lookup instead of dereference. Ids are
+// monotonic and never reused, so the lookup cannot land on a different
+// connection either.
+procedure TWSIocpTransport.PostSendReady(AConn: TWSIocpConn);
+begin
+  if FCompletionPort = 0 then Exit;
+  // Quota exhaustion is the documented transient failure here, exactly
+  // as on the post wake; one retry clears it in practice. If both fail
+  // the connection waits for its next real completion — the same
+  // position it was in before the carrier existed, never worse.
+  // Through Pointer, like the completion-key cast in WaitAndDispatch:
+  // the ordinal-to-pointer step is the one FPC wants spelled out.
+  if not C_PostQueuedCompletionStatus(FCompletionPort, 0,
+      SendReadyCompletionKey, POverlapped(Pointer(AConn.Id))) then
+    C_PostQueuedCompletionStatus(FCompletionPort, 0,
+      SendReadyCompletionKey, POverlapped(Pointer(AConn.Id)));
+end;
+
+// Deliver a self-posted carrier. Drain-style and id-validated, like the
+// post path: the connection may have died and been freed between the
+// post and this dequeue, and one that is dead, finalizing or draining
+// its close_notify has nothing left to be paid.
+procedure TWSIocpTransport.DeliverSendReady(AConnId: NativeUInt);
+var
+  I: Integer;
+  Conn: TWSIocpConn;
+begin
+  Conn := nil;
+  for I := 0 to FLiveCount - 1 do
+    if FLive[I].Id = AConnId then
+    begin
+      if not (FLive[I].FDead or FLive[I].FClosing) then Conn := FLive[I];
+      Break;
+    end;
+  if (Conn = nil) or (Conn.FTls = nil) then Exit;
+  // Deliberately does NOT clear FSendReadyPosted: the token stays set
+  // until a real completion arrives, which is what stops a session that
+  // cannot make progress from re-posting a carrier per round.
+  //
+  // Pin across the callback like every other path that can reach user
+  // code, and release it in a finally — a raising handler would
+  // otherwise strand the pin and hang Shutdown's drain forever.
+  Inc(Conn.FOutstanding);
+  try
+    // Exactly what a send completion does: pump the engine, then pay
+    // the debt and re-arm intake.
+    HandleSendCompletionTls(Conn);
+  finally
+    Dec(Conn.FOutstanding);
+    if Conn.FDead then Conn.TryFinalize;
+  end;
+end;
+
+// Reactor-owned deadlines. Two kinds:
 //   - handshake pending: a peer that connected and then went quiet (or
 //     trickles just enough to look alive) is aborted;
 //   - graceful close draining: a peer that stopped reading must not pin
 //     the socket forever waiting for its close_notify to fit.
-procedure TWSIocpTransport.SweepTlsDeadlines;
+//
+// The skip precondition is deliberately the same one the epoll sweep
+// uses — "not carrying a clock, or already reaped" — even though the
+// two transports spell "already reaped" differently: this transport has
+// a pending-finalize state (FDead with pins still outstanding) and must
+// test it, while epoll untracks synchronously and has nothing to test.
+// The reap condition matches too: a session that is dead can never
+// activate, so it leaves on the same pass a timed-out one does.
+procedure TWSIocpTransport.SweepTlsDeadlines(ANowTick: QWord);
 var
   I: Integer;
-  NowTick: QWord;
   Conn: TWSIocpConn;
 begin
-  NowTick := SysUtils.GetTickCount64;
   I := 0;
   while I < FLiveCount do
   begin
@@ -1008,14 +1164,33 @@ begin
     end;
     if Conn.FClosing then
     begin
-      if NowTick >= Conn.FDeadline then Conn.HardClose;
+      if ANowTick >= Conn.FDeadline then Conn.HardClose;
     end
-    else if Conn.FTls.DeadlineExpired then
+    else if Conn.FTls.Dead or Conn.FTls.DeadlineExpired then
       RemoteClosed(Conn);
     // Untrack swaps the last entry into this slot, so an index that
     // still holds the same object is the only one safe to advance past.
     if (I < FLiveCount) and (FLive[I] = Conn) then Inc(I);
   end;
+end;
+
+// The sweep is O(live connections), so running it after every single
+// completion is O(N) per completion — and under handshake churn
+// FTimedCount is permanently positive, so "only while a deadline
+// exists" is no bound at all. Gate it on the clock instead: the
+// deadline resolution is TlsDeadlinePollMs either way (that is already
+// the GetQueuedCompletionStatus bound a live deadline imposes), so
+// amortizing to one scan per poll interval costs nothing and removes
+// the per-completion cost.
+procedure TWSIocpTransport.MaybeSweepTlsDeadlines;
+var
+  NowTick: QWord;
+begin
+  if FTimedCount <= 0 then Exit;
+  NowTick := SysUtils.GetTickCount64;
+  if NowTick < FNextSweepTick then Exit;
+  FNextSweepTick := NowTick + QWord(TlsDeadlinePollMs);
+  SweepTlsDeadlines(NowTick);
 end;
 
 procedure TWSIocpTransport.WaitAndDispatch(ATimeout: DWORD);
@@ -1037,6 +1212,14 @@ begin
   if CompletionKey = PostCompletionKey then
   begin
     DeliverPosts(FPosts.Drain, False);
+    Exit;
+  end;
+  // Same shape, and for the same reason it precedes the nil guard: the
+  // carrier's "overlapped" is an Id, not a pointer, and may be any
+  // value the connection counter produced.
+  if CompletionKey = SendReadyCompletionKey then
+  begin
+    DeliverSendReady(NativeUInt(PtrUInt(Overlapped)));
     Exit;
   end;
   // Stop's wake is a WakeCompletionKey with a nil overlapped and is
@@ -1187,13 +1370,13 @@ begin
     repeat
       WaitAndDispatch(DeadlineBoundedWait(InfiniteWait));
       SweepPosts;
-      if FTimedCount > 0 then SweepTlsDeadlines;
+      MaybeSweepTlsDeadlines;
     until not FRunning
   else
   begin
     WaitAndDispatch(DeadlineBoundedWait(DWORD(ATimeoutMs)));
     SweepPosts;
-    if FTimedCount > 0 then SweepTlsDeadlines;
+    MaybeSweepTlsDeadlines;
   end;
 end;
 

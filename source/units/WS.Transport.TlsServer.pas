@@ -28,6 +28,15 @@ unit WS.Transport.TlsServer;
 //                  transport arms its writability notification), < 0 =
 //                  the socket is dead.
 //
+// NEITHER CALLBACK MAY RAISE. An exception unwinds out of the middle of
+// a pump, leaving the lwpt session half-driven (ciphertext produced but
+// not consumed, a write retry outstanding, the carry buffer holding
+// bytes nobody will re-offer) with no way for this unit to reconcile
+// it. The transports treat a raising handler as fatal to Run, which is
+// exactly the convention WS.Transport already publishes for OnData: a
+// handler that can fail must catch its own failure and tear the
+// connection down deliberately.
+//
 // This unit owns the exact accounting on both sides: it re-offers what
 // lwpt would not accept (the carry buffer below), consumes exactly what
 // the socket took (TransportSecurityConsumeCiphertext), and never
@@ -133,12 +142,14 @@ type
   // Decrypted application bytes. The pointer is session-owned and valid
   // only for the duration of the call. False = the delivery dropped
   // this connection; the pump stops immediately and nothing here may be
-  // touched again.
+  // touched again. MUST NOT RAISE — an exception leaves the session
+  // mid-pump with no way to reconcile it (see the unit header).
   TWSTlsPlaintextEvent = function(P: PByte; ALen: NativeInt): Boolean of object;
 
   // Hand ciphertext to the socket. Returns bytes taken (a short take is
   // normal — the transport arms its writability notification and the
   // remainder rides the next pump), or -1 when the socket is dead.
+  // MUST NOT RAISE, for the same reason as TWSTlsPlaintextEvent.
   TWSTlsCiphertextEvent = function(P: PByte; ALen: NativeInt): NativeInt of object;
 
   TWSTlsIngestResult = (
@@ -213,6 +224,14 @@ type
     // rather than the socket and the transport arms anyway to
     // manufacture the OnSendReady the caller is owed.
     function NeedsWritable: Boolean;
+
+    // Ciphertext lwpt has produced that the socket has not taken yet.
+    // A completion-port transport reads it to tell "a write is already
+    // on its way back to me" — its completion will re-drive the pump —
+    // from "nothing will ever complete on this connection again", which
+    // is the state a short Encrypt with an empty output queue leaves
+    // behind and the one that needs a self-posted carrier.
+    function PendingCiphertext: NativeInt;
 
     property HandshakeDone: Boolean read FHandshakeDone;
     property Dead: Boolean read FDead;
@@ -341,11 +360,16 @@ begin
     else
       Result.InboundHandshakeBudget := WSTlsDefaultInboundHandshakeBudget;
   // Same floor, enforced rather than applied, for an explicit value.
+  // Both numbers in the message are the RESOLVED ones actually compared:
+  // InputHighWater may itself have come from a default, and reporting
+  // the raw 0 the caller wrote would name a value nothing was checked
+  // against.
   if Result.InboundHandshakeBudget < Result.InputHighWater then
     raise EWSTlsServer.CreateFmt('TWSTransportTls.InboundHandshakeBudget ' +
-      'must be 0 (default %d) or at least InputHighWater (%d); got %d',
+      'must be 0 (default %d) or at least the resolved InputHighWater ' +
+      '(%d); got a resolved %d',
       [WSTlsDefaultInboundHandshakeBudget, Result.InputHighWater,
-      ATls.InboundHandshakeBudget]);
+      Result.InboundHandshakeBudget]);
 end;
 
 function WSTlsCreateServerContext(const ATls: TWSTransportTls;
@@ -432,6 +456,14 @@ function TWSTlsServerSession.NeedsWritable: Boolean;
 begin
   Result := (not FDead) and (FWriteRetry or
     (TransportSecurityPendingCiphertext(FConn) > 0));
+end;
+
+function TWSTlsServerSession.PendingCiphertext: NativeInt;
+begin
+  // A failed session has already had its backend state released; asking
+  // lwpt about it would be a question about nothing.
+  if FDead then Exit(0);
+  Result := TransportSecurityPendingCiphertext(FConn);
 end;
 
 // Hand the socket everything lwpt has produced, consuming exactly what
@@ -571,7 +603,12 @@ var
   N: Integer;
 begin
   if FDead or (ALen <= 0) then Exit(0);
+  // lwpt takes an Integer length. Only worth clamping where NativeInt is
+  // actually wider — on a 32-bit target the two are the same type and
+  // the compare is a tautology the compiler warns about.
+  {$ifdef CPU64}
   if ALen > High(Integer) then ALen := High(Integer);
+  {$endif}
   N := TransportSecurityFeedCiphertext(FConn, P, Integer(ALen));
   if N < 0 then
   begin

@@ -26,8 +26,13 @@ unit WS.Transport.Epoll;
 //   - EPOLLIN dropped from a connection's interest while lwpt reports
 //     encrypted-input backpressure, restored on lwpt's own low-water
 //     hysteresis;
+//   - the socket read clamped to the configured encrypted-input
+//     watermark, so that one number bounds a TLS connection's whole
+//     inbound footprint rather than just lwpt's share of it;
 //   - a deferred close: close_notify has to reach the socket before
-//     FIN, which can outlive the SubmitClose that asked for it.
+//     FIN, which can outlive the SubmitClose that asked for it, and
+//     which ends in a half-close plus an inbound drain rather than a
+//     bare close() — see FinishDeferredClose.
 
 {$I Shared.inc}
 
@@ -73,6 +78,11 @@ type
     FSendReadyOwed: Boolean;
     FTimed: Boolean;           // counted in the reactor's deadline sweep
     FDeadline: QWord;          // close-drain deadline (monotonic)
+    FFinSent: Boolean;         // half-closed; the drain is inbound-only
+    // Set by every ciphertext hand-off in the current writable round.
+    // False after a round means the engine never even offered the
+    // socket a byte — see the no-progress guard in DriveTlsWritable.
+    FWireActivity: Boolean;
     procedure ApplyInterest;
     procedure SetTimed(AValue: Boolean);
     function RawSend(P: PByte; ALen: NativeInt): NativeInt;
@@ -84,6 +94,7 @@ type
     procedure ReconcileTlsInterest;
     procedure BeginDeferredClose;
     procedure StepDeferredClose;
+    procedure FinishDeferredClose;
     procedure RunDeferredClose;
     procedure ForceClose;
   public
@@ -106,6 +117,8 @@ type
     FTlsContext: TTransportSecurityServerContext;
     FTlsPolicy: TWSTlsPolicy;
     FTimedCount: Integer;      // connections carrying a live deadline
+    FTlsReadLen: Integer;      // per-round socket read bound on a TLS conn
+    FNextSweepTick: QWord;     // deadline sweeps are amortized on the clock
 
     procedure EpollMod(AConn: TWSEpollConn; AEvents: Cardinal);
     procedure Track(AConn: TWSEpollConn);
@@ -114,8 +127,11 @@ type
     procedure HandleReadable(AConn: TWSEpollConn);
     procedure HandleReadableTls(AConn: TWSEpollConn);
     procedure HandleTlsEvent(AConn: TWSEpollConn; AEvents: Cardinal);
+    procedure HandleTlsClosingEvent(AConn: TWSEpollConn; AEvents: Cardinal);
+    procedure DrainClosingInput(AConn: TWSEpollConn);
     function DriveTlsWritable(AConn: TWSEpollConn): Boolean;
-    procedure SweepTlsDeadlines;
+    procedure SweepTlsDeadlines(ANowTick: QWord);
+    procedure MaybeSweepTlsDeadlines;
     procedure RemoteClosed(AConn: TWSEpollConn);
     procedure DeliverPosts(AChain: PWSPostNode; ADropped: Boolean);
   public
@@ -140,11 +156,17 @@ const
   // epoll_wait that would otherwise park, and only while at least one
   // connection carries a deadline — a plaintext listener never sees it.
   TlsDeadlinePollMs = 100;
+  ShutdownWrite = 1; // shutdown(): SHUT_WR
 
 // The RTL's Linux unit predates eventfd on some targets; bind libc
 // directly (explicit name — the formatter recases identifiers).
 function C_eventfd(ACount: Cardinal; AFlags: Integer): Integer; cdecl;
   external name 'eventfd';
+// Same treatment for shutdown(): the RTL's binding and its SHUT_*
+// constants are not uniform across FPC's unix targets, and the IOCP
+// transport binds its own for the same reason.
+function C_shutdown(AFd: Integer; AHow: Integer): Integer; cdecl;
+  external name 'shutdown';
 
 procedure SetNonBlocking(AFd: Integer);
 var
@@ -288,6 +310,11 @@ end;
 // returns, so a short write costs nothing but a later EPOLLOUT.
 function TWSEpollConn.TlsCiphertext(P: PByte; ALen: NativeInt): NativeInt;
 begin
+  // The engine only calls this when it HAS ciphertext to hand over, so
+  // the call itself is the round's progress marker: bytes moved, or the
+  // socket said it was full and RawSend armed EPOLLOUT for the retry.
+  // A writable round that never gets here had nothing to flush.
+  FWireActivity := True;
   Result := RawSend(P, ALen);
 end;
 
@@ -337,7 +364,15 @@ procedure TWSEpollConn.BeginDeferredClose;
 begin
   FClosing := True;
   UserData := nil;
-  FPaused := True; // nothing the peer says now can matter
+  // EPOLLIN deliberately STAYS armed, and inbound bytes are read and
+  // discarded from here on (DrainClosingInput). Nothing the peer says
+  // can matter any more, but leaving its bytes unread in the kernel
+  // receive queue makes close() send RST instead of FIN — and a peer
+  // whose stack then discards its own receive buffer loses the very
+  // close_notify this drain exists to deliver. Draining is what keeps
+  // the shutdown orderly; the IOCP transport learned the same lesson
+  // against a Windows peer.
+  FPaused := False;
   FDeadline := GetTickCount64 +
     QWord(FTransport.FTlsPolicy.HandshakeDeadlineMs);
   SetTimed(True);
@@ -348,14 +383,44 @@ procedure TWSEpollConn.StepDeferredClose;
 begin
   if FTls.DrainClose or FTls.Dead then
   begin
+    FinishDeferredClose;
+    Exit;
+  end;
+  // Still bytes to push. EPOLLOUT is armed only while the engine
+  // actually owes the wire: a drain that cannot advance — a write retry
+  // lwpt parked on tssWantRead — would otherwise spin at 100% CPU on a
+  // permanently writable socket until the deadline. The close-drain
+  // deadline in the sweep is what bounds that case, and a peer that
+  // sends anything re-enters here through EPOLLIN.
+  FWantWrite := FTls.NeedsWritable;
+  ApplyInterest;
+end;
+
+// close_notify is out (or the session died trying). Half-close so the
+// peer sees FIN rather than RST, then keep EPOLLIN armed and read-and-
+// discard until the peer's own EOF reaps us. Two things go wrong with a
+// bare close() here: Linux turns it into an RST whenever unread bytes
+// are still queued, and a peer that receives RST may discard its own
+// buffered-but-unread data — the alert included. shutdown(SHUT_WR)
+// puts the FIN on the wire while the read side stays open for exactly
+// as long as the drain needs. The close-drain deadline bounds a peer
+// that reads the alert and then never closes.
+procedure TWSEpollConn.FinishDeferredClose;
+begin
+  // A session that died on the way out has no orderly shutdown to
+  // offer, and no reason to hold an fd waiting for a courtesy EOF.
+  if FTls.Dead then
+  begin
     ForceClose;
     Exit;
   end;
-  // Still bytes to push. Keep EPOLLOUT armed unconditionally: the
-  // engine may be waiting on output capacity rather than on the socket,
-  // and a level-triggered EPOLLOUT on a writable socket is exactly the
-  // "come back and try again" the drain needs.
-  FWantWrite := True;
+  if not FFinSent then
+  begin
+    FFinSent := True;
+    C_shutdown(FFd, ShutdownWrite);
+  end;
+  FWantWrite := False;
+  FPaused := False;
   ApplyInterest;
 end;
 
@@ -391,6 +456,15 @@ begin
     FTlsContext := WSTlsCreateServerContext(ATls, FTlsPolicy);
   end;
   SetLength(FRecv, 256 * 1024);
+  // A TLS connection reads at most one encrypted-input watermark per
+  // round: lwpt accepts no more than that per feed, and the remainder
+  // would sit in the per-connection carry buffer — so a full 256 KB
+  // read would let a flooding peer pin the configured bound PLUS the
+  // difference. The clamp makes InputHighWater the whole per-connection
+  // inbound bound, and makes it the same number on IOCP.
+  FTlsReadLen := Length(FRecv);
+  if (FTlsContext <> nil) and (FTlsPolicy.InputHighWater < FTlsReadLen) then
+    FTlsReadLen := FTlsPolicy.InputHighWater;
 
   FListenFd := fpSocket(AF_INET, SOCK_STREAM, 0);
   if FListenFd < 0 then raise Exception.Create('socket() failed');
@@ -684,9 +758,10 @@ begin
 end;
 
 // The TLS twin of HandleReadable. Same shared read buffer, same
-// generation invariant; the difference is that bytes go to the TLS
-// session instead of straight to OnData, and that intake stops the
-// moment lwpt reports encrypted-input backpressure.
+// generation invariant; the differences are that bytes go to the TLS
+// session instead of straight to OnData, that the read is clamped to
+// one encrypted-input watermark (FTlsReadLen), and that intake stops
+// the moment lwpt reports encrypted-input backpressure.
 procedure TWSEpollTransport.HandleReadableTls(AConn: TWSEpollConn);
 var
   Fd, Got: Integer;
@@ -697,7 +772,7 @@ begin
   Gen := AConn.Id;
   repeat
     if AConn.FPaused then Exit;
-    Got := fpRecv(Fd, @FRecv[0], Length(FRecv), 0);
+    Got := fpRecv(Fd, @FRecv[0], FTlsReadLen, 0);
     if Got = 0 then
     begin
       RemoteClosed(AConn);
@@ -733,6 +808,8 @@ begin
   Result := False;
   Fd := AConn.FFd;
   Gen := AConn.Id;
+  // Opens the round the no-progress guard at the bottom judges.
+  AConn.FWireActivity := False;
   // Ingest with no new input is the pump: it flushes queued ciphertext,
   // resumes a write lwpt could not finish, drives a pending handshake
   // and decrypts whatever the input buffer still holds.
@@ -763,6 +840,20 @@ begin
   // The callback may have left nothing owed and nothing queued; without
   // this the connection would keep waking a permanently writable socket.
   AConn.ReconcileTlsInterest;
+  // No-progress guard. A whole writable round in which the engine never
+  // offered the socket a single byte cannot be improved by repeating
+  // it: lwpt is parked on tssWantRead — a write retry waiting for
+  // INPUT — and the reconciliation above would nonetheless keep
+  // EPOLLOUT armed for the unpaid re-offer, which a level-triggered
+  // reactor on a permanently writable socket turns into a 100% CPU
+  // spin. Drop the write interest and let the next inbound event
+  // re-arm it through the ordinary reconciliation; that event is
+  // exactly what unblocks the state, and EPOLLIN is still armed for it.
+  if (not AConn.FWireActivity) and AConn.FWantWrite then
+  begin
+    AConn.FWantWrite := False;
+    AConn.ApplyInterest;
+  end;
   Result := True;
 end;
 
@@ -773,12 +864,7 @@ procedure TWSEpollTransport.HandleTlsEvent(AConn: TWSEpollConn;
 begin
   if AConn.FClosing then
   begin
-    // Draining close_notify: no session callbacks left to make. A
-    // hangup means the peer will never read it — stop trying.
-    if (AEvents and (EPOLLERR or EPOLLHUP)) <> 0 then
-      AConn.ForceClose
-    else
-      AConn.StepDeferredClose;
+    HandleTlsClosingEvent(AConn, AEvents);
     Exit;
   end;
   if (AEvents and (EPOLLERR or EPOLLHUP)) <> 0 then
@@ -792,30 +878,106 @@ begin
     HandleReadableTls(AConn);
 end;
 
-// Reactor-owned deadlines, swept once per epoll_wait batch and only
-// while at least one connection carries one. Two kinds:
+// Readiness on a connection draining its close_notify. No session
+// callbacks are left to make, so this is pure byte movement in two
+// directions: EPOLLOUT pushes whatever the alert still owes the wire,
+// EPOLLIN reads and DISCARDS whatever the peer keeps sending. The
+// inbound half is not politeness — see FinishDeferredClose: unread
+// bytes in the receive queue turn the eventual close() into an RST,
+// which can cost the peer the alert it has not read yet.
+procedure TWSEpollTransport.HandleTlsClosingEvent(AConn: TWSEpollConn;
+  AEvents: Cardinal);
+var
+  Fd: Integer;
+  Gen: NativeUInt;
+begin
+  // A socket error means the peer will never read the alert; stop
+  // trying. EPOLLHUP is NOT in this test any more: a half-closed
+  // connection whose peer has also closed reports it, and that case
+  // wants the read below, which reaps on the EOF it finds.
+  if (AEvents and EPOLLERR) <> 0 then
+  begin
+    AConn.ForceClose;
+    Exit;
+  end;
+  Fd := AConn.FFd;
+  Gen := AConn.Id;
+  if (AEvents and EPOLLOUT) <> 0 then
+  begin
+    AConn.StepDeferredClose; // may finish the drain and free AConn
+    if (FConns[Fd] = nil) or (FConns[Fd].Id <> Gen) then Exit;
+  end;
+  if (AEvents and (EPOLLIN or EPOLLHUP)) <> 0 then
+    DrainClosingInput(AConn);
+end;
+
+// Read and drop everything the peer sends while we are closing, until
+// the socket runs dry (EAGAIN) or the peer's own EOF arrives — the EOF
+// is what reaps the connection, exactly as the armed WSARecv does on
+// the IOCP transport. The close-drain deadline in the sweep bounds a
+// peer that neither sends nor closes.
+procedure TWSEpollTransport.DrainClosingInput(AConn: TWSEpollConn);
+var
+  Got: Integer;
+begin
+  repeat
+    Got := fpRecv(AConn.FFd, @FRecv[0], Length(FRecv), 0);
+    if Got > 0 then Continue;
+    if (Got < 0) and (fpgeterrno = ESysEAGAIN) then Exit;
+    // EOF, or a read error on a socket we have nothing left to say to.
+    AConn.ForceClose;
+    Exit;
+  until False;
+end;
+
+// Reactor-owned deadlines. Two kinds:
 //   - handshake pending: a peer that connected and then went quiet (or
 //     trickles just enough to look alive) is aborted;
 //   - graceful close draining: a peer that stopped reading must not
 //     pin the fd forever waiting for its close_notify to fit.
-procedure TWSEpollTransport.SweepTlsDeadlines;
+//
+// The skip precondition is deliberately the same one the IOCP sweep
+// uses — "not carrying a clock, or already reaped" — even though the
+// two transports spell "already reaped" differently: IOCP has a
+// pending-finalize state (FDead with pins outstanding) and tests it,
+// while epoll untracks synchronously, so an entry still in this table
+// is by construction not reaped and needs no test. The reap condition
+// matches too: a session that is dead can never activate, so it leaves
+// on the same pass a timed-out one does.
+procedure TWSEpollTransport.SweepTlsDeadlines(ANowTick: QWord);
 var
   I: Integer;
-  NowTick: QWord;
   Conn: TWSEpollConn;
 begin
-  NowTick := GetTickCount64;
   for I := 0 to High(FConns) do
   begin
     Conn := FConns[I];
     if (Conn = nil) or (not Conn.FTimed) then Continue;
     if Conn.FClosing then
     begin
-      if NowTick >= Conn.FDeadline then Conn.ForceClose;
+      if ANowTick >= Conn.FDeadline then Conn.ForceClose;
     end
-    else if Conn.FTls.DeadlineExpired then
+    else if Conn.FTls.Dead or Conn.FTls.DeadlineExpired then
       RemoteClosed(Conn);
   end;
+end;
+
+// The sweep is O(connection table), so running it after every
+// epoll_wait batch is O(table) per batch — and under handshake churn
+// FTimedCount is permanently positive, so "only while a deadline
+// exists" is no bound at all. Gate it on the clock instead: the
+// deadline resolution is TlsDeadlinePollMs either way (that is already
+// the epoll_wait bound a live deadline imposes), so amortizing to one
+// scan per poll interval costs nothing and removes the per-batch cost.
+procedure TWSEpollTransport.MaybeSweepTlsDeadlines;
+var
+  NowTick: QWord;
+begin
+  if FTimedCount <= 0 then Exit;
+  NowTick := GetTickCount64;
+  if NowTick < FNextSweepTick then Exit;
+  FNextSweepTick := NowTick + QWord(TlsDeadlinePollMs);
+  SweepTlsDeadlines(NowTick);
 end;
 
 procedure TWSEpollTransport.Run(ATimeoutMs: Integer);
@@ -888,7 +1050,7 @@ begin
       if (Evs[I].events and EPOLLIN) <> 0 then
         HandleReadable(Conn);
     end;
-    if FTimedCount > 0 then SweepTlsDeadlines;
+    MaybeSweepTlsDeadlines;
     // Wake-independent backstop (once per batch, never per event): a
     // post whose eventfd wake was lost, or that landed after this
     // round's drain, is picked up on the next readiness event. Not

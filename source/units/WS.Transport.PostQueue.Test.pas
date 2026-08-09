@@ -322,6 +322,11 @@ const
   // Cap-per-producer in tens of milliseconds.
   PushCap = 2000000;
   RaceWindowMs = 10;
+  // Generous bound on the scheduler getting the first producer onto a
+  // core after the gate opens. Never reached on a healthy machine; it
+  // exists so a pathologically starved run fails the assertions below
+  // instead of hanging the suite.
+  StartupBoundMs = 30000;
 var
   Q: TWSPostQueue;
   Threads: array[0..Producers - 1] of TRacingPusherThread;
@@ -329,7 +334,8 @@ var
   Node, Head, Next: PWSPostNode;
   I, Producer, Delivered, AcceptedSum: Integer;
   ExactOk, RefusedOk, CountOk: Boolean;
-  Gate: Boolean;
+  Gate, Started: Boolean;
+  StartupBound: QWord;
 begin
   Q := TWSPostQueue.Create;
   Gate := False;
@@ -346,12 +352,25 @@ begin
     for I := 0 to Producers - 1 do
       Threads[I].Start;
 
-    // Release every producer at once, give them a fixed window to
-    // hammer, then land Stop mid-flight. A producer the scheduler
-    // starves for the whole window is simply refused at its first push
-    // (Accepted = 0) — still a valid outcome of the rendezvous, never a
-    // false failure.
+    // Release every producer at once, wait for the first push to
+    // actually land, then give the set a fixed window to hammer before
+    // landing Stop mid-flight. The bounded wait is what keeps the
+    // barrier's cap safety without the all-four-starved flake: a
+    // producer the scheduler starves for the window is simply refused
+    // at its first push (Accepted = 0), a valid outcome — but ALL FOUR
+    // starved means Stop lands on an empty queue and AcceptedSum = 0
+    // fails a run that proved nothing. The wait is on the aggregate, so
+    // the race the fixed window creates is unchanged.
     Gate := True;
+    StartupBound := GetTickCount64 + StartupBoundMs;
+    repeat
+      Started := False;
+      for I := 0 to Producers - 1 do
+        if InterlockedExchangeAdd(Threads[I].Accepted, 0) > 0 then
+          Started := True;
+      if Started then Break;
+      Sleep(1);
+    until GetTickCount64 >= StartupBound;
     Sleep(RaceWindowMs);
     Head := Q.Stop;
 
