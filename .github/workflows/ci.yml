@@ -225,13 +225,15 @@ jobs:
         if: matrix.frozen-install == 'skip'
         run: |
           lwpt install
-          # The 0.5.0 constraintFingerprint is platform-line-ending-
-          # dependent (lwpt#168), so a clean install legitimately rewrites
-          # it on CRLF Windows — that is the reason this leg is online, not
-          # drift. Real drift is a changed resolved ref/commit/URL; fail
-          # only on those, ignoring the fingerprint line.
+          # Two lockfile fields are line-ending-derived, so a clean install
+          # legitimately rewrites them on a CRLF Windows checkout: the
+          # constraintFingerprint (lwpt#168) and computedHash (the module
+          # tree hash — #78's residual). Neither is dependency drift, which
+          # is a changed resolved ref/commit/URL/version; fail only on
+          # those, ignoring the two derived hashes.
           drift="$(git diff lwpt.lock | grep -E '^[+-]' \
-            | grep -vE '^(\+\+\+|---) ' | grep -v 'constraintFingerprint' \
+            | grep -vE '^(\+\+\+|---) ' \
+            | grep -vE '(constraintFingerprint|computedHash) =' \
             || true)"
           if [ -n "$drift" ]; then
             echo "::error::lwpt.lock resolution drifted on Windows:"
