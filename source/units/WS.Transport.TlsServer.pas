@@ -96,6 +96,13 @@ const
   // One decrypted TLS record is at most 16384 bytes, so a read larger
   // than this can never come back fuller.
   WSTlsPlaintextBufferSize = 16 * 1024;
+  // Carry allocation a fully-drained buffer is allowed to keep. A
+  // connection that spiked into a large backlog (up to InputHighWater +
+  // one read) must not retain that allocation for life — at 10k
+  // connections that is hundreds of MB of once-used, never-freed space.
+  // Once the backlog empties, an allocation above this floor is released
+  // and Append re-grows it on demand.
+  WSTlsCarryShrinkFloor = 16 * 1024;
 
 type
   EWSTlsServer = class(Exception);
@@ -174,6 +181,11 @@ type
     FDead: Boolean;
     FPeerClosed: Boolean;
     FDetached: Boolean;
+    // Set whenever a pump hands the wire ciphertext to move (FlushEgress
+    // → OnCiphertext); reset at the top of every entry point that pumps
+    // (Ingest, Encrypt, DrainClose). MadeWireProgress reads it — see the
+    // no-progress guard both fd-owning transports source from here.
+    FWireProgress: Boolean;
     procedure Fail;
     function FeedChunk(P: PByte; ALen: NativeInt): NativeInt;
     function FlushEgress: Boolean;
@@ -181,6 +193,7 @@ type
     function DriveHandshake: Boolean;
     function ReadPlaintext: Boolean;
     function Outcome: TWSTlsIngestResult;
+    function WriteParked: Boolean;
   public
     // Begins a TLS session against the transport's shared context. Both
     // callbacks are required. Raises on a context lwpt refuses.
@@ -232,6 +245,16 @@ type
     // is the state a short Encrypt with an empty output queue leaves
     // behind and the one that needs a self-posted carrier.
     function PendingCiphertext: NativeInt;
+
+    // True when the most recent pump handed the wire ciphertext to move.
+    // False after a pump means the engine offered the socket nothing —
+    // a write retry parked on tssWantRead (it needs INPUT, not a
+    // writable socket). Both fd-owning transports consume this as the
+    // no-progress guard on their writable/close-drain paths: a round
+    // that produced no wire bytes must not re-arm writability on a
+    // permanently writable socket, which would spin. The session owns
+    // this fact; the transports no longer reconstruct it.
+    function MadeWireProgress: Boolean;
 
     property HandshakeDone: Boolean read FHandshakeDone;
     property Dead: Boolean read FDead;
@@ -285,6 +308,13 @@ begin
   begin
     FHead := 0;
     FTail := 0;
+    // Drained. Compaction in Append only ever bounds growth against the
+    // LIVE backlog; a buffer that grew to hold a transient spike would
+    // otherwise keep that allocation until the record is Reset (failure
+    // path only). Release it here so a once-busy connection stops pinning
+    // its high-water footprint for the rest of its life.
+    if Length(FBuf) > WSTlsCarryShrinkFloor then
+      FBuf := nil;
   end;
 end;
 
@@ -309,6 +339,8 @@ end;
 { policy }
 
 function WSTlsResolvePolicy(const ATls: TWSTransportTls): TWSTlsPolicy;
+var
+  ResolvedBudgetDefault: Integer;
 begin
   Result.InputHighWater := ATls.InputHighWater;
   if Result.InputHighWater = 0 then
@@ -350,25 +382,30 @@ begin
       'be 0 (default %d) or positive; got %d',
       [WSTlsDefaultHandshakeDeadlineMs, ATls.HandshakeDeadlineMs]);
 
-  Result.InboundHandshakeBudget := ATls.InboundHandshakeBudget;
   // The default never sits below the input high watermark: a listener
   // that widened its encrypted-input buffer must not have handshakes
-  // rejected at a volume that buffer was sized to hold.
+  // rejected at a volume that buffer was sized to hold. The resolved
+  // default is therefore the LARGER of the fixed default and the resolved
+  // InputHighWater — reporting a flat "64 KiB" would name a value that is
+  // not the one a zero actually resolves to when the high watermark was
+  // widened.
+  ResolvedBudgetDefault := WSTlsDefaultInboundHandshakeBudget;
+  if Result.InputHighWater > ResolvedBudgetDefault then
+    ResolvedBudgetDefault := Result.InputHighWater;
+
+  Result.InboundHandshakeBudget := ATls.InboundHandshakeBudget;
   if Result.InboundHandshakeBudget = 0 then
-    if Result.InputHighWater > WSTlsDefaultInboundHandshakeBudget then
-      Result.InboundHandshakeBudget := Result.InputHighWater
-    else
-      Result.InboundHandshakeBudget := WSTlsDefaultInboundHandshakeBudget;
+    Result.InboundHandshakeBudget := ResolvedBudgetDefault;
   // Same floor, enforced rather than applied, for an explicit value.
-  // Both numbers in the message are the RESOLVED ones actually compared:
-  // InputHighWater may itself have come from a default, and reporting
-  // the raw 0 the caller wrote would name a value nothing was checked
-  // against.
+  // Every number in the message is the RESOLVED one actually compared:
+  // InputHighWater may itself have come from a default, and the reported
+  // default is the value a zero would have produced here, not the fixed
+  // constant.
   if Result.InboundHandshakeBudget < Result.InputHighWater then
     raise EWSTlsServer.CreateFmt('TWSTransportTls.InboundHandshakeBudget ' +
-      'must be 0 (default %d) or at least the resolved InputHighWater ' +
-      '(%d); got a resolved %d',
-      [WSTlsDefaultInboundHandshakeBudget, Result.InputHighWater,
+      'must be 0 (resolved default %d) or at least the resolved ' +
+      'InputHighWater (%d); got a resolved %d',
+      [ResolvedBudgetDefault, Result.InputHighWater,
       Result.InboundHandshakeBudget]);
 end;
 
@@ -442,14 +479,41 @@ begin
     (GetTickCount64 >= FDeadline);
 end;
 
+function TWSTlsServerSession.WriteParked: Boolean;
+begin
+  // The one state in which forward progress requires INPUT the transport
+  // would otherwise refuse to read: lwpt parked a write retry on
+  // tssWantRead (a TLS 1.3 KeyUpdate or TLS 1.2 renegotiation read from
+  // inside SslWrite) and produced no ciphertext to show for it. Nothing
+  // this side can hand the wire will advance it — only feeding the
+  // peer's records into lwpt's read BIO does, which happens when intake
+  // is allowed to run.
+  Result := (not FDead) and FWriteRetry and
+    (TransportSecurityPendingCiphertext(FConn) = 0);
+end;
+
 function TWSTlsServerSession.MayResume: Boolean;
 begin
+  // A parked write outranks backpressure and the carry alike: suppressing
+  // intake here is the one thing that guarantees non-recovery, because
+  // the input is exactly what unblocks the parked write. A read into the
+  // carry is bounded by InputHighWater and the parked write drains lwpt's
+  // read BIO as it retries, so keeping intake armed is safe, not just a
+  // throughput choice — without it the connection ends the round with no
+  // armed interest and no clock, leaking until Shutdown and blind to the
+  // peer hanging up.
+  if WriteParked then Exit(True);
   // lwpt's Backpressured flag IS the hysteresis (it clears only once
   // buffered input has fallen back to the low watermark), so it is read
   // rather than re-derived from BufferedBytes here. A non-empty carry
   // means bytes are still owed to lwpt, which outranks the flag.
   Result := (not FDead) and (FCarry.Len = 0) and
     (not TransportSecurityServerInputFlow(FConn).Backpressured);
+end;
+
+function TWSTlsServerSession.MadeWireProgress: Boolean;
+begin
+  Result := FWireProgress;
 end;
 
 function TWSTlsServerSession.NeedsWritable: Boolean;
@@ -479,6 +543,12 @@ begin
   repeat
     Avail := TransportSecurityGetCiphertext(FConn, Buf);
     if Avail <= 0 then Exit(True);
+    // Ciphertext to move IS the round's wire progress, whether or not the
+    // socket takes it: a full socket arms writability for the retry, an
+    // accepted prefix advances the queue. Only a pump that never reaches
+    // here left the engine with nothing to offer — the parked-write case
+    // the no-progress guard exists for.
+    FWireProgress := True;
     Taken := FOnCiphertext(PByte(Buf), Avail);
     if Taken < 0 then
     begin
@@ -486,6 +556,11 @@ begin
       Exit(False);
     end;
     if Taken = 0 then Exit(True); // socket full; the transport armed EPOLLOUT
+    // The callback contract is "bytes taken, <= Avail"; a callback that
+    // over-reports would drive TransportSecurityConsumeCiphertext past
+    // the pending output, and that RAISES — unwinding the pump the unit
+    // header says must never unwind. Clamp defensively.
+    if Taken > Avail then Taken := Avail;
     TransportSecurityConsumeCiphertext(FConn, Taken);
   until False;
 end;
@@ -635,6 +710,7 @@ var
   N: NativeInt;
   Progressed: Boolean;
 begin
+  FWireProgress := False;
   if FDead then Exit(wtiFailed);
 
   if (ALen > 0) and (not FHandshakeDone) then
@@ -702,6 +778,7 @@ var
   R: TTransportSecurityIOResult;
   N: Integer;
 begin
+  FWireProgress := False;
   if FDead then Exit(-1);
   if (ALen <= 0) or (P = nil) then Exit(0);
   if not FHandshakeDone then Exit(0); // nothing rides before activation
@@ -739,6 +816,7 @@ function TWSTlsServerSession.DrainClose: Boolean;
 var
   St: TTransportSecurityState;
 begin
+  FWireProgress := False;
   if FDead then Exit(True);
   if not FHandshakeDone then
   begin

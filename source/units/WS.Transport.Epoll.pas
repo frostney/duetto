@@ -79,10 +79,6 @@ type
     FTimed: Boolean;           // counted in the reactor's deadline sweep
     FDeadline: QWord;          // close-drain deadline (monotonic)
     FFinSent: Boolean;         // half-closed; the drain is inbound-only
-    // Set by every ciphertext hand-off in the current writable round.
-    // False after a round means the engine never even offered the
-    // socket a byte — see the no-progress guard in DriveTlsWritable.
-    FWireActivity: Boolean;
     procedure ApplyInterest;
     procedure SetTimed(AValue: Boolean);
     function RawSend(P: PByte; ALen: NativeInt): NativeInt;
@@ -229,6 +225,11 @@ function TWSEpollConn.RawSend(P: PByte; ALen: NativeInt): NativeInt;
 var
   W: NativeInt;
 begin
+  // A dead connection has no socket worth writing to (its fd may already
+  // be closed); report the failure the caller expects, exactly as the
+  // IOCP twin does. Reachable when a TLS pump flushes egress after an
+  // earlier send in the same round already marked the connection dead.
+  if FDead then Exit(-1);
   Result := 0;
   while Result < ALen do
   begin
@@ -300,21 +301,22 @@ end;
 
 // Plaintext sink. False tells the pump to stop: the delivery tore this
 // connection down and the session unit must not touch anything else.
+// FDead is tested alongside FFreeDeferred so a send failure inside the
+// delivery (RawSend marking the connection dead) stops the pump too —
+// the same pair the IOCP twin returns.
 function TWSEpollConn.TlsPlaintext(P: PByte; ALen: NativeInt): Boolean;
 begin
   if Assigned(FTransport.OnData) then FTransport.OnData(Self, P, ALen);
-  Result := not FFreeDeferred;
+  Result := (not FFreeDeferred) and (not FDead);
 end;
 
 // Ciphertext egress. The session unit consumes exactly what this
-// returns, so a short write costs nothing but a later EPOLLOUT.
+// returns, so a short write costs nothing but a later EPOLLOUT. The
+// round's wire-progress marker lives in the session now (FlushEgress
+// sets it as it hands bytes here), so the transport no longer records
+// it separately.
 function TWSEpollConn.TlsCiphertext(P: PByte; ALen: NativeInt): NativeInt;
 begin
-  // The engine only calls this when it HAS ciphertext to hand over, so
-  // the call itself is the round's progress marker: bytes moved, or the
-  // socket said it was full and RawSend armed EPOLLOUT for the retry.
-  // A writable round that never gets here had nothing to flush.
-  FWireActivity := True;
   Result := RawSend(P, ALen);
 end;
 
@@ -386,13 +388,18 @@ begin
     FinishDeferredClose;
     Exit;
   end;
-  // Still bytes to push. EPOLLOUT is armed only while the engine
-  // actually owes the wire: a drain that cannot advance — a write retry
-  // lwpt parked on tssWantRead — would otherwise spin at 100% CPU on a
-  // permanently writable socket until the deadline. The close-drain
-  // deadline in the sweep is what bounds that case, and a peer that
-  // sends anything re-enters here through EPOLLIN.
-  FWantWrite := FTls.NeedsWritable;
+  // Still bytes to push. EPOLLOUT is armed only while the drain actually
+  // handed the wire something THIS round: NeedsWritable stays True on a
+  // write retry lwpt parked on tssWantRead (it owes the wire in
+  // principle but produced no ciphertext), and arming EPOLLOUT for that
+  // on a permanently writable socket spins at 100% CPU until the
+  // deadline. The same no-progress guard DriveTlsWritable uses, sourced
+  // from the session: a drain that made wire progress keeps EPOLLOUT to
+  // finish flushing; one that could not advance waits instead. EPOLLIN
+  // stays armed throughout the close (BeginDeferredClose left it so), so
+  // the close-drain deadline in the sweep is the backstop and a peer
+  // that sends or hangs up re-enters here.
+  FWantWrite := FTls.NeedsWritable and FTls.MadeWireProgress;
   ApplyInterest;
 end;
 
@@ -798,8 +805,11 @@ begin
 end;
 
 // Writability on a TLS connection: push whatever the engine owes the
-// wire, then let the session layer re-offer. False = the connection is
-// gone and the caller must not look at it again.
+// wire, then let the session layer re-offer. False = do NOT touch AConn
+// again this round — it is either gone (reaped here) or has moved into
+// the close drain, which owns its own writability from here on. Both
+// callers already treat False that way; it does not by itself mean the
+// connection was freed.
 function TWSEpollTransport.DriveTlsWritable(AConn: TWSEpollConn): Boolean;
 var
   Fd: Integer;
@@ -808,8 +818,6 @@ begin
   Result := False;
   Fd := AConn.FFd;
   Gen := AConn.Id;
-  // Opens the round the no-progress guard at the bottom judges.
-  AConn.FWireActivity := False;
   // Ingest with no new input is the pump: it flushes queued ciphertext,
   // resumes a write lwpt could not finish, drives a pending handshake
   // and decrypts whatever the input buffer still holds.
@@ -848,8 +856,10 @@ begin
   // reactor on a permanently writable socket turns into a 100% CPU
   // spin. Drop the write interest and let the next inbound event
   // re-arm it through the ordinary reconciliation; that event is
-  // exactly what unblocks the state, and EPOLLIN is still armed for it.
-  if (not AConn.FWireActivity) and AConn.FWantWrite then
+  // exactly what unblocks the state, and EPOLLIN is still armed for it
+  // (the WriteParked case keeps intake un-paused precisely so it is).
+  // The progress signal is the session's — it set it while flushing.
+  if (not AConn.FTls.MadeWireProgress) and AConn.FWantWrite then
   begin
     AConn.FWantWrite := False;
     AConn.ApplyInterest;
@@ -911,23 +921,25 @@ begin
     DrainClosingInput(AConn);
 end;
 
-// Read and drop everything the peer sends while we are closing, until
-// the socket runs dry (EAGAIN) or the peer's own EOF arrives — the EOF
-// is what reaps the connection, exactly as the armed WSARecv does on
-// the IOCP transport. The close-drain deadline in the sweep bounds a
-// peer that neither sends nor closes.
+// Read and drop what the peer sends while we are closing. ONE
+// FTlsReadLen-sized read per readiness round, not a drain-to-EAGAIN
+// loop: a peer streaming during our close_notify drain would otherwise
+// hold the single-threaded reactor hostage across an unbounded read
+// loop, starving every other connection — the IOCP twin is naturally
+// bounded at one WSARecv per completion and this must match it. Level-
+// triggered EPOLLIN brings us straight back next round if the socket
+// still has bytes; the close-drain deadline in the sweep bounds a peer
+// that neither sends nor closes. The read is FTlsReadLen, the documented
+// per-connection inbound bound, not the whole 256 KB shared buffer.
 procedure TWSEpollTransport.DrainClosingInput(AConn: TWSEpollConn);
 var
   Got: Integer;
 begin
-  repeat
-    Got := fpRecv(AConn.FFd, @FRecv[0], Length(FRecv), 0);
-    if Got > 0 then Continue;
-    if (Got < 0) and (fpgeterrno = ESysEAGAIN) then Exit;
-    // EOF, or a read error on a socket we have nothing left to say to.
-    AConn.ForceClose;
-    Exit;
-  until False;
+  Got := fpRecv(AConn.FFd, @FRecv[0], FTlsReadLen, 0);
+  if Got > 0 then Exit; // more may wait; the next EPOLLIN round takes it
+  if (Got < 0) and (fpgeterrno = ESysEAGAIN) then Exit;
+  // EOF, or a read error on a socket we have nothing left to say to.
+  AConn.ForceClose;
 end;
 
 // Reactor-owned deadlines. Two kinds:

@@ -43,6 +43,8 @@ type
     procedure TestInputRangeEnforced;
     procedure TestOutputRangeEnforced;
     procedure TestGuardDefaultsAndFloor;
+    procedure TestBudgetTracksWidenedInput;
+    procedure TestContextGuards;
   end;
 
   TTlsCarryTests = class(TTestSuite)
@@ -52,6 +54,7 @@ type
     procedure TestAppendConsumePreservesOrder;
     procedure TestPartialConsumeRefeedsTheTail;
     procedure TestCompactionBoundsGrowth;
+    procedure TestShrinkOnDrain;
     procedure TestResetReleases;
   end;
 
@@ -73,6 +76,30 @@ begin
     // Silences the "assigned but never used" hint without weakening
     // the check: reaching here at all is the failure.
     Result := Policy.InputHighWater < 0;
+  except
+    on EWSTlsServer do
+      Result := True;
+  end;
+end;
+
+// True when WSTlsCreateServerContext rejects the configuration at one of
+// its pure guards. Both guards fire BEFORE any OpenSSL context is built,
+// so these cases are platform-independent (they never reach the macOS
+// "server TLS unsupported" path).
+function CreateContextRaises(const ATls: TWSTransportTls): Boolean;
+var
+  Context: TTransportSecurityServerContext;
+  Policy: TWSTlsPolicy;
+begin
+  Result := False;
+  FillChar(Policy, SizeOf(Policy), 0);
+  Context := nil;
+  try
+    Context := WSTlsCreateServerContext(ATls, Policy);
+    // Reaching here means no guard fired; reclaim whatever came back so
+    // the check itself leaks nothing.
+    if Context <> nil then
+      CloseTransportSecurityServerContext(Context);
   except
     on EWSTlsServer do
       Result := True;
@@ -208,6 +235,37 @@ begin
   Expect<Boolean>(ResolveRaises(Tls)).ToBe(False);
 end;
 
+// A high watermark above the fixed 64 KiB default pulls the resolved
+// zero-budget default up with it, so the budget never rejects a
+// handshake the widened input buffer was sized to hold — the exact
+// value the raise message now reports as the resolved default.
+procedure TTlsPolicyTests.TestBudgetTracksWidenedInput;
+var
+  Tls: TWSTransportTls;
+  Policy: TWSTlsPolicy;
+begin
+  Tls := BareTls;
+  Tls.InputHighWater := 128 * 1024; // within lwpt's 256 KiB ceiling
+  Policy := WSTlsResolvePolicy(Tls);
+  Expect<Integer>(Policy.InboundHandshakeBudget).ToBe(128 * 1024);
+end;
+
+// The two pure guards on the context builder: TLS must be enabled and an
+// identity path must be named. Both reject before any backend work, so
+// the listener fails at construction rather than the first handshake.
+procedure TTlsPolicyTests.TestContextGuards;
+var
+  Tls: TWSTransportTls;
+begin
+  Tls := BareTls;
+  Tls.Enabled := False;
+  Expect<Boolean>(CreateContextRaises(Tls)).ToBe(True);
+
+  Tls := BareTls;
+  Tls.Pkcs12Path := '';
+  Expect<Boolean>(CreateContextRaises(Tls)).ToBe(True);
+end;
+
 procedure TTlsPolicyTests.SetupTests;
 begin
   Test('zero fields resolve to the documented defaults',
@@ -224,6 +282,10 @@ begin
     TestOutputRangeEnforced);
   Test('handshake deadline and inbound budget defaults and floor',
     TestGuardDefaultsAndFloor);
+  Test('inbound budget default tracks a widened input high watermark',
+    TestBudgetTracksWidenedInput);
+  Test('context builder rejects disabled TLS and a missing identity',
+    TestContextGuards);
 end;
 
 { ───────── carry buffer ───────── }
@@ -341,9 +403,35 @@ begin
     if Carry.Allocated > Peak then Peak := Carry.Allocated;
   end;
   Expect<Integer>(Integer(Carry.Len)).ToBe(100 * 200);
-  // 200 KB of live backlog, and the allocation tracks it rather than
-  // the 200 MB that passed through.
-  Expect<Boolean>(Peak < 4 * 1024 * 1024).ToBe(True);
+  // ~20 KB of live backlog, and the allocation tracks THAT rather than
+  // the ~200 KB that passed through. The bound is the live backlog plus
+  // one chunk of headroom — a slack loose enough to survive compaction
+  // rounding but ~10x tighter than the peak throughput, so it still
+  // fails outright if compaction is removed (the buffer would then track
+  // the 200 KB total, not the 20 KB owed).
+  Expect<Boolean>(Peak < Carry.Len + 2000).ToBe(True);
+end;
+
+// A spike into a large backlog must not be retained for the connection's
+// life: once the backlog drains to empty, the allocation is released
+// (down to at most the shrink floor) rather than pinned at high water.
+procedure TTlsCarryTests.TestShrinkOnDrain;
+var
+  Carry: TWSTlsCarry;
+  Chunk: TBytes;
+begin
+  Carry.Reset;
+  Chunk := Pattern(0, 200 * 1024);
+  Carry.Append(@Chunk[0], Length(Chunk));
+  Expect<Boolean>(Carry.Allocated >= 200 * 1024).ToBe(True);
+  // Drain the whole spike. The buffer empties, so the allocation is let
+  // go instead of surviving at 200 KB.
+  Carry.Consume(Carry.Len);
+  Expect<Integer>(Integer(Carry.Len)).ToBe(0);
+  Expect<Boolean>(Carry.Allocated <= WSTlsCarryShrinkFloor).ToBe(True);
+  // Still usable — Append re-grows on demand.
+  Carry.Append(@Chunk[0], 10);
+  Expect<Integer>(Integer(Carry.Len)).ToBe(10);
 end;
 
 procedure TTlsCarryTests.TestResetReleases;
@@ -372,6 +460,8 @@ begin
     TestPartialConsumeRefeedsTheTail);
   Test('compaction bounds growth across many partial accepts',
     TestCompactionBoundsGrowth);
+  Test('a fully drained buffer releases a spike allocation',
+    TestShrinkOnDrain);
   Test('reset releases the buffer and stays usable', TestResetReleases);
 end;
 

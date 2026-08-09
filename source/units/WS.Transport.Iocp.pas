@@ -158,7 +158,7 @@ type
       AOverlapped: POverlapped; ABytes: DWORD; ASucceeded: Boolean);
     procedure HandleReceivedTls(AConn: TWSIocpConn; ABytes: DWORD);
     procedure HandleSendCompletionTls(AConn: TWSIocpConn);
-    procedure PostSendReady(AConn: TWSIocpConn);
+    function PostSendReady(AConn: TWSIocpConn): Boolean;
     procedure DeliverSendReady(AConnId: NativeUInt);
     procedure SweepTlsDeadlines(ANowTick: QWord);
     procedure MaybeSweepTlsDeadlines;
@@ -570,8 +570,14 @@ begin
   // Something IS coming back: an in-flight send, or ciphertext the next
   // flush will put in flight.
   if FSendInFlight or (FTls.PendingCiphertext > 0) then Exit;
-  FSendReadyPosted := True;
-  FTransport.PostSendReady(Self);
+  // The token is set to what the post ACHIEVED, not to True unconditionally.
+  // The double failure this carrier exists for is quota exhaustion, and a
+  // post that failed put no carrier in the port — recording it as posted
+  // anyway would leave FSendReadyPosted stuck True, blocking every future
+  // carrier for this connection's life (a real completion clears it, but a
+  // starved connection with nothing in flight produces none). On failure
+  // the token stays False so the next pump re-attempts the post.
+  FSendReadyPosted := FTransport.PostSendReady(Self);
 end;
 
 procedure TWSIocpConn.BeginTlsClose;
@@ -835,7 +841,16 @@ begin
       if C_CreateIoCompletionPort(THandle(AcceptedSocket), FCompletionPort,
           PtrUInt(Pointer(Conn)), 0) <> 0 then
       begin
+        // NativeUInt is 32-bit on win32, so the 2^32-th accept would trap
+        // under {$Q+} and unwind the completion thread — killing the
+        // listener for good. Ids only need to be unique among LIVE
+        // connections, so a wrap is harmless; disable the overflow check
+        // for this one increment rather than widening Id through the whole
+        // transport seam (it flows through the base class and epoll's
+        // generation tag).
+        {$push}{$Q-}
         Inc(FNextId);
+        {$pop}
         Conn.Id := FNextId;
         TlsFailed := False;
         if FTlsContext <> nil then
@@ -1085,19 +1100,24 @@ end;
 // dispatch resolves it by lookup instead of dereference. Ids are
 // monotonic and never reused, so the lookup cannot land on a different
 // connection either.
-procedure TWSIocpTransport.PostSendReady(AConn: TWSIocpConn);
+function TWSIocpTransport.PostSendReady(AConn: TWSIocpConn): Boolean;
 begin
+  Result := False;
   if FCompletionPort = 0 then Exit;
-  // Quota exhaustion is the documented transient failure here, exactly
-  // as on the post wake; one retry clears it in practice. If both fail
-  // the connection waits for its next real completion — the same
-  // position it was in before the carrier existed, never worse.
-  // Through Pointer, like the completion-key cast in WaitAndDispatch:
-  // the ordinal-to-pointer step is the one FPC wants spelled out.
-  if not C_PostQueuedCompletionStatus(FCompletionPort, 0,
+  // Quota exhaustion is the documented transient failure here, exactly as
+  // on the post wake; one retry clears it in practice. The RESULT of the
+  // post is returned so EnsureSendReadyCarrier does not mark the carrier
+  // posted when it was not: a double failure (the exact case the carrier
+  // exists for) that both failed to post AND latched the flag would block
+  // every future carrier for this connection. Returning False lets the
+  // next pump retry. Through Pointer, like the completion-key cast in
+  // WaitAndDispatch: the ordinal-to-pointer step is the one FPC wants
+  // spelled out.
+  if C_PostQueuedCompletionStatus(FCompletionPort, 0,
       SendReadyCompletionKey, POverlapped(Pointer(AConn.Id))) then
-    C_PostQueuedCompletionStatus(FCompletionPort, 0,
-      SendReadyCompletionKey, POverlapped(Pointer(AConn.Id)));
+    Exit(True);
+  Result := C_PostQueuedCompletionStatus(FCompletionPort, 0,
+    SendReadyCompletionKey, POverlapped(Pointer(AConn.Id)));
 end;
 
 // Deliver a self-posted carrier. Drain-style and id-validated, like the
@@ -1170,6 +1190,16 @@ begin
       RemoteClosed(Conn);
     // Untrack swaps the last entry into this slot, so an index that
     // still holds the same object is the only one safe to advance past.
+    //
+    // Known imprecision, deliberately not fixed: a reap here can reach a
+    // user handler (OnClosed) that closes a DIFFERENT, still-unvisited
+    // connection. Untrack then swaps the tail entry into that connection's
+    // slot; if the slot sits BELOW I it is an unvisited entry landing in
+    // an already-swept position, so it is missed for this pass. That costs
+    // it at most one sweep interval (TlsDeadlinePollMs, 100 ms) before the
+    // next scan catches it — a bounded delay on a deadline that is seconds
+    // long, not a leak. A precise fix would need a visited set or a second
+    // pass, neither worth the cost against a 100 ms slip.
     if (I < FLiveCount) and (FLive[I] = Conn) then Inc(I);
   end;
 end;

@@ -168,9 +168,14 @@ type
 
     // Total ciphertext, in bytes, one connection may push at the server
     // BEFORE its handshake completes; exceeding it aborts the
-    // connection. 0 = WSTlsDefaultInboundHandshakeBudget (64 KiB — an
-    // order of magnitude above any real ClientHello/certificate flight).
-    // The slow-loris guard on the volume axis: it stops a peer from
+    // connection. 0 = the LARGER of WSTlsDefaultInboundHandshakeBudget
+    // (64 KiB — an order of magnitude above any real
+    // ClientHello/certificate flight) and the resolved InputHighWater,
+    // so a listener that widened its encrypted-input buffer never has a
+    // handshake rejected at a volume that buffer was sized to hold. Must
+    // resolve to at least InputHighWater; a smaller explicit value is a
+    // configuration error. The slow-loris guard on the volume axis: it
+    // stops a peer from
     // trickling well-formed-looking records forever, which the deadline
     // alone would only catch after the full timeout, and stops a
     // garbage flood from being re-offered indefinitely.
