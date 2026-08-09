@@ -11,9 +11,12 @@
 - Substitute the live WebSocket port into the served page at startup so
   the browser knows where duetto is listening.
 - Pair `ws://` with `http://` and `wss://` with `https://` — browsers
-  block the mixed combination. Server-side TLS is **macOS only** today
-  (Network.framework); on Linux and Windows terminate TLS in a reverse
-  proxy in front of both listeners.
+  block the mixed combination. Server-side TLS terminates **natively on
+  all three platforms** (macOS via Network.framework, Linux and Windows
+  via lwpt's OpenSSL memory-BIO accept), with the caveat that the two
+  OpenSSL-backed transports need libssl/libcrypto 3 loadable at runtime;
+  a TLS-terminating reverse proxy in front of a plain listener stays a
+  valid alternative where those libraries are absent.
 - Secure-context gotcha: powerful APIs (WebCodecs and friends) silently
   disappear on plain `http://` over a LAN IP; `localhost` is a secure
   context, LAN IPs are not.

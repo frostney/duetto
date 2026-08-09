@@ -18,14 +18,15 @@ program wsecho;
 // executable's directory or System32.
 //
 // There are deliberately no knobs for the TLS flow-control policy: the
-// program serves with every TWSTransportTls tuning field left at 0,
-// which is lwpt's own default shape — a 64 KiB encrypted-input
-// watermark (also the per-round socket read bound) with a 32 KiB
-// resume watermark, 64 KiB of encrypted-output capacity, a 10 s
-// handshake deadline and a 64 KiB pre-handshake inbound budget.
-// Squeezing those is a listener-tuning decision an echo/conformance
-// target has no opinion about; wsinterop is where the extremes are
-// exercised.
+// program serves with every TWSTransportTls tuning field left at 0, so
+// each falls back to its default. The flow-control watermarks are lwpt's
+// defaults — a 64 KiB encrypted-input watermark (also the per-round
+// socket read bound) with a 32 KiB resume watermark and 64 KiB of
+// encrypted-output capacity — while the handshake-liveness guards are
+// duetto's own (WS.Transport.TlsServer): a 10 s handshake deadline and a
+// 64 KiB pre-handshake inbound budget. Squeezing those is a
+// listener-tuning decision an echo/conformance target has no opinion
+// about; wsinterop is where the extremes are exercised.
 
 {$I Shared.inc}
 

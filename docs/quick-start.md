@@ -38,7 +38,7 @@ no sibling checkout is needed. The committed `.lwpt/modules/` tree plus
 
 ```bash
 lwpt build           # all five programs (Linux, macOS, Windows)
-lwpt test            # six suites, all green
+lwpt test            # seven suites, all green
 ./build/wsinterop    # live-socket battery, exit 0 = pass
 ```
 

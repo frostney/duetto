@@ -74,12 +74,19 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
   giving the Network.framework transport the same Autobahn net as
   epoll; the client direction stays on the Linux job. The x86_64 macOS
   leg skips the loopback batteries entirely: GitHub's Intel VMs deliver
-  Network.framework loopback traffic on a ~60 s timer (duetto#11).
+  Network.framework loopback traffic on a ~60 s timer (duetto#11). Both
+  Windows legs (win64, win32) install online (`lwpt install`, not
+  `--frozen`) for the same lwpt 0.5.0 line-ending fingerprint regression
+  as the PR gate, followed by a `git diff --exit-code lwpt.lock` guard so
+  a clean install that forks the resolution still fails loudly.
 
 Both workflows install the lwpt release binary from a checksum-verified
-tarball (no sibling checkout, no bootstrap) and verify dependencies
-against the committed lockfile via `lwpt install --frozen`; duetto has no
-committed toolchain binaries.
+tarball (no sibling checkout, no bootstrap). On every non-Windows leg
+they verify dependencies against the committed lockfile via `lwpt install
+--frozen`; the Windows legs install online for the line-ending
+fingerprint regression noted above, guarding the committed lockfile with
+`git diff --exit-code` instead. duetto has no committed toolchain
+binaries.
 
 ### Dependency layout note
 

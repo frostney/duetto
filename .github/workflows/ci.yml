@@ -57,6 +57,10 @@ env:
 
 jobs:
   test:
+    # Pin the display name to the target alone, so the matrix's extra
+    # per-leg keys (frozen-install: skip, loopback-battery: skip, …) do
+    # not append a ", skip" tail that shifts as the exceptions come and go.
+    name: test (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
@@ -214,9 +218,14 @@ jobs:
       # Windows: the 0.5.0 frozen verifier's constraint fingerprint is
       # line-ending-dependent (see the matrix comment); mirror lwpt's
       # own Windows CI and install online until that is fixed upstream.
-      - name: lwpt install (Windows)
+      # The lockfile is still committed, so a clean online install against
+      # the same release tag must not move it — assert that, or a future
+      # 0.5.x silently forking the dep tree across legs would go unnoticed.
+      - name: lwpt install (Windows, then assert lockfile unmoved)
         if: matrix.frozen-install == 'skip'
-        run: lwpt install
+        run: |
+          lwpt install
+          git diff --exit-code lwpt.lock
 
       - name: lwpt format --check (one runner)
         if: matrix.format-check == true
@@ -225,7 +234,7 @@ jobs:
       - name: lwpt build (all programs)
         run: lwpt build
 
-      - name: lwpt test (six co-located unit suites)
+      - name: lwpt test (seven co-located unit suites)
         run: lwpt test
 
       - name: wsinterop (live-socket battery, own client vs own server)

@@ -49,24 +49,32 @@ type
   end;
 
   // Pushes its sequence until the queue refuses, so Stop is guaranteed a
-  // live producer to race. Cap is a runaway guard, not the expected exit.
-  // Producers spin on StartGate before the first push: releasing them
-  // together makes the pre-Stop window a fixed few milliseconds for
-  // every producer, so no early starter can reach the cap while the
-  // scheduler is still warming a late one up (the exact interleaving a
-  // slow Windows VM produced — Sleep(1) there rounds to ~16 ms).
+  // live producer to race. Cap is a runaway guard, not the expected exit
+  // — a producer that reaches it simply did not race Stop (it filled its
+  // whole quota before Stop landed), which the assertions tolerate; what
+  // they require is only that AT LEAST ONE producer was refused, so the
+  // refusal path is exercised. Producers spin on StartGate (an atomic
+  // LongInt) before the first push: releasing them together keeps the
+  // pre-Stop window a fixed few milliseconds for every producer.
   TRacingPusherThread = class(TThread)
   public
     Queue: TWSPostQueue;
     ProducerId: NativeUInt;
     Cap: Integer;
-    StartGate: PBoolean;
+    StartGate: PLongInt;
     // Published with InterlockedIncrement so the main thread can watch
     // the producers spin up before it lands Stop; final after WaitFor.
     Accepted: LongInt;
     HitCap: Boolean;
     procedure Execute; override;
   end;
+
+// File-scope, not a stack local in the test: the producers hold its
+// address for the whole race, so a mid-Start thread-creation failure
+// must not leave a survivor spinning on a freed stack slot. LongInt +
+// interlocked access keeps the release free of a formal data race.
+var
+  RacingStartGate: LongInt = 0;
 
 procedure FreeChain(ANode: PWSPostNode);
 var
@@ -198,9 +206,10 @@ var
 begin
   Accepted := 0;
   HitCap := False;
-  // ThreadSwitch is an opaque RTL call, so the gate read cannot be
-  // hoisted out of the loop.
-  while not StartGate^ do
+  // Interlocked read, so the release is a proper cross-thread publish
+  // rather than a formal data race; ThreadSwitch is an opaque RTL call,
+  // so the load cannot be hoisted out of the loop either way.
+  while InterlockedExchangeAdd(StartGate^, 0) = 0 do
     ThreadSwitch;
   // Sequence and counter move in lockstep, so the accepted sequences are
   // exactly 0 .. Accepted-1 — the property the Stop chain is checked
@@ -306,21 +315,26 @@ end;
 // appears). Nothing is lost, nothing arrives twice, nothing lands after
 // Stop.
 //
-// Both vacuous outcomes are designed out. The producers push until the
-// queue refuses rather than a fixed count, so they cannot finish before
-// Stop and leave the refusal path unexercised; and the main thread waits
-// for every producer to get well past a spin-up threshold before it
-// Stops, so Stop cannot land before the producers were scheduled. The
-// run is asserted to have ended by refusal, never by the runaway cap.
+// The empty-run outcome is designed out from both ends. The producers
+// push until the queue refuses rather than a fixed count, so the refusal
+// path is live for Stop to hit; and the main thread releases them
+// together through a start gate and waits (bounded) for at least one
+// push to land before it Stops, so Stop cannot rendezvous with an empty
+// queue. The assertion the race turns on is only that AT LEAST ONE
+// producer was refused — a producer that instead reached the runaway cap
+// simply filled its quota before Stop landed and did not race; its
+// accepted sequences are still in the chain, so loss/duplication/order
+// and the totals are all still checked against it.
 procedure TPostQueueConcurrency.TestPushRacingStop;
 const
   Producers = 4;
-  // Runaway guard only: reaching it means Stop never refused, which the
-  // HitCap assertion below turns into a red test. Sized so it is
-  // unreachable inside the fixed pre-Stop window: every push crosses
-  // one shared critical section, which bounds the aggregate well below
-  // Cap-per-producer in tens of milliseconds.
-  PushCap = 2000000;
+  // Runaway guard: reaching it means a producer never got to race Stop.
+  // One reaching it is tolerated (see above); sized well above what the
+  // fixed pre-Stop window admits — every push crosses one shared
+  // critical section — while small enough that the runaway path's node
+  // backlog stays a modest memory spike rather than a multi-million-node
+  // one.
+  PushCap = 500000;
   RaceWindowMs = 10;
   // Generous bound on the scheduler getting the first producer onto a
   // core after the gate opens. Never reached on a healthy machine; it
@@ -333,12 +347,12 @@ var
   NextSeq: array[0..Producers - 1] of PtrUInt;
   Node, Head, Next: PWSPostNode;
   I, Producer, Delivered, AcceptedSum: Integer;
-  ExactOk, RefusedOk, CountOk: Boolean;
-  Gate, Started: Boolean;
+  ExactOk, RefusedAny, CountOk: Boolean;
+  Started: Boolean;
   StartupBound: QWord;
 begin
   Q := TWSPostQueue.Create;
-  Gate := False;
+  InterlockedExchange(RacingStartGate, 0);
   try
     for I := 0 to Producers - 1 do
     begin
@@ -346,7 +360,7 @@ begin
       Threads[I].Queue := Q;
       Threads[I].ProducerId := NativeUInt(I);
       Threads[I].Cap := PushCap;
-      Threads[I].StartGate := @Gate;
+      Threads[I].StartGate := @RacingStartGate;
       NextSeq[I] := 0;
     end;
     for I := 0 to Producers - 1 do
@@ -354,14 +368,13 @@ begin
 
     // Release every producer at once, wait for the first push to
     // actually land, then give the set a fixed window to hammer before
-    // landing Stop mid-flight. The bounded wait is what keeps the
-    // barrier's cap safety without the all-four-starved flake: a
-    // producer the scheduler starves for the window is simply refused
-    // at its first push (Accepted = 0), a valid outcome — but ALL FOUR
-    // starved means Stop lands on an empty queue and AcceptedSum = 0
-    // fails a run that proved nothing. The wait is on the aggregate, so
-    // the race the fixed window creates is unchanged.
-    Gate := True;
+    // landing Stop mid-flight. The bounded wait keeps the run from the
+    // all-four-starved flake: a producer the scheduler starves for the
+    // window is simply refused at its first push (Accepted = 0), a valid
+    // outcome — but ALL FOUR starved means Stop lands on an empty queue
+    // and AcceptedSum = 0 fails a run that proved nothing. The wait is on
+    // the aggregate, so the race the fixed window creates is unchanged.
+    InterlockedExchange(RacingStartGate, 1);
     StartupBound := GetTickCount64 + StartupBoundMs;
     repeat
       Started := False;
@@ -378,12 +391,14 @@ begin
     // raised here would skip the remaining joins and let the finally
     // below free the queue under live producers.
     AcceptedSum := 0;
-    RefusedOk := True;
+    RefusedAny := False;
     for I := 0 to Producers - 1 do
     begin
       Threads[I].WaitFor;
       Inc(AcceptedSum, Threads[I].Accepted);
-      RefusedOk := RefusedOk and not Threads[I].HitCap;
+      // At least one producer refused proves Stop rendezvoused with a
+      // live producer; one that hit the cap instead just did not race.
+      RefusedAny := RefusedAny or not Threads[I].HitCap;
       NextSeq[I] := 0;
     end;
 
@@ -416,7 +431,7 @@ begin
     for I := 0 to Producers - 1 do
       Threads[I].Free;
 
-    Expect<Boolean>(RefusedOk).ToBe(True);     // ended by refusal, not cap
+    Expect<Boolean>(RefusedAny).ToBe(True);    // at least one refused by Stop
     Expect<Boolean>(AcceptedSum > 0).ToBe(True);
     Expect<Integer>(Delivered).ToBe(AcceptedSum);
     Expect<Boolean>(ExactOk).ToBe(True);

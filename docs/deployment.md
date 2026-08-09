@@ -35,3 +35,30 @@ During the sandbox phase the dependency can also be a local path
 Browser-facing consumers also need to serve the page that opens the
 WebSocket — duetto deliberately doesn't do that; see the
 [companion HTTP recipe](companion-http.md).
+
+## Runtime dependencies
+
+Plain `ws://` deployments have none beyond the C runtime — the epoll,
+Network.framework and IOCP transports are self-contained. Server-side
+`wss://` is where a runtime dependency appears, and only on the two
+OpenSSL-backed transports:
+
+- **Linux (epoll).** `libssl.so.3` and `libcrypto.so.3` must be loadable
+  from the usual library paths. They ship with any current distribution's
+  `openssl` / `libssl3` package; without them the TLS server context
+  fails to build at startup.
+- **Windows x64 (IOCP).** `libssl-3-x64.dll` and `libcrypto-3-x64.dll`
+  must sit **beside the executable** or in `System32`. The loader is
+  called with `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`, so `%PATH%` is
+  deliberately **not** searched — dropping the DLLs next to the `.exe` is
+  the supported placement.
+- **Windows x86 (win32).** There is **no server TLS**: a 32-bit OpenSSL 3
+  runtime is effectively unobtainable, so a win32 build cannot terminate
+  `wss://`. Terminate TLS in a reverse proxy in front of a plain `ws://`
+  listener there.
+- **macOS (Network.framework).** Nothing extra — TLS terminates inside
+  the platform stack.
+
+Where the OpenSSL libraries are absent (or on win32), a TLS-terminating
+reverse proxy in front of a plain listener remains a valid deployment
+shape; see [companion-http.md](companion-http.md).

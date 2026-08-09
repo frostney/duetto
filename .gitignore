@@ -25,6 +25,11 @@ build/
 # Autobahn testsuite output (reports are generated, never committed).
 tests/autobahn/reports/
 
+# Session-local agent handoff state (per the handoff protocol) — working
+# notes, not repo content. Kept out of the tree so the markdownlint docs
+# job (globs **/*.md) never lints .agent/HANDOFF.md.
+.agent/
+
 # OS noise.
 .DS_Store
 Thumbs.db

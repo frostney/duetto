@@ -10,13 +10,17 @@ program wsinterop;
 // abrupt raw-socket drops and server-initiated pushes, ended by a
 // Shutdown with connections still open.
 //
-// On Linux there is also a wss:// section (duetto#22): a second server
-// with server TLS terminated by the epoll transport itself, driven from
-// a runtime-generated CA + leaf identity. It is Linux-only because of
-// what the CLIENT half needs, not the server half — see the skip line
-// at the section itself for why macOS and Windows are excluded. It also
-// skips with a clear line when the openssl CLI is not installed, so a
-// local macOS/Windows run stays green.
+// On Linux there is also a wss:// section (duetto#22): a third server
+// (after the echo and plain-request ones) with server TLS terminated by
+// the epoll transport itself, driven from a runtime-generated CA + leaf
+// identity. It is Linux-only because of what the CLIENT half needs, not
+// the server half — see the skip line at the section itself for why
+// macOS and Windows are excluded. The whole section is {$ifdef LINUX};
+// on Linux it skips with a clear line when the openssl CLI or the
+// libssl server backend is unavailable, so a bare container without them
+// stays green. Set WSINTEROP_REQUIRE_TLS to turn any such skip into a
+// hard failure (the CI knob that keeps the section from silently
+// vanishing).
 //
 // Exit 0 = every check passed.
 
@@ -408,6 +412,9 @@ const
 // TLS use, which is why the whole section runs after it).
 function C_setenv(AName: PAnsiChar; AValue: PAnsiChar;
   AOverwrite: Integer): Integer; cdecl; external name 'setenv';
+function C_unsetenv(AName: PAnsiChar): Integer; cdecl;
+  external name 'unsetenv';
+function C_getenv(AName: PAnsiChar): PAnsiChar; cdecl; external name 'getenv';
 
 function TlsOpenSslPresent: Boolean;
 begin
@@ -467,7 +474,7 @@ begin
     // Braces, not a trailing redirect: the redirect has to cover every
     // command in the script, and openssl chatters on both streams.
     ExecuteProcess('/bin/sh',
-      ['-c', '{ ' + Script + '; } >' + ADir + 'openssl.log 2>&1']);
+      ['-c', '{ ' + Script + '; } >"' + ADir + 'openssl.log" 2>&1']);
   except
     Exit;
   end;
@@ -641,7 +648,89 @@ begin
   Result := -1;
 end;
 
+// Structural FIN-vs-RST discriminator on the raw fd, read AFTER lwpt's
+// TLS layer has already reported close_notify. A bare recv returns 0 for
+// an orderly FIN and -1 (ECONNRESET) for a reset, so this is the
+// deterministic signal the close_notify checks need on top of the racy
+// "SSL_read returned 0": a server that turned the FIN into an RST (failed
+// to drain unread input) shows the reset here even when the buffered
+// close_notify was read first. A short receive timeout is armed so the
+// call can never block — a peer that sends neither reads as "not an
+// orderly close" rather than hanging the battery.
+function RawSawOrderlyFin(AFd: Tsocket): Boolean;
+var
+  B: array[0..15] of Byte;
+  TV: TInteropTimeVal;
+begin
+  TV.Seconds := 2;
+  TV.Microseconds := 0;
+  fpSetSockOpt(AFd, SOL_SOCKET, SO_RCVTIMEO, @TV, SizeOf(TV));
+  Result := fpRecv(AFd, @B[0], SizeOf(B), 0) = 0;
+end;
+
+// A well-formed TLS handshake byte stream that never completes, for the
+// inbound-budget probe. It is a run of valid handshake records (content
+// type 0x16, a TLS 1.0 record version — the widest a server accepts
+// before it has picked one — each at the 16 KiB record ceiling) carrying
+// a single ClientHello whose declared length is larger than the stream
+// ever delivers. OpenSSL accepts every record at the record layer and
+// buffers the partial ClientHello in WANT_READ: no content-type or
+// record-length parse error is reachable, so a server that drops this
+// connection can only be enforcing the inbound byte budget — which is
+// exactly what the probe needs to distinguish the budget from a lucky
+// parse failure. Returns at least AMinBytes bytes, rounded up to whole
+// records (never fewer than two, so more than one clamped read window
+// must accrue before the budget can fire).
+function TlsHandshakeFlood(AMinBytes: Integer): TBytes;
+const
+  RecordBody = 16384;            // TLS record payload ceiling (2^14)
+  RecordSize = 5 + RecordBody;
+var
+  Records, Total, R, Off, I: Integer;
+  MsgLen: Cardinal;
+begin
+  Records := (AMinBytes + RecordSize - 1) div RecordSize;
+  if Records < 2 then Records := 2;
+  Total := Records * RecordSize;
+  SetLength(Result, Total);
+  // Declared one whole record beyond everything the stream carries, so
+  // the ClientHello is provably never complete however far the server
+  // reads before the budget stops it.
+  MsgLen := Cardinal((Records + 1) * RecordBody);
+  Off := 0;
+  for R := 0 to Records - 1 do
+  begin
+    Result[Off] := $16;          // handshake record
+    Result[Off + 1] := $03;      // record version TLS 1.0
+    Result[Off + 2] := $01;
+    Result[Off + 3] := RecordBody shr 8;
+    Result[Off + 4] := RecordBody and $FF;
+    Inc(Off, 5);
+    if R = 0 then
+    begin
+      Result[Off] := $01;        // ClientHello handshake type
+      Result[Off + 1] := Byte((MsgLen shr 16) and $FF);
+      Result[Off + 2] := Byte((MsgLen shr 8) and $FF);
+      Result[Off + 3] := Byte(MsgLen and $FF);
+      for I := 4 to RecordBody - 1 do
+        Result[Off + I] := Byte((R * 31 + I * 7) and $FF);
+    end
+    else
+      for I := 0 to RecordBody - 1 do
+        Result[Off + I] := Byte((R * 31 + I * 7) and $FF);
+    Inc(Off, RecordBody);
+  end;
+end;
+
 {$endif}
+
+// WSINTEROP_REQUIRE_TLS turns a skipped wss section into a hard failure —
+// the CI knob (see the header) that stops server-TLS coverage from
+// silently evaporating on a runner that is meant to exercise it.
+function TlsRequired: Boolean;
+begin
+  Result := GetEnvironmentVariable('WSINTEROP_REQUIRE_TLS') <> '';
+end;
 
 // ---------------------------------------------------------------------------
 // Concurrent-connections stress section
@@ -1259,8 +1348,24 @@ var
   TlsCode: Word;
   TlsElapsed: Integer;
   TlsOk: Boolean;
+  // SSL_CERT_FILE is process-global and OpenSSL caches its trust store at
+  // first client use; capture whatever it held so teardown can restore it
+  // (or unset) before the CA file is deleted, rather than leaving it
+  // pointing at a path that no longer exists.
+  TlsPriorCert: PAnsiChar;
+  TlsHadPriorCert: Boolean;
+  TlsPriorCertVal: AnsiString;
   {$endif}
 begin
+  {$ifdef UNIX}
+  // Ignore SIGPIPE once, up front and unconditionally — before any
+  // section, present openssl or not — so the global signal disposition
+  // is deterministic for the whole battery. The TLS close_notify probes
+  // SSL_shutdown into a peer that may already be gone, and a write into a
+  // reset socket would otherwise take the process down with a signal
+  // instead of surfacing as an EPIPE a check can report.
+  fpSignal(SIGPIPE, SignalHandler(SIG_IGN));
+  {$endif}
   Echo := TEcho.Create;
   Tracker := TStressTracker.Create;
   SrvT := TServerThread.Create(True);
@@ -1518,221 +1623,351 @@ begin
   StressPhase := 'tls section';
   TlsDir := IncludeTrailingPathDelimiter(GetTempDir) + 'duetto-interop-tls-' +
     IntToStr(FpGetPid) + PathDelim;
-  if not TlsOpenSslPresent then
-    WriteLn('skip - tls: openssl CLI not installed; wss section skipped')
+  // Gate on BOTH halves the section needs: the openssl CLI builds the
+  // throwaway identity, and lwpt's libssl backend (a different artifact —
+  // a box can have the CLI but not a loadable libssl) terminates the
+  // server side. A missing either is a skip, not an abort — unless
+  // WSINTEROP_REQUIRE_TLS says a runner that is meant to cover TLS must
+  // not let the section quietly vanish.
+  if not (TlsOpenSslPresent and TransportSecurityServerBackendAvailable) then
+  begin
+    if TlsRequired then
+      Check(False, 'tls: required (WSINTEROP_REQUIRE_TLS) but skipped — ' +
+        'openssl CLI or the libssl server backend is unavailable')
+    else
+      WriteLn('skip - tls: openssl CLI or libssl server backend ' +
+        'unavailable; wss section skipped');
+  end
   else if not TlsGenerateIdentity(TlsDir) then
-    WriteLn('skip - tls: openssl could not build a test identity (see ',
-      TlsDir, 'openssl.log); wss section skipped')
+  begin
+    if TlsRequired then
+      Check(False, 'tls: required (WSINTEROP_REQUIRE_TLS) but openssl ' +
+        'could not build a test identity (see ' + TlsDir + 'openssl.log)')
+    else
+      WriteLn('skip - tls: openssl could not build a test identity (see ',
+        TlsDir, 'openssl.log); wss section skipped');
+  end
   else
   begin
     // Before the first client TLS use in this process: the client's
     // OpenSSL context loads its trust store once, at connect time.
+    // Capture whatever SSL_CERT_FILE held so teardown can put it back
+    // (or unset) before the CA file is deleted.
+    TlsPriorCert := C_getenv('SSL_CERT_FILE');
+    TlsHadPriorCert := TlsPriorCert <> nil;
+    if TlsHadPriorCert then TlsPriorCertVal := AnsiString(TlsPriorCert);
     C_setenv('SSL_CERT_FILE', PAnsiChar(AnsiString(TlsDir + 'ca.crt')), 1);
 
-    TlsCfg := WSTransportNoTls;
-    TlsCfg.Enabled := True;
-    TlsCfg.Pkcs12Path := TlsDir + 'identity.p12';
-    TlsCfg.Pkcs12Passphrase := TlsPassphrase;
-    TlsCfg.InputHighWater := TlsInputHighWater;
-    TlsCfg.OutputCapacity := TlsOutputCapacity;
-    TlsCfg.HandshakeDeadlineMs := TlsHandshakeDeadlineMs;
-    TlsCfg.InboundHandshakeBudget := TlsInboundBudget;
-    TlsSrvT := TServerThread.Create(True);
-    TlsSrvT.Srv := TWSServer.Create(0, TlsCfg, True);
-    TlsSrvT.Srv.OnMessage := Echo.OnMsg;
-    TlsPort := TlsSrvT.Srv.Port;
-    // The leaf carries 127.0.0.1 as a DNS SAN as well as an IP one, so
-    // the client's hostname check passes without a name lookup — the
-    // rest of the battery dials the loopback address for the same
-    // reason.
-    TlsUrl := Format('wss://127.0.0.1:%d/', [TlsPort]);
-    TlsSrvT.Start;
-
-    TlsCli := TWSClient.Create;
-    TlsCli.Connect(TlsUrl);
-    TlsCli.SendText(HelloProbe);
-    Check(TlsCli.ReadMessage(IsText, Data) and IsText and
-      (Length(Data) = Length(HelloProbe)) and
-      CompareMem(@Data[0], @HelloProbe[1], Length(HelloProbe)),
-      'tls: wss handshake and text echo');
-
-    for I := 0 to 2 do
-      TlsCli.SendText(PipelinedMsgs[I]);
-    Ok := True;
-    for I := 0 to 2 do
-    begin
-      S := PipelinedMsgs[I];
-      Ok := Ok and TlsCli.ReadMessage(IsText, Data) and IsText and
-        (Length(Data) = Length(S)) and CompareMem(@Data[0], @S[1], Length(S));
-    end;
-    Check(Ok, 'tls: three pipelined messages over wss, in order');
-
-    // The flow-control proof. With the encrypted input window at
-    // lwpt's floor, every 256 KB socket read is accepted a fraction at
-    // a time and the remainder re-offered from the carry buffer; with
-    // the output capacity at the floor, the echo is absorbed in ~30
-    // capacity-sized bites re-offered through OnSendReady. Any byte
-    // lost, duplicated or reordered on either side breaks the record
-    // stream long before the payload compare.
-    SetLength(Big, TlsBigEchoBytes);
-    for I := 0 to High(Big) do
-      Big[I] := Byte((I * 131 + 17) and $FF);
-    TlsCli.SendBinary(@Big[0], Length(Big));
-    Check(TlsCli.ReadMessage(IsText, Data) and (not IsText) and
-      (Length(Data) = Length(Big)) and
-      CompareMem(@Data[0], @Big[0], Length(Big)),
-      Format('tls: %d KiB echo intact and in order through %d-byte ' +
-      'input/output windows', [TlsBigEchoBytes div 1024, TlsInputHighWater]));
-
-    TlsCli.Close(1000, 'done');
-    Check(TlsCli.CloseCode = 1000, 'tls: clean close echoes 1000 over wss');
-    TlsCli.Free;
-
-    // close_notify before FIN, observed from a probe that keeps its
-    // socket open past the WebSocket close: lwpt's blocking read
-    // returns 0 on an orderly TLS shutdown and raises on a reset.
-    StressPhase := 'tls section: close_notify probe';
-    TlsProbeFd := RawConnectEx(TlsPort, False);
-    StartTransportSecurity(TlsProbe, TlsProbeFd, '127.0.0.1');
-    TlsOk := TlsProbe.Active;
-    TlsLeft := TlsProbeHandshake(TlsProbe, TlsPort);
-    TlsOk := TlsOk and TlsProbeWrite(TlsProbe,
-      BuildFrameBytes(WS_OP_CLOSE, #$03#$E8, True));
-    TlsCode := TlsProbeReadCloseCode(TlsProbe, TlsLeft);
-    TlsOk := TlsOk and (TlsCode = 1000) and TlsProbeSawCloseNotify(TlsProbe);
-    CloseTransportSecurity(TlsProbe);
-    CloseSocket(TlsProbeFd);
-    Check(TlsOk, 'tls: graceful close flushes close_notify before FIN');
-
-    // The same close, with a trailer pipelined right behind the close
-    // frame — bytes the server is still holding UNREAD when its drain
-    // starts. That is the case the check above cannot see, because a
-    // probe that goes quiet leaves an empty receive queue: close() on a
-    // socket with unread bytes sends RST instead of FIN, and a peer
-    // that receives RST may discard its own buffered receive data,
-    // alert included. Surviving this is what says the drain half-closes
-    // and reads the rest away rather than closing outright.
-    StressPhase := 'tls section: close_notify behind a pipelined trailer';
-    // lwpt's blocking client write has no MSG_NOSIGNAL knob, and this
-    // probe deliberately keeps writing into a socket a broken server
-    // would reset mid-write. Ignoring SIGPIPE turns that into an EPIPE
-    // the code below reports as a red check instead of a signal that
-    // kills the battery outright — measured: without the transport's
-    // drain this section takes the process down with exit 141.
-    fpSignal(SIGPIPE, SignalHandler(SIG_IGN));
-    TlsProbeFd := RawConnectEx(TlsPort, False);
-    StartTransportSecurity(TlsProbe, TlsProbeFd, '127.0.0.1');
-    TlsOk := False;
+    TlsSrvT := nil;
     try
-      TlsLeft := TlsProbeHandshake(TlsProbe, TlsPort);
-      // One write, so the trailer is already in flight while the server
-      // is still digesting the first clamped input window — no sleep,
-      // no reliance on the server losing a race.
-      TlsOk := TlsProbe.Active and TlsProbeWrite(TlsProbe,
-        BuildFrameBytes(WS_OP_CLOSE, #$03#$E8, True) +
-        BuildFrameBytes(WS_OP_BINARY,
-        TlsBurstPayload(0, TlsClosePipelineBytes), True));
-      TlsCode := TlsProbeReadCloseCode(TlsProbe, TlsLeft);
-      TlsOk := TlsOk and (TlsCode = 1000) and TlsProbeSawCloseNotify(TlsProbe);
-    except
-      // A reset in place of an orderly shutdown surfaces as an exception
-      // out of lwpt's blocking client. That IS the failure this check
-      // exists to catch, so name it and go red.
-      on E: Exception do
-      begin
-        TlsOk := False;
-        WriteLn('       pipelined-close probe: ', E.Message);
+      TlsCfg := WSTransportNoTls;
+      TlsCfg.Enabled := True;
+      TlsCfg.Pkcs12Path := TlsDir + 'identity.p12';
+      TlsCfg.Pkcs12Passphrase := TlsPassphrase;
+      TlsCfg.InputHighWater := TlsInputHighWater;
+      TlsCfg.OutputCapacity := TlsOutputCapacity;
+      TlsCfg.HandshakeDeadlineMs := TlsHandshakeDeadlineMs;
+      TlsCfg.InboundHandshakeBudget := TlsInboundBudget;
+      TlsSrvT := TServerThread.Create(True);
+      TlsSrvT.Srv := TWSServer.Create(0, TlsCfg, True);
+      TlsSrvT.Srv.OnMessage := Echo.OnMsg;
+      TlsPort := TlsSrvT.Srv.Port;
+      // The leaf carries 127.0.0.1 as a DNS SAN as well as an IP one, so
+      // the client's hostname check passes without a name lookup — the
+      // rest of the battery dials the loopback address for the same
+      // reason.
+      TlsUrl := Format('wss://127.0.0.1:%d/', [TlsPort]);
+      TlsSrvT.Start;
+
+      // The wss client session: handshake + echo, pipelining, the big
+      // carry-path echo, clean close. Guarded like every probe below, so
+      // a raise out of Connect/ReadMessage becomes one red check line
+      // instead of an unhandled exception out of the section.
+      StressPhase := 'tls section: wss client session';
+      TlsCli := nil;
+      try
+        TlsCli := TWSClient.Create;
+        TlsCli.Connect(TlsUrl);
+        TlsCli.SendText(HelloProbe);
+        Check(TlsCli.ReadMessage(IsText, Data) and IsText and
+          (Length(Data) = Length(HelloProbe)) and
+          CompareMem(@Data[0], @HelloProbe[1], Length(HelloProbe)),
+          'tls: wss handshake and text echo');
+
+        for I := 0 to 2 do
+          TlsCli.SendText(PipelinedMsgs[I]);
+        Ok := True;
+        for I := 0 to 2 do
+        begin
+          S := PipelinedMsgs[I];
+          Ok := Ok and TlsCli.ReadMessage(IsText, Data) and IsText and
+            (Length(Data) = Length(S)) and
+            CompareMem(@Data[0], @S[1], Length(S));
+        end;
+        Check(Ok, 'tls: three pipelined messages over wss, in order');
+
+        // The flow-control proof. With the encrypted input window at
+        // lwpt's floor, every 256 KB socket read is accepted a fraction
+        // at a time and the remainder re-offered from the carry buffer;
+        // with the output capacity at the floor, the echo is absorbed in
+        // ~30 capacity-sized bites re-offered through OnSendReady. Any
+        // byte lost, duplicated or reordered on either side breaks the
+        // record stream long before the payload compare.
+        SetLength(Big, TlsBigEchoBytes);
+        for I := 0 to High(Big) do
+          Big[I] := Byte((I * 131 + 17) and $FF);
+        TlsCli.SendBinary(@Big[0], Length(Big));
+        Check(TlsCli.ReadMessage(IsText, Data) and (not IsText) and
+          (Length(Data) = Length(Big)) and
+          CompareMem(@Data[0], @Big[0], Length(Big)),
+          Format('tls: %d KiB echo intact and in order through %d-byte ' +
+          'input/output windows',
+          [TlsBigEchoBytes div 1024, TlsInputHighWater]));
+
+        TlsCli.Close(1000, 'done');
+        Check(TlsCli.CloseCode = 1000, 'tls: clean close echoes 1000 over wss');
+      except
+        on E: Exception do
+          Check(False, 'tls: wss client session raised: ' + E.Message);
       end;
-    end;
-    CloseTransportSecurity(TlsProbe);
-    CloseSocket(TlsProbeFd);
-    Check(TlsOk, Format('tls: close_notify survives %d KiB pipelined behind ' +
-      'the close frame (unread input must not turn the FIN into an RST)',
-      [TlsClosePipelineBytes div 1024]));
+      FreeAndNil(TlsCli);
 
-    // A throttled peer. The probe's receive buffer is a fraction of the
-    // echo it is about to earn, and it writes everything — one large
-    // message plus a pipelined tail of small ones — before reading a
-    // byte, so the server is holding several messages' worth of output
-    // while more input keeps arriving. That is the transport's
-    // re-offer accounting under maximum overlap; every message coming
-    // back whole and in order is what says nothing was dropped,
-    // duplicated or reordered.
-    //
-    // Neither write can wedge: the lead message is fully consumed
-    // before its echo begins, and the tail is small enough to sit in
-    // the socket buffers of a server that has stopped reading.
-    StressPhase := 'tls section: throttled peer';
-    TlsProbeFd := RawConnectEx(TlsPort, False, TlsBurstRecvBuf);
-    StartTransportSecurity(TlsProbe, TlsProbeFd, '127.0.0.1');
-    TlsLeft := TlsProbeHandshake(TlsProbe, TlsPort);
-    SetLength(TlsSizes, TlsBurstTailCount + 1);
-    TlsSizes[0] := TlsBurstLeadSize;
-    for I := 1 to TlsBurstTailCount do
-      TlsSizes[I] := TlsBurstTailSize;
-    TlsOk := True;
-    for I := 0 to TlsBurstTailCount do
-    begin
-      S := BuildFrameBytes(WS_OP_BINARY, TlsBurstPayload(I, TlsSizes[I]),
-        True);
-      TlsOk := TlsOk and TlsProbeWrite(TlsProbe, S);
-    end;
-    TlsOk := TlsOk and TlsProbeVerifyEchoes(TlsProbe, TlsLeft, TlsSizes);
-    CloseTransportSecurity(TlsProbe);
-    CloseSocket(TlsProbeFd);
-    Check(TlsOk, Format('tls: %d KiB + %d x %d B pipelined behind a %d KiB ' +
-      'receive window, every echo intact and in order',
-      [TlsBurstLeadSize div 1024, TlsBurstTailCount, TlsBurstTailSize,
-      TlsBurstRecvBuf div 1024]));
+      // close_notify before FIN, observed from a probe that keeps its
+      // socket open past the WebSocket close: lwpt's blocking read
+      // returns 0 on an orderly TLS shutdown and raises on a reset. On
+      // top of that TLS-level signal we require a structural FIN on the
+      // raw fd (a bare recv returning 0, not an RST), so the check turns
+      // on a real orderly close, not a race that read 0 first.
+      StressPhase := 'tls section: close_notify probe';
+      TlsOk := False;
+      TlsProbeFd := RawConnectEx(TlsPort, False);
+      try
+        StartTransportSecurity(TlsProbe, TlsProbeFd, '127.0.0.1');
+        TlsOk := TlsProbe.Active;
+        TlsLeft := TlsProbeHandshake(TlsProbe, TlsPort);
+        TlsOk := TlsOk and TlsProbeWrite(TlsProbe,
+          BuildFrameBytes(WS_OP_CLOSE, #$03#$E8, True));
+        TlsCode := TlsProbeReadCloseCode(TlsProbe, TlsLeft);
+        TlsOk := TlsOk and (TlsCode = 1000) and
+          TlsProbeSawCloseNotify(TlsProbe) and RawSawOrderlyFin(TlsProbeFd);
+      except
+        on E: Exception do
+        begin
+          TlsOk := False;
+          WriteLn('       close_notify probe: ', E.Message);
+        end;
+      end;
+      CloseTransportSecurity(TlsProbe);
+      CloseSocket(TlsProbeFd);
+      Check(TlsOk,
+        'tls: graceful close flushes close_notify before an orderly FIN');
 
-    // Slow loris: a plausible record header, then silence. Nothing in
-    // the TLS engine can time this out — only the reactor's deadline.
-    StressPhase := 'tls section: handshake deadline';
-    Fd := RawConnect(TlsPort);
-    S := #$16#$03#$01#$00#$C0;
-    fpSend(Fd, @S[1], Length(S), TlsSendFlags);
-    TlsElapsed := RawWaitForClose(Fd, TlsCloseBoundMs + 2000);
-    CloseSocket(Fd);
-    Check((TlsElapsed >= 0) and (TlsElapsed < TlsCloseBoundMs),
-      Format('tls: silent peer dropped by the %d ms handshake deadline ' +
-      '(after %d ms)', [TlsHandshakeDeadlineMs, TlsElapsed]));
+      // The same close, with a trailer pipelined right behind the close
+      // frame — bytes the server is still holding UNREAD when its drain
+      // starts. That is the case the check above cannot see on its own,
+      // because a probe that goes quiet leaves an empty receive queue:
+      // close() on a socket with unread bytes sends RST instead of FIN,
+      // and a peer that receives RST may discard its own buffered receive
+      // data, alert included. Surviving this is what says the drain
+      // half-closes and reads the rest away rather than closing outright
+      // — and the raw-fd FIN check is what proves it structurally, since
+      // the buffered close_notify can be read 0 even as an RST is pending.
+      StressPhase := 'tls section: close_notify behind a pipelined trailer';
+      TlsOk := False;
+      TlsProbeFd := RawConnectEx(TlsPort, False);
+      try
+        StartTransportSecurity(TlsProbe, TlsProbeFd, '127.0.0.1');
+        TlsLeft := TlsProbeHandshake(TlsProbe, TlsPort);
+        // One write, so the trailer is already in flight while the server
+        // is still digesting the first clamped input window — no sleep,
+        // no reliance on the server losing a race. SIGPIPE is ignored
+        // process-wide (installed at program start), so a broken server
+        // resetting mid-write surfaces as an EPIPE the except arm reports
+        // rather than a signal that kills the battery.
+        TlsOk := TlsProbe.Active and TlsProbeWrite(TlsProbe,
+          BuildFrameBytes(WS_OP_CLOSE, #$03#$E8, True) +
+          BuildFrameBytes(WS_OP_BINARY,
+          TlsBurstPayload(0, TlsClosePipelineBytes), True));
+        TlsCode := TlsProbeReadCloseCode(TlsProbe, TlsLeft);
+        TlsOk := TlsOk and (TlsCode = 1000) and
+          TlsProbeSawCloseNotify(TlsProbe) and RawSawOrderlyFin(TlsProbeFd);
+      except
+        // A reset in place of an orderly shutdown surfaces as an exception
+        // out of lwpt's blocking client. That IS the failure this check
+        // exists to catch, so name it and go red.
+        on E: Exception do
+        begin
+          TlsOk := False;
+          WriteLn('       pipelined-close probe: ', E.Message);
+        end;
+      end;
+      CloseTransportSecurity(TlsProbe);
+      CloseSocket(TlsProbeFd);
+      Check(TlsOk, Format('tls: close_notify + orderly FIN survive %d KiB ' +
+        'pipelined behind the close frame (unread input must not turn the ' +
+        'FIN into an RST)', [TlsClosePipelineBytes div 1024]));
 
-    // Volume guard: far more ciphertext than any handshake needs, in
-    // one burst. The connection dies bounded instead of buffering it.
-    StressPhase := 'tls section: inbound budget';
-    Fd := RawConnect(TlsPort);
-    SetLength(Garbage, 256 * 1024);
-    for I := 0 to High(Garbage) do
-      Garbage[I] := Byte((I * 61 + 3) and $FF);
-    fpSend(Fd, @Garbage[0], Length(Garbage), TlsSendFlags);
-    TlsElapsed := RawWaitForClose(Fd, TlsCloseBoundMs + 2000);
-    CloseSocket(Fd);
-    Check((TlsElapsed >= 0) and (TlsElapsed < TlsCloseBoundMs),
-      Format('tls: %d KiB pre-handshake flood dropped against a %d KiB ' +
-      'budget (after %d ms)', [Length(Garbage) div 1024,
-      TlsInboundBudget div 1024, TlsElapsed]));
+      // A throttled peer. The probe asks for a receive buffer a fraction
+      // of the echo it is about to earn (Linux rounds SO_RCVBUF up and
+      // roughly doubles the request, so the effective window is ~2x the
+      // number below — the point is only that it is far smaller than the
+      // pending echo), and it writes everything — one large message plus
+      // a pipelined tail of small ones — before reading a byte, so the
+      // server holds several messages' worth of output while more input
+      // keeps arriving. What this asserts is narrow: every message comes
+      // back whole and in order, which a byte lost, duplicated or
+      // reordered on the transport's re-offer path would break. It
+      // exercises that path under overlap; it does not directly audit the
+      // accounting (the big-echo check above already carries the plain
+      // carry-path proof).
+      //
+      // Neither write can wedge: the lead message is fully consumed
+      // before its echo begins, and the tail is small enough to sit in
+      // the socket buffers of a server that has stopped reading.
+      StressPhase := 'tls section: throttled peer';
+      TlsOk := False;
+      TlsProbeFd := RawConnectEx(TlsPort, False, TlsBurstRecvBuf);
+      try
+        StartTransportSecurity(TlsProbe, TlsProbeFd, '127.0.0.1');
+        TlsLeft := TlsProbeHandshake(TlsProbe, TlsPort);
+        SetLength(TlsSizes, TlsBurstTailCount + 1);
+        TlsSizes[0] := TlsBurstLeadSize;
+        for I := 1 to TlsBurstTailCount do
+          TlsSizes[I] := TlsBurstTailSize;
+        TlsOk := True;
+        for I := 0 to TlsBurstTailCount do
+        begin
+          S := BuildFrameBytes(WS_OP_BINARY, TlsBurstPayload(I, TlsSizes[I]),
+            True);
+          TlsOk := TlsOk and TlsProbeWrite(TlsProbe, S);
+        end;
+        TlsOk := TlsOk and TlsProbeVerifyEchoes(TlsProbe, TlsLeft, TlsSizes);
+      except
+        on E: Exception do
+        begin
+          TlsOk := False;
+          WriteLn('       throttled-peer probe: ', E.Message);
+        end;
+      end;
+      CloseTransportSecurity(TlsProbe);
+      CloseSocket(TlsProbeFd);
+      Check(TlsOk, Format('tls: %d KiB + %d x %d B pipelined behind a ' +
+        '~%d KiB requested receive window, every echo intact and in order',
+        [TlsBurstLeadSize div 1024, TlsBurstTailCount, TlsBurstTailSize,
+        TlsBurstRecvBuf div 1024]));
 
-    // Both guards fire per connection, not per listener.
-    StressPhase := 'tls section: survivor';
-    TlsCli := TWSClient.Create;
-    TlsCli.Connect(TlsUrl);
-    TlsCli.SendText(HelloProbe);
-    Ok := TlsCli.ReadMessage(IsText, Data) and IsText and
-      (Length(Data) = Length(HelloProbe));
-    TlsCli.Close(1000, '');
-    TlsCli.Free;
-    Check(Ok, 'tls: the listener still serves wss after both guards fired');
+      // Slow loris: a plausible record header, then silence. Nothing in
+      // the TLS engine can time this out — only the reactor's deadline.
+      // Two-sided on purpose: the drop must land AFTER half the deadline
+      // (so a removed or zeroed deadline, dropping at ~0 ms, fails) and
+      // BEFORE the close bound (so a real drop, not a hang, is asserted).
+      StressPhase := 'tls section: handshake deadline';
+      TlsOk := False;
+      TlsElapsed := -1;
+      try
+        Fd := RawConnect(TlsPort);
+        try
+          S := #$16#$03#$01#$00#$C0;
+          fpSend(Fd, @S[1], Length(S), TlsSendFlags);
+          TlsElapsed := RawWaitForClose(Fd, TlsCloseBoundMs + 2000);
+        finally
+          CloseSocket(Fd);
+        end;
+        TlsOk := (TlsElapsed >= TlsHandshakeDeadlineMs div 2) and
+          (TlsElapsed < TlsCloseBoundMs);
+      except
+        on E: Exception do
+        begin
+          TlsOk := False;
+          WriteLn('       handshake-deadline probe: ', E.Message);
+        end;
+      end;
+      Check(TlsOk,
+        Format('tls: silent peer dropped by the %d ms handshake deadline ' +
+        '(after %d ms, past the %d ms floor)',
+        [TlsHandshakeDeadlineMs, TlsElapsed, TlsHandshakeDeadlineMs div 2]));
 
-    StressPhase := 'tls section: teardown';
-    TlsSrvT.Terminate;
-    TlsSrvT.Srv.Stop;
-    TlsSrvT.WaitFor;
-    TlsSrvT.Srv.Free;
-    TlsSrvT.Free;
-    try
-      ExecuteProcess('/bin/sh', ['-c', 'rm -rf "' + TlsDir + '"']);
-    except
-      // A leftover temp directory is not a battery failure.
+      // Volume guard: a well-formed but never-completing TLS handshake,
+      // far more ciphertext than any handshake needs. The stream is valid
+      // records by construction (TlsHandshakeFlood), so no parse error is
+      // reachable — the connection can die only from the inbound budget.
+      // Two-sided against the deadline: the drop must land WELL under half
+      // the deadline, so the fast budget is distinguished from the slow
+      // deadline (a removed budget would leave the deadline as the only
+      // killer, dropping ~700 ms in, and fail this floor).
+      StressPhase := 'tls section: inbound budget';
+      TlsOk := False;
+      TlsElapsed := -1;
+      try
+        Fd := RawConnect(TlsPort);
+        try
+          Garbage := TlsHandshakeFlood(TlsInboundBudget * 8);
+          fpSend(Fd, @Garbage[0], Length(Garbage), TlsSendFlags);
+          TlsElapsed := RawWaitForClose(Fd, TlsCloseBoundMs + 2000);
+        finally
+          CloseSocket(Fd);
+        end;
+        TlsOk := (TlsElapsed >= 0) and
+          (TlsElapsed < TlsHandshakeDeadlineMs div 2);
+      except
+        on E: Exception do
+        begin
+          TlsOk := False;
+          WriteLn('       inbound-budget probe: ', E.Message);
+        end;
+      end;
+      Check(TlsOk,
+        Format('tls: %d KiB well-formed pre-handshake flood dropped by the ' +
+        '%d KiB budget after %d ms (well under the %d ms deadline)',
+        [Length(Garbage) div 1024, TlsInboundBudget div 1024, TlsElapsed,
+        TlsHandshakeDeadlineMs]));
+
+      // Both guards fire per connection, not per listener.
+      StressPhase := 'tls section: survivor';
+      TlsOk := False;
+      TlsCli := nil;
+      try
+        TlsCli := TWSClient.Create;
+        TlsCli.Connect(TlsUrl);
+        TlsCli.SendText(HelloProbe);
+        TlsOk := TlsCli.ReadMessage(IsText, Data) and IsText and
+          (Length(Data) = Length(HelloProbe)) and
+          CompareMem(@Data[0], @HelloProbe[1], Length(HelloProbe));
+        TlsCli.Close(1000, '');
+      except
+        on E: Exception do
+        begin
+          TlsOk := False;
+          WriteLn('       survivor probe: ', E.Message);
+        end;
+      end;
+      FreeAndNil(TlsCli);
+      Check(TlsOk, 'tls: the listener still serves wss after both guards fired');
+    finally
+      StressPhase := 'tls section: teardown';
+      if TlsSrvT <> nil then
+      begin
+        TlsSrvT.Terminate;
+        if TlsSrvT.Srv <> nil then
+        begin
+          TlsSrvT.Srv.Stop;
+          TlsSrvT.WaitFor;
+          TlsSrvT.Srv.Free;
+        end;
+        TlsSrvT.Free;
+      end;
+      // Drop SSL_CERT_FILE back to whatever it was BEFORE the CA file is
+      // deleted, so a later/refactored client TLS use never resolves a
+      // dangling trust path (lwpt raises on a missing SSL_CERT_FILE).
+      if TlsHadPriorCert then
+        C_setenv('SSL_CERT_FILE', PAnsiChar(TlsPriorCertVal), 1)
+      else
+        C_unsetenv('SSL_CERT_FILE');
+      try
+        ExecuteProcess('/bin/sh', ['-c', 'rm -rf "' + TlsDir + '"']);
+      except
+        // A leftover temp directory is not a battery failure.
+      end;
     end;
   end;
   {$else}
@@ -1741,10 +1976,14 @@ begin
   // the machine's trust store (SecureTransport on macOS, SChannel on
   // Windows), plus loadable OpenSSL 3 libraries for the server half on
   // Windows.
-  WriteLn('skip - tls: the wss section is Linux-only (the macOS/Windows ',
-    'clients ride SecureTransport/SChannel and would need the test CA ',
-    'written into the machine trust store; the Windows server half also ',
-    'needs libssl-3/libcrypto-3 beside the executable)');
+  if TlsRequired then
+    Check(False, 'tls: required (WSINTEROP_REQUIRE_TLS) but the wss ' +
+      'section is compiled out on this platform (Linux-only)')
+  else
+    WriteLn('skip - tls: the wss section is Linux-only (the macOS/Windows ',
+      'clients ride SecureTransport/SChannel and would need the test CA ',
+      'written into the machine trust store; the Windows server half also ',
+      'needs libssl-3/libcrypto-3 beside the executable)');
   {$endif}
 
   // --- concurrent-connections stress -------------------------------------
