@@ -11,10 +11,10 @@ program wsecho;
 // (--port=0 binds an ephemeral port and reports the real one).
 // --pkcs12 serves wss:// with the identity in FILE — native TLS on
 // macOS (Network.framework) only. The epoll (Linux) and IOCP (Windows)
-// transports reject an enabled TLS record: lwpt#70 shipped accept-side
-// TransportSecurity in lwpt 0.3.0, but the remaining blockers are the
-// lwpt#85 flow-control contract plus the duetto-side wiring, tracked
-// in duetto#22. Terminate TLS in a reverse proxy there.
+// transports reject an enabled TLS record: lwpt 0.5.0 ships both
+// upstream contracts (accept-side TransportSecurity since 0.3.0, the
+// lwpt#85 flow-control since 0.5.0); the duetto-side wiring is tracked
+// in duetto#22. Terminate TLS in a reverse proxy there until it lands.
 
 {$I Shared.inc}
 

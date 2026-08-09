@@ -308,9 +308,9 @@ begin
   FPosts := TWSPostQueue.Create;
   if ATls.Enabled then
     raise Exception.Create(
-      'iocp transport has no TLS yet; tracked as duetto#22 (needs ' +
-      'lwpt#85 flow-control in a release). Run behind a ' +
-      'TLS-terminating proxy');
+      'iocp transport has no TLS yet; tracked as duetto#22 (upstream ' +
+      'contracts shipped in lwpt 0.5.0; duetto wiring pending). Run ' +
+      'behind a TLS-terminating proxy');
 
   if WSAStartup($0202, Data) <> 0 then
     raise Exception.Create('WSAStartup failed');

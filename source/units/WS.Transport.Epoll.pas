@@ -156,9 +156,9 @@ begin
   FPosts := TWSPostQueue.Create;
   if ATls.Enabled then
     raise Exception.Create(
-      'epoll transport has no TLS yet; tracked as duetto#22 (needs ' +
-      'lwpt#85 flow-control in a release). Run behind a ' +
-      'TLS-terminating proxy');
+      'epoll transport has no TLS yet; tracked as duetto#22 (upstream ' +
+      'contracts shipped in lwpt 0.5.0; duetto wiring pending). Run ' +
+      'behind a TLS-terminating proxy');
   SetLength(FRecv, 256 * 1024);
 
   FListenFd := fpSocket(AF_INET, SOCK_STREAM, 0);
