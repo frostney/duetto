@@ -1097,9 +1097,10 @@ end;
 // Put the OnSendReady carrier in the port (see EnsureSendReadyCarrier).
 // The Id rides the overlapped slot rather than a pointer to the
 // connection: the packet can outlive the object it names, and the
-// dispatch resolves it by lookup instead of dereference. Ids are
-// monotonic and never reused, so the lookup cannot land on a different
-// connection either.
+// dispatch resolves it by lookup instead of dereference. Ids are unique
+// among live connections (the counter only wraps after 2^32 accepts, by
+// which point any colliding original is long gone), so the lookup cannot
+// land on a different live connection.
 function TWSIocpTransport.PostSendReady(AConn: TWSIocpConn): Boolean;
 begin
   Result := False;

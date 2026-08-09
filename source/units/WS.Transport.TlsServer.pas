@@ -103,6 +103,17 @@ const
   // Once the backlog empties, an allocation above this floor is released
   // and Append re-grows it on demand.
   WSTlsCarryShrinkFloor = 16 * 1024;
+  // Post-handshake carry ceiling, as a multiple of InputHighWater. A
+  // parked write retry (tssWantRead from a KeyUpdate/renegotiation) keeps
+  // intake armed so the peer's records can unblock it; if the peer never
+  // sends them, ciphertext lwpt will not accept accretes in the carry
+  // with no other backstop (an established connection carries no
+  // deadline). One clamped read may legitimately sit in the carry under
+  // ordinary backpressure, so the ceiling is above one window; crossing
+  // it means the parked write is not making progress and the connection
+  // is dropped. Bounds total inbound memory to lwpt's InputHighWater plus
+  // this many more, independent of peer cooperation.
+  WSTlsPostHandshakeCarryFactor = 2;
 
 type
   EWSTlsServer = class(Exception);
@@ -496,12 +507,13 @@ function TWSTlsServerSession.MayResume: Boolean;
 begin
   // A parked write outranks backpressure and the carry alike: suppressing
   // intake here is the one thing that guarantees non-recovery, because
-  // the input is exactly what unblocks the parked write. A read into the
-  // carry is bounded by InputHighWater and the parked write drains lwpt's
-  // read BIO as it retries, so keeping intake armed is safe, not just a
-  // throughput choice — without it the connection ends the round with no
-  // armed interest and no clock, leaking until Shutdown and blind to the
-  // peer hanging up.
+  // the input is exactly what unblocks the parked write. Without it the
+  // connection ends the round with no armed interest and no clock,
+  // leaking until Shutdown and blind to the peer hanging up. Keeping
+  // intake armed is bounded the other way by the post-handshake carry
+  // ceiling in Ingest (WSTlsPostHandshakeCarryFactor): a peer that never
+  // sends the completing records fills the carry and is dropped, so this
+  // cannot grow memory without bound.
   if WriteParked then Exit(True);
   // lwpt's Backpressured flag IS the hysteresis (it clears only once
   // buffered input has fallen back to the low watermark), so it is read
@@ -743,6 +755,20 @@ begin
     N := FeedChunk(P, ALen);
     if N < 0 then Exit(wtiFailed);
     if N < ALen then FCarry.Append(P + N, ALen - N);
+  end;
+
+  // Post-handshake volume guard for the parked-write path (see
+  // WSTlsPostHandshakeCarryFactor): while a write is parked, intake stays
+  // armed to unblock it, so a peer that withholds the completing records
+  // could otherwise grow the carry without bound and with no deadline to
+  // reap it. Under ordinary backpressure the carry never reaches this —
+  // intake stops after one clamped read (MayResume is False with a
+  // non-empty carry).
+  if FHandshakeDone and
+    (FCarry.Len > WSTlsPostHandshakeCarryFactor * FPolicy.InputHighWater) then
+  begin
+    Fail;
+    Exit(wtiFailed);
   end;
 
   // Drain: every round re-offers the carry (decryption frees input
