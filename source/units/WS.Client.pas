@@ -179,9 +179,20 @@ begin
   Addr := StrToNetAddr(AHost);
   if Addr.s_addr = 0 then
   begin
-    if not ResolveHostByName(AHost, HE) then
+    // libc resolves names through nsswitch (files before dns), but FPC's
+    // netdb splits the pair: GetHostByName reads /etc/hosts only and
+    // returns the address in host byte order, while ResolveHostByName
+    // queries the resolv.conf nameservers only and returns network byte
+    // order. Names like localhost normally exist only in /etc/hosts, so a
+    // DNS-only lookup fails on any resolver that does not synthesize them
+    // (plain glibc setups; macOS happens to answer). Match libc: hosts
+    // file first — flipping its host-order result — then DNS.
+    if GetHostByName(AHost, HE) then
+      Addr.s_addr := htonl(HE.Addr.s_addr)
+    else if ResolveHostByName(AHost, HE) then
+      Addr := HE.Addr
+    else
       raise EWSClient.CreateFmt('cannot resolve %s', [AHost]);
-    Addr := HE.Addr;
   end;
 
   Result := fpSocket(AF_INET, SOCK_STREAM, 0);

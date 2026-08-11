@@ -1434,6 +1434,24 @@ begin
   Check(Cli.CloseCode = 1000, 'clean close echoes 1000');
   Cli.Free;
 
+  // --- hostname resolution (files before dns) -------------------------------
+  // The UNIX client resolved names with DNS-only ResolveHostByName, so
+  // ws://localhost failed on any glibc resolver that does not synthesize
+  // the name (plain nameservers in containers and VMs; macOS answers, GH
+  // runners answer via systemd-resolved). One echo round through the
+  // hostname pins the /etc/hosts path on every platform; Windows resolves
+  // through getaddrinfo and was never affected.
+  StressPhase := 'localhost resolution section';
+  Cli := TWSClient.Create;
+  Cli.Connect(Format('ws://localhost:%d/', [Port]));
+  S := 'via-hosts-file';
+  Cli.SendText(S);
+  Check(Cli.ReadMessage(IsText, Data) and IsText and
+    (Length(Data) = Length(S)) and CompareMem(@Data[0], @S[1], Length(S)),
+    'ws://localhost echo (hosts-file resolution)');
+  Cli.Close(1000, 'done');
+  Cli.Free;
+
   // --- bounded ReadMessage (ws:// only) -----------------------------------
   StressPhase := 'bounded-read section';
   Cli := TWSClient.Create;
