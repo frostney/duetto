@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-- FPC **3.2.2** (Delphi mode) is the pinned compiler; the [lwpt](https://github.com/frostney/lwpt) **0.5.0 release binary** is the single toolchain entry point for install / build / test / format.
+- FPC **3.2.2** (Delphi mode) is the pinned compiler; the [lwpt](https://github.com/frostney/lwpt) **0.5.1 release binary** is the single toolchain entry point for install / build / test / format.
 - The Autobahn testsuite runs via Docker (`crossbario/autobahn-testsuite`) through `tools/autobahn.sh`, judged by `tools/autobahn-check.py`.
 - Lefthook runs `lwpt format` pre-commit; markdownlint and the PR workflow are the blocking gates.
 - CI: `pr.yml` is the fast Ubuntu pre-merge gate, `ci.yml` (push to main) adds the platform matrix and the Autobahn suite.
@@ -13,7 +13,7 @@
 | Tool | Version / source | Role |
 | --- | --- | --- |
 | FPC | 3.2.2 (apt / brew) | compiler, Delphi mode via `source/units/Shared.inc` |
-| lwpt | 0.5.0 release binary (checksum-verified tarball, pinned as `LWPT_VERSION` in CI) | build, test discovery, formatter, dependency install |
+| lwpt | 0.5.1 release binary (checksum-verified tarball, pinned as `LWPT_VERSION` in CI) | build, test discovery, formatter, dependency install |
 | Lefthook | ≥ 1.5 | pre-commit formatter hook (`lefthook install`) |
 | Docker | any recent | Autobahn testsuite container |
 | git-cliff | latest | changelog generation from Conventional Commits |
@@ -58,11 +58,11 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
 - **`.github/workflows/pr.yml`** — every PR: the full battery
   (`install --frozen` → `build` → `test` → `wsinterop`) on Linux, macOS,
   and win64 runners plus format-check and a blocking markdownlint job.
-  The authoritative pre-merge gate; i386-win32 stays post-merge. The
-  Windows legs install online (`lwpt install`, not `--frozen`) until an
-  lwpt release computes the frozen verifier's constraint fingerprint
-  platform-independently — lwpt 0.5.0 hashes it with the platform line
-  ending, so an LF-written lockfile can never verify on CRLF Windows.
+  The authoritative pre-merge gate; i386-win32 stays post-merge. Every
+  leg — Windows included — verifies against the committed lockfile with
+  `install --frozen` (lwpt 0.5.1 made the frozen digests
+  platform-independent: the constraint fingerprint, the tree-hash
+  content, and its fold order, lwpt#168).
 - **`.github/workflows/ci.yml`** — push to main: native test matrix
   (x86_64/aarch64 Linux and macOS, x86_64/i386 Windows) plus the full
   Autobahn suite with report artifacts. Every leg builds the full program set and runs the
@@ -74,19 +74,13 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
   giving the Network.framework transport the same Autobahn net as
   epoll; the client direction stays on the Linux job. The x86_64 macOS
   leg skips the loopback batteries entirely: GitHub's Intel VMs deliver
-  Network.framework loopback traffic on a ~60 s timer (duetto#11). Both
-  Windows legs (win64, win32) install online (`lwpt install`, not
-  `--frozen`) for the same lwpt 0.5.0 line-ending fingerprint regression
-  as the PR gate, followed by a `git diff --exit-code lwpt.lock` guard so
-  a clean install that forks the resolution still fails loudly.
+  Network.framework loopback traffic on a ~60 s timer (duetto#11).
 
 Both workflows install the lwpt release binary from a checksum-verified
 tarball (no sibling checkout, no bootstrap). On every non-Windows leg
 they verify dependencies against the committed lockfile via `lwpt install
---frozen`; the Windows legs install online for the line-ending
-fingerprint regression noted above, guarding the committed lockfile with
-`git diff --exit-code` instead. duetto has no committed toolchain
-binaries.
+--frozen`, every leg and every platform. duetto has no committed
+toolchain binaries.
 
 ### Dependency layout note
 

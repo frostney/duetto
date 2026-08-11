@@ -28,12 +28,12 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.5.0"
+  LWPT_VERSION: "0.5.1"
 
 jobs:
   build-and-test:
-    # Pin the display name to the runner, so the win64 leg's frozen-install
-    # skip key does not append a shifting ", skip" tail to the job label.
+    # Pin the display name to the runner so the matrix's per-leg keys do
+    # not append a shifting tail to the job label.
     name: build-and-test (${{ matrix.runner }})
     strategy:
       fail-fast: false
@@ -55,13 +55,6 @@ jobs:
             fpc-install: choco
             fpc-win-target: x86_64-win64
             exe: .exe
-            # lwpt 0.5.0 regression (lwpt#78's class, new symptom): the
-            # frozen verifier's constraint fingerprint hashes
-            # TStringList.Text, which joins with the PLATFORM line
-            # ending — a lockfile written on LF platforms can never
-            # verify on CRLF Windows. Install online until an lwpt
-            # release computes it platform-independently.
-            frozen-install: skip
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -165,35 +158,7 @@ jobs:
           echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
 
       - name: lwpt install --frozen (verify lockfile + committed modules)
-        if: matrix.frozen-install != 'skip'
         run: lwpt install --frozen
-
-      # Windows: the 0.5.0 frozen verifier's constraint fingerprint is
-      # line-ending-dependent (see the matrix comment); mirror lwpt's
-      # own Windows CI and install online until that is fixed upstream.
-      # The lockfile is still committed, so a clean online install against
-      # the same release tag must not move it — assert that, or a future
-      # 0.5.x silently forking the dep tree across legs would go unnoticed.
-      - name: lwpt install (Windows, then assert resolution unmoved)
-        if: matrix.frozen-install == 'skip'
-        run: |
-          lwpt install
-          # Two lockfile fields are line-ending-derived, so a clean install
-          # legitimately rewrites them on a CRLF Windows checkout: the
-          # constraintFingerprint (lwpt#168) and computedHash (the module
-          # tree hash — #78's residual). Neither is dependency drift, which
-          # is a changed resolved ref/commit/URL/version; fail only on
-          # those, ignoring the two derived hashes.
-          drift="$(git diff lwpt.lock | grep -E '^[+-]' \
-            | grep -vE '^(\+\+\+|---) ' \
-            | grep -vE '(constraintFingerprint|computedHash) =' \
-            || true)"
-          if [ -n "$drift" ]; then
-            echo "::error::lwpt.lock resolution drifted on Windows:"
-            echo "$drift"
-            exit 1
-          fi
-          git checkout -- lwpt.lock
 
       - name: lwpt format --check (formatting drift?)
         if: matrix.fpc-install == 'apt'   # platform-independent; one runner
