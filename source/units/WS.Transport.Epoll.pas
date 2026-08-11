@@ -697,7 +697,14 @@ begin
     Conn.FTransport := Self;
     Conn.FFd := Fd;
     Conn.FInterest := EPOLLIN;
+    // NativeUInt is 32-bit on a 32-bit target (CI builds i386-win32, and
+    // any i386-linux build too), so the 2^32-th accept would trap under
+    // {$Q+} and unwind the Run thread — killing the listener. Ids only
+    // need to be unique among LIVE connections, so a wrap is harmless;
+    // disable the overflow check for this one increment (mirrors IOCP).
+    {$push}{$Q-}
     Inc(FNextId);
+    {$pop}
     Conn.Id := FNextId;
     if FTlsContext <> nil then
     begin

@@ -6,7 +6,7 @@
 - The heart is `WS.Protocol`, a **sans-I/O state machine** — one instance per connection, either role — that never touches a file descriptor.
 - Every RFC rule lives in that one testable place; the blocking client, the epoll server, and the in-process benchmark all sit behind the same machine unchanged.
 - Layers are strictly bottom-up: frame codec → UTF-8 → handshake → deflate → protocol machine → client / server.
-- The server is a platform-neutral session layer over a completion-shaped **transport** seam (ADR-0001/0003): epoll on Linux and IOCP on Windows (native `wss://` over lwpt's memory-BIO accept API, shared through `WS.Transport.TlsServer`), Network.framework on macOS (native `wss://` inside the platform stack). The client runs on POSIX and Windows (direct WinSock2) with TLS delegated to lwpt's `TransportSecurity`.
+- The server is a platform-neutral session layer over a completion-shaped **transport** seam (ADR-0001/0003): epoll on Linux and IOCP on Windows x64 (native `wss://` over lwpt's memory-BIO accept API, shared through `WS.Transport.TlsServer`), Network.framework on macOS (native `wss://` inside the platform stack). The client runs on POSIX and Windows (direct WinSock2) with TLS delegated to lwpt's `TransportSecurity`.
 
 ## The sans-I/O core
 
@@ -35,7 +35,7 @@ once on protocol failure, after queueing the appropriate close frame
 | `WS.Transport.TlsServer` | platform-neutral per-connection server TLS over lwpt's memory-BIO accept API: handshake pump, accepted-prefix re-offer, input/output flow accounting, `close_notify` drain; used by the fd-owning transports only |
 | `WS.Transport.Epoll` | Linux transport: nonblocking sockets, one shared 256 KB read buffer, `EPOLLOUT` armed only while a connection has backlog; native `wss://` through `WS.Transport.TlsServer`, with the handshake deadline, the inbound pre-handshake budget and the `EPOLLIN` pause/resume owned by the reactor |
 | `WS.Transport.NetworkFramework` | macOS transport (ADR-0002): `nw_listener`/`nw_connection` C API, one serial dispatch queue per connection, native TLS via a PKCS#12 `SecIdentity` |
-| `WS.Transport.Iocp` | Windows transport: one completion-port thread, `AcceptEx`/`WSARecv`/`WSASend` always armed overlapped, copy-on-send, outstanding-operation pinning for deferred frees; native `wss://` through `WS.Transport.TlsServer`, with the handshake deadline, the inbound pre-handshake budget and the `WSARecv` suppress/resume owned by the completion loop |
+| `WS.Transport.Iocp` | Windows transport: one completion-port thread, `AcceptEx`/`WSARecv`/`WSASend` always armed overlapped, copy-on-send, outstanding-operation pinning for deferred frees; native `wss://` (Windows x64; win32 has no 32-bit OpenSSL 3) through `WS.Transport.TlsServer`, with the handshake deadline, the inbound pre-handshake budget and the `WSARecv` suppress/resume owned by the completion loop |
 | `WS.Server` | platform-neutral session layer: handshake accumulation, protocol wiring, flush/backpressure policy over the transport seam; `SendText`/`SendBinary` return False when the transport dropped (and freed) the connection mid-flush, and `Conn.Post` is the any-thread hand-off for server-driven pushes (ADR-0003 amendment) |
 
 Units higher in the table never depend on units lower down. The programs in
