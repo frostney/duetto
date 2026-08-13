@@ -33,6 +33,14 @@ tools/benchmatrix.sh # cross-implementation benchmark matrix
 tools/crosscheck.py  # validate against Python websockets, both directions
 ```
 
+Run `wsinterop` on native hardware when its verdict matters:
+Rosetta-translated x86_64 Linux VMs (OrbStack/UTM amd64 machines on
+Apple Silicon) intermittently fail `recv`/`send` with `EFAULT` on valid
+buffers — a translation-layer artifact, diagnosed against a native
+arm64 VM on the same kernel — and the stress section reports it as a
+mid-echo drop. The comment above the stress constants in
+`source/apps/wsinterop.pas` carries the full evidence.
+
 ## Autobahn testsuite
 
 Industry conformance fuzzing, run in both directions via

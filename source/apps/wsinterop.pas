@@ -752,6 +752,17 @@ end;
 // message index) rather than a random source — reproducible given the
 // same cycle, though which payloads a run actually sends depends on how
 // many cycles the budget allowed.
+//
+// Known-benign flake under Rosetta-translated x86_64 Linux (OrbStack /
+// UTM amd64 machines on Apple Silicon): recv/send intermittently fail
+// with EFAULT on provably valid single-owner buffers, surfacing here as
+// "connection closed mid-echo (code 1005)" or "EWSClient: not
+// connected" at a few-percent-per-run rate. Diagnosed 2026-08-11: the
+// same binary logged EFAULT only under Rosetta; zero occurrences on
+// native macOS and on native arm64 Linux sharing the *same kernel* as
+// the Rosetta VM, and Rosetta has documented non-atomic mmap behaviour
+// that corrupts process memory maps (colima#1452). Not a duetto bug —
+// run the battery natively when it matters.
 
 const
   StressEchoWorkerCount = 28;
