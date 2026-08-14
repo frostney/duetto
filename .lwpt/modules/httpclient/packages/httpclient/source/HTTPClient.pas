@@ -1,7 +1,7 @@
 unit HTTPClient;
 
 // Minimal HTTP/1.1 client built on raw BSD sockets.
-// Supports GET and HEAD over HTTP and HTTPS.
+// Supports GET, HEAD, and POST over HTTP and HTTPS.
 // Cross-platform: Unix (macOS, Linux) and Windows.
 // Synchronous API with deadline-aware nonblocking socket I/O.
 
@@ -38,11 +38,27 @@ type
 
   EHTTPError = class(Exception);
 
+  {$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
+  { Test-only select seam. Production code must leave this nil. The hook can
+    simulate the two syscall outcomes that otherwise depend on signal and
+    network timing while leaving ordinary readiness to the real select call. }
+  THTTPClientSelectTestAction = (selectUseSystem, selectInterrupted,
+    selectFailed);
+  THTTPClientSelectTestHook = function(const ASocket: PtrInt;
+    const ARead, AWrite: Boolean;
+    const AAttempt: Integer): THTTPClientSelectTestAction;
+  {$ENDIF}
+
 const
   DEFAULT_MAX_RESPONSE_BODY_BYTES = Int64(64) * 1024 * 1024;
   DEFAULT_MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
   DEFAULT_REQUEST_TIMEOUT_MILLISECONDS = 120 * 1000;
   DEFAULT_MAXIMUM_REDIRECTS = 20;
+
+{$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
+var
+  HTTPClientSelectTestHook: THTTPClientSelectTestHook;
+{$ENDIF}
 
 function DefaultHTTPRequestOptions: THTTPRequestOptions;
 function HTTPGet(const AURL: string;
@@ -52,6 +68,12 @@ function HTTPGet(const AURL: string; const AHeaders: THTTPHeaders;
 function HTTPHead(const AURL: string;
   const AHeaders: THTTPHeaders): THTTPResponse; overload;
 function HTTPHead(const AURL: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse; overload;
+function HTTPPost(const AURL: string; const ABody: TBytes;
+  const AContentType: string;
+  const AHeaders: THTTPHeaders): THTTPResponse; overload;
+function HTTPPost(const AURL: string; const ABody: TBytes;
+  const AContentType: string; const AHeaders: THTTPHeaders;
   const AOptions: THTTPRequestOptions): THTTPResponse; overload;
 
 implementation
@@ -295,6 +317,8 @@ procedure WaitForSocket(const ASock: TSocket; const ARead, AWrite: Boolean;
 var
   ReadSet, WriteSet: TFDSet;
   ReadSetPointer, WriteSetPointer: PFDSet;
+  Attempt: Integer;
+  Interrupted: Boolean;
   Ready: Integer;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
@@ -307,22 +331,61 @@ var
 {$ENDIF}
 begin
   {$IFDEF UNIX}
-  fpFD_ZERO(ReadSet);
-  fpFD_ZERO(WriteSet);
-  ReadSetPointer := nil;
-  WriteSetPointer := nil;
-  if ARead then
-  begin
-    fpFD_SET(ASock, ReadSet);
-    ReadSetPointer := @ReadSet;
-  end;
-  if AWrite then
-  begin
-    fpFD_SET(ASock, WriteSet);
-    WriteSetPointer := @WriteSet;
-  end;
-  Ready := fpSelect(ASock + 1, ReadSetPointer, WriteSetPointer, nil,
-    RemainingRequestMilliseconds(ADeadline, ATimeoutMilliseconds));
+  { A signal delivered while select() blocks fails it with EINTR — a healthy
+    socket, not a fault. Recompute the remaining time to the deadline (which
+    raises once it lapses) and wait again; only a different error is fatal.
+    The fd sets are rebuilt each pass because select() leaves their contents
+    unspecified after an EINTR return. }
+  Attempt := 0;
+  repeat
+    Inc(Attempt);
+    fpFD_ZERO(ReadSet);
+    fpFD_ZERO(WriteSet);
+    ReadSetPointer := nil;
+    WriteSetPointer := nil;
+    if ARead then
+    begin
+      fpFD_SET(ASock, ReadSet);
+      ReadSetPointer := @ReadSet;
+    end;
+    if AWrite then
+    begin
+      fpFD_SET(ASock, WriteSet);
+      WriteSetPointer := @WriteSet;
+    end;
+    {$IFDEF HTTPCLIENT_TESTING}
+    if Assigned(HTTPClientSelectTestHook) then
+      case HTTPClientSelectTestHook(PtrInt(ASock), ARead, AWrite, Attempt) of
+        selectUseSystem:
+          begin
+            Ready := fpSelect(ASock + 1, ReadSetPointer, WriteSetPointer, nil,
+              RemainingRequestMilliseconds(ADeadline,
+                ATimeoutMilliseconds));
+            Interrupted := (Ready < 0) and (fpgeterrno = ESysEINTR);
+          end;
+        selectInterrupted:
+          begin
+            Ready := -1;
+            Interrupted := True;
+          end;
+        selectFailed:
+          begin
+            Ready := -1;
+            Interrupted := False;
+          end;
+      end
+    else
+    {$ENDIF}
+    begin
+      Ready := fpSelect(ASock + 1, ReadSetPointer, WriteSetPointer, nil,
+        RemainingRequestMilliseconds(ADeadline, ATimeoutMilliseconds));
+      Interrupted := (Ready < 0) and (fpgeterrno = ESysEINTR);
+    end;
+    if Ready >= 0 then
+      Break;
+    if not Interrupted then
+      raise EHTTPError.Create('HTTP socket readiness wait failed');
+  until False;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   FillChar(ReadSet, SizeOf(ReadSet), 0);
@@ -416,15 +479,22 @@ begin
   end;
   if ConnectResult <> 0 then
   begin
-    WaitForSocket(Result, False, True, ADeadline, ATimeoutMilliseconds);
-    SocketError := 0;
-    SocketErrorLength := SizeOf(SocketError);
-    if (fpGetSockOpt(Result, SOL_SOCKET, SO_ERROR, @SocketError,
-       @SocketErrorLength) <> 0) or (SocketError <> 0) then
-    begin
+    { WaitForSocket can raise (deadline lapsed or select failure); the just
+      created socket must be closed on any exit through this block or its fd
+      leaks. Mirrors the Windows connect path's try/except. The getsockopt
+      failure path raises inside the try so the single except closes the fd
+      exactly once. }
+    try
+      WaitForSocket(Result, False, True, ADeadline, ATimeoutMilliseconds);
+      SocketError := 0;
+      SocketErrorLength := SizeOf(SocketError);
+      if (fpGetSockOpt(Result, SOL_SOCKET, SO_ERROR, @SocketError,
+         @SocketErrorLength) <> 0) or (SocketError <> 0) then
+        raise EHTTPError.CreateFmt('Failed to connect to %s:%d',
+          [AHost, APort]);
+    except
       CloseSocket(Result);
-      raise EHTTPError.CreateFmt('Failed to connect to %s:%d',
-        [AHost, APort]);
+      raise;
     end;
   end;
 end;
@@ -556,23 +626,23 @@ end;
 // Send / Receive wrappers (unified TLS + plain)
 // ---------------------------------------------------------------------------
 
-procedure SendAll(const ASock: TSocket;
+procedure SendAllBuffer(const ASock: TSocket;
   var ATransport: TTransportSecurityConnection;
-  const AData: AnsiString; const ADeadline,
-  ATimeoutMilliseconds: QWord);
+  const AData: Pointer; const ALength: Integer;
+  const ADeadline, ATimeoutMilliseconds: QWord);
 var
   Sent, Total, Len, N: Integer;
 begin
-  Total := Length(AData);
+  Total := ALength;
   Sent := 0;
   while Sent < Total do
   begin
     CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
     Len := Total - Sent;
     if ATransport.Active then
-      N := TransportSecurityWrite(ATransport, @AData[Sent + 1], Len)
+      N := TransportSecurityWrite(ATransport, PByte(AData) + Sent, Len)
     else
-      N := SocketSend(ASock, @AData[Sent + 1], Len);
+      N := SocketSend(ASock, PByte(AData) + Sent, Len);
     if (N < 0) and SocketWouldBlock then
     begin
       WaitForSocket(ASock, False, True, ADeadline,
@@ -584,6 +654,26 @@ begin
     Inc(Sent, N);
     CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
   end;
+end;
+
+procedure SendAll(const ASock: TSocket;
+  var ATransport: TTransportSecurityConnection;
+  const AData: AnsiString; const ADeadline,
+  ATimeoutMilliseconds: QWord);
+begin
+  if Length(AData) > 0 then
+    SendAllBuffer(ASock, ATransport, @AData[1], Length(AData), ADeadline,
+      ATimeoutMilliseconds);
+end;
+
+procedure SendAllBytes(const ASock: TSocket;
+  var ATransport: TTransportSecurityConnection;
+  const AData: TBytes; const ADeadline,
+  ATimeoutMilliseconds: QWord);
+begin
+  if Length(AData) > 0 then
+    SendAllBuffer(ASock, ATransport, @AData[0], Length(AData), ADeadline,
+      ATimeoutMilliseconds);
 end;
 
 function RecvBytes(const ASock: TSocket;
@@ -911,6 +1001,13 @@ begin
         raise EHTTPError.CreateFmt(
           'HTTP response body exceeds configured limit of %d bytes',
           [AOptions.MaxResponseBodyBytes]);
+      { ChunkBuf must hold both the payload and its trailing CRLF. Reject a
+        frame that cannot fit in the Integer-indexed accumulator before any
+        addition can overflow, even when the caller permits that body size. }
+      if ChunkSizeValue > High(Integer) - 2 then
+        raise EHTTPError.CreateFmt(
+          'HTTP chunk size exceeds supported frame limit of %d bytes',
+          [High(Integer) - 2]);
       ChunkSize := Integer(ChunkSizeValue);
       if ChunkSize = 0 then Break;
 
@@ -1004,7 +1101,16 @@ begin
     raise EHTTPError.Create('HTTP maximum redirects must not be negative');
 end;
 
+procedure ValidateRequestContentType(const AContentType: string);
+begin
+  if (Pos(#13, AContentType) > 0) or (Pos(#10, AContentType) > 0) then
+    raise EHTTPError.Create(
+      'HTTP content type must not contain carriage return or line feed');
+end;
+
 function DoRequest(const AMethod, AURL: string;
+  const ABody: TBytes; const AContentType: string;
+  const AManagesContentHeaders: Boolean;
   const AHeaders: THTTPHeaders;
   const AOptions: THTTPRequestOptions;
   const AMaxRedirects: Integer): THTTPResponse;
@@ -1016,12 +1122,14 @@ var
   Raw: TRawHTTPResponse;
   I, Redirects: Integer;
   CurrentURL, Location, HostHeader: string;
-  HasUserAgent: Boolean;
-  IsHead: Boolean;
-  Method: string;
+  HasRequestContent, HasUserAgent, IsHead: Boolean;
+  HeaderName, Method, ContentType: string;
+  Body: TBytes;
   Deadline, StartedAt: QWord;
 begin
   ValidateRequestOptions(AOptions);
+  if AManagesContentHeaders then
+    ValidateRequestContentType(AContentType);
   StartedAt := GetTickCount64;
   if AOptions.RequestTimeoutMilliseconds > High(QWord) - StartedAt then
     Deadline := High(QWord)
@@ -1032,6 +1140,9 @@ begin
   Result.Redirected := False;
   Method := UpperCase(AMethod);
   IsHead := (Method = 'HEAD');
+  Body := ABody;
+  ContentType := AContentType;
+  HasRequestContent := AManagesContentHeaders;
 
   while True do
   begin
@@ -1066,10 +1177,22 @@ begin
         if not HasUserAgent then
           Request := Request + AnsiString('User-Agent: GocciaScript/1.0' + CRLF);
 
-        // Add custom headers (skip Host since we already set it)
+        if HasRequestContent then
+        begin
+          Request := Request + AnsiString('Content-Length: ' +
+            IntToStr(Length(Body)) + CRLF);
+          Request := Request + AnsiString('Content-Type: ' + ContentType + CRLF);
+        end;
+
+        // Add custom headers. Request content owns its framing and media type.
         for I := 0 to High(AHeaders) do
         begin
-          if LowerCase(AHeaders[I].Name) = 'host' then Continue;
+          HeaderName := LowerCase(AHeaders[I].Name);
+          if HeaderName = 'host' then Continue;
+          if AManagesContentHeaders and
+             ((HeaderName = 'content-length') or
+              (HeaderName = 'content-type') or
+              (HeaderName = 'transfer-encoding')) then Continue;
           Request := Request + AnsiString(AHeaders[I].Name + ': ' + AHeaders[I].Value + CRLF);
         end;
 
@@ -1077,6 +1200,9 @@ begin
 
         SendAll(Sock, Transport, Request, Deadline,
           AOptions.RequestTimeoutMilliseconds);
+        if HasRequestContent then
+          SendAllBytes(Sock, Transport, Body, Deadline,
+            AOptions.RequestTimeoutMilliseconds);
         Raw := ReadResponse(Sock, Transport, IsHead, AOptions, Deadline);
         CheckRequestDeadline(Deadline,
           AOptions.RequestTimeoutMilliseconds);
@@ -1105,11 +1231,17 @@ begin
         else
           CurrentURL := Location;
 
-        // 303: change method to GET per RFC 7231
-        if Raw.StatusCode = 303 then
+        // RFC 9205 recommends browser-compatible POST rewriting for 301/302.
+        // 303 always retrieves with GET; 307/308 preserve method and content.
+        if (Raw.StatusCode = 303) or
+           (((Raw.StatusCode = 301) or (Raw.StatusCode = 302)) and
+            (Method = 'POST')) then
         begin
           Method := 'GET';
           IsHead := False;
+          SetLength(Body, 0);
+          ContentType := '';
+          HasRequestContent := False;
         end;
 
         Continue;
@@ -1149,7 +1281,7 @@ function HTTPGet(const AURL: string; const AHeaders: THTTPHeaders;
   const AOptions: THTTPRequestOptions): THTTPResponse;
 begin
   try
-    Result := DoRequest('GET', AURL, AHeaders, AOptions,
+    Result := DoRequest('GET', AURL, nil, '', False, AHeaders, AOptions,
       AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
@@ -1167,8 +1299,29 @@ function HTTPHead(const AURL: string; const AHeaders: THTTPHeaders;
   const AOptions: THTTPRequestOptions): THTTPResponse;
 begin
   try
-    Result := DoRequest('HEAD', AURL, AHeaders, AOptions,
+    Result := DoRequest('HEAD', AURL, nil, '', False, AHeaders, AOptions,
       AOptions.MaximumRedirects);
+  except
+    on E: ETransportSecurityError do
+      raise EHTTPError.Create(E.Message);
+  end;
+end;
+
+function HTTPPost(const AURL: string; const ABody: TBytes;
+  const AContentType: string;
+  const AHeaders: THTTPHeaders): THTTPResponse;
+begin
+  Result := HTTPPost(AURL, ABody, AContentType, AHeaders,
+    DefaultHTTPRequestOptions);
+end;
+
+function HTTPPost(const AURL: string; const ABody: TBytes;
+  const AContentType: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse;
+begin
+  try
+    Result := DoRequest('POST', AURL, ABody, AContentType, True,
+      AHeaders, AOptions, AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
       raise EHTTPError.Create(E.Message);

@@ -12,10 +12,9 @@ program wsecho;
 // --pkcs12 serves wss:// with the identity in FILE, natively on every
 // platform (duetto#22): macOS terminates TLS inside Network.framework,
 // while the epoll (Linux) and IOCP (Windows) transports terminate it
-// themselves over lwpt's memory-BIO accept API. The two OpenSSL-backed
-// transports need libssl/libcrypto 3 at runtime — on Windows that means
-// libssl-3-x64.dll and libcrypto-3-x64.dll reachable from the
-// executable's directory or System32.
+// themselves over lwpt's memory-BIO accept API — OpenSSL on Linux
+// (libssl/libcrypto 3 loadable at runtime), SChannel on Windows (x64
+// and win32, nothing to ship beside the executable).
 //
 // There are deliberately no knobs for the TLS flow-control policy: the
 // program serves with every TWSTransportTls tuning field left at 0, so

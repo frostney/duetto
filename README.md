@@ -5,10 +5,10 @@ once over one full-duplex connection. RFC 6455 (v13) + RFC 7692
 permessage-deflate in FreePascal, built and tested with
 [lwpt](https://github.com/frostney/lwpt). A sans-I/O protocol core behind a
 blocking client and a server with per-platform transports — epoll on
-Linux, Network.framework on macOS, IOCP on Windows x64, every one of them
-terminating `wss://` natively (win32 has no 32-bit OpenSSL 3, so it runs
-`ws://` behind a proxy) — validated by unit suites, a live-socket
-battery, and the Autobahn testsuite. See
+Linux, Network.framework on macOS, IOCP on Windows — every one of them
+terminating `wss://` natively (Windows through lwpt's SChannel accept,
+x64 and win32 alike, no OpenSSL DLLs) — validated by unit suites, a
+live-socket battery, and the Autobahn testsuite. See
 [docs/architecture.md](docs/architecture.md).
 
 ## Install
@@ -38,7 +38,7 @@ Echo server (Linux, macOS, Windows) and probe, from the shipped programs:
 lwpt build
 ./build/wsecho --port=9001                       # echo server
 ./build/wsprobe ws://localhost:9001/ --deflate   # client probe vs any server
-./build/wsecho --pkcs12=id.p12 --pkcs12-pass=x   # wss:// (native; Windows x64, not win32)
+./build/wsecho --pkcs12=id.p12 --pkcs12-pass=x   # wss:// (native on every platform)
 ```
 
 For the full program set (`wsinterop`, `wsbench`, `wsautobahn`) and every

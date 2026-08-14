@@ -12,11 +12,12 @@
   the browser knows where duetto is listening.
 - Pair `ws://` with `http://` and `wss://` with `https://` — browsers
   block the mixed combination. Server-side TLS terminates **natively on
-  all three platforms** (macOS via Network.framework, Linux and Windows
-  via lwpt's OpenSSL memory-BIO accept), with the caveat that the two
-  OpenSSL-backed transports need libssl/libcrypto 3 loadable at runtime;
-  a TLS-terminating reverse proxy in front of a plain listener stays a
-  valid alternative where those libraries are absent.
+  all three platforms** (macOS via Network.framework, Linux via lwpt's
+  OpenSSL memory-BIO accept, Windows — x64 and win32 — via lwpt's
+  SChannel accept), with the caveat that the Linux transport needs
+  libssl/libcrypto 3 loadable at runtime; a TLS-terminating reverse
+  proxy in front of a plain listener stays a valid alternative where
+  those libraries are absent.
 - Secure-context gotcha: powerful APIs (WebCodecs and friends) silently
   disappear on plain `http://` over a LAN IP; `localhost` is a secure
   context, LAN IPs are not.
@@ -140,12 +141,11 @@ platform you are on, the companion server must serve `https://` too.
   (ADR-0002); only the identity fields of the record are read.
 - **Linux and Windows.** The epoll and IOCP transports terminate TLS
   over lwpt's memory-BIO accept API
-  ([duetto#22](https://github.com/frostney/duetto/issues/22)), so
-  OpenSSL 3 has to be loadable at runtime: `libssl.so.3` /
-  `libcrypto.so.3` from the usual library paths on Linux, and
-  `libssl-3-x64.dll` / `libcrypto-3-x64.dll` from the executable's own
-  directory or `System32` on Windows (`%PATH%` is deliberately not
-  searched). Without them the server context fails to build, and a
+  ([duetto#22](https://github.com/frostney/duetto/issues/22)) — OpenSSL
+  on Linux, native SChannel on Windows (x64 and win32, no DLLs to ship).
+  On Linux OpenSSL 3 has to be loadable at runtime (`libssl.so.3` /
+  `libcrypto.so.3` from the usual library paths); without it the server
+  context fails to build, and a
   TLS-terminating reverse proxy (nginx, Caddy, HAProxy) in front of a
   plain `http://` + `ws://` pair on loopback remains a valid shape.
 

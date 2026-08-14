@@ -1627,23 +1627,21 @@ begin
   // SChannel on Windows; neither reads SSL_CERT_FILE, so a throwaway CA
   // can only be trusted by writing it into the machine's own trust store
   // (keychain surgery / `certutil -addstore Root`), which a test binary
-  // has no business doing to the machine it runs on. Windows carries a
-  // second blocker on top: the OpenSSL-backed server accept needs
-  // libssl-3/libcrypto-3 loadable from the executable's directory or
-  // System32 (LOAD_LIBRARY_SEARCH_DEFAULT_DIRS — %PATH% is not searched),
-  // which no CI runner supplies, and the 32-bit build has no 32-bit
-  // OpenSSL 3 to find at all.
+  // has no business doing to the machine it runs on. Since lwpt 0.6.0
+  // the server half is no blocker anywhere: Windows accept rides
+  // SChannel natively, x64 and win32 alike, with no OpenSSL DLLs.
   //
-  // Say the consequence plainly: WINDOWS HAS NO RUNTIME TLS COVERAGE.
-  // The win64 CI leg proves the IOCP TLS code COMPILES, and the
-  // WS.Transport.TlsServer suite covers what is platform-neutral —
-  // policy resolution and the carry buffer — but not one byte of
-  // Windows server TLS is exercised against a real socket anywhere.
-  // Closing that gap is achievable follow-up work: a win64-only leg
-  // with vendored OpenSSL 3 DLLs next to the executable and the
-  // throwaway CA pushed into the runner's store with
-  // `certutil -addstore Root` is safe on a disposable runner, which is
-  // exactly what a developer machine is not.
+  // Say the consequence plainly: WINDOWS HAS NO RUNTIME TLS COVERAGE
+  // IN THIS BATTERY. The win64 CI leg proves the IOCP TLS code
+  // COMPILES, the WS.Transport.TlsServer suite covers what is
+  // platform-neutral — policy resolution and the carry buffer — and
+  // lwpt's own Windows suite drives the SChannel accept over an
+  // in-memory loopback, but duetto exercises no Windows server TLS
+  // against a real socket. Closing that gap is achievable follow-up
+  // work: only the client-trust half remains, and pushing the
+  // throwaway CA into the runner's store with `certutil -addstore
+  // Root` is safe on a disposable runner, which is exactly what a
+  // developer machine is not.
   //
   // A third server carries the section — the flow-control watermarks are
   // deliberately squeezed to lwpt's floor here, which is not what a
@@ -2011,8 +2009,8 @@ begin
   else
     WriteLn('skip - tls: the wss section is Linux-only (the macOS/Windows ',
       'clients ride SecureTransport/SChannel and would need the test CA ',
-      'written into the machine trust store; the Windows server half also ',
-      'needs libssl-3/libcrypto-3 beside the executable)');
+      'written into the machine trust store; the server half is native ',
+      'on every platform since lwpt 0.6.0)');
   {$endif}
 
   // --- concurrent-connections stress -------------------------------------
