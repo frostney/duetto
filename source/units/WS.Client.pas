@@ -7,7 +7,7 @@ unit WS.Client;
 // All protocol behaviour lives in TWSProtocol; this unit is the socket,
 // the TLS shim, the opening handshake, and a pump loop. ReadMessage blocks
 // until a complete message arrives (pings are answered invisibly along the
-// way) or the connection ends.
+// way) or the connection ends; a bounded overload caps the wait instead.
 
 {$I Shared.inc}
 
@@ -37,6 +37,8 @@ const
   {$endif}
 
 type
+  // Outcome of the bounded ReadMessage overload.
+  TWSReadResult = (wrrMessage, wrrTimeout, wrrClosed);
 
   TWSClient = class
   private
@@ -58,6 +60,8 @@ type
     function RawWrite(P: PByte; ALen: Integer): Integer;
     procedure FlushOut;
     function PumpOnce: Boolean;
+    function WaitReadable(ATimeoutMs: Integer): Boolean;
+    procedure PopMessage(out AText: Boolean; out AData: TBytes); inline;
   public
     constructor Create;
     destructor Destroy; override;
@@ -73,6 +77,38 @@ type
     // Blocks until a message arrives. False = connection closed (see
     // CloseCode/CloseReason) or failed.
     function ReadMessage(out AText: Boolean; out AData: TBytes): Boolean;
+      overload;
+
+    // Bounded variant. Waits at most ATimeoutMs milliseconds for a
+    // complete message. A message already queued returns immediately,
+    // without a clock read or a poll. ATimeoutMs <= 0 means a single
+    // non-blocking round: take whatever the socket already holds, never
+    // block. wrrClosed covers clean close and failure alike — inspect
+    // CloseCode afterwards, exactly like the unbounded form's False.
+    //
+    // What the bound is worth:
+    //
+    // Over ws:// the deadline bounds total wall clock — every blocking
+    // step is a readiness poll sized by the remainder, so a peer
+    // trickling a partial frame cannot stretch the wait.
+    //
+    // Over wss:// the deadline bounds waiting for ciphertext to arrive.
+    // Once a TLS record has begun arriving the read blocks until that
+    // record completes, and plaintext the TLS layer has decrypted but
+    // not yet handed over is invisible to a readiness poll on the raw
+    // socket: a complete message can sit inside the TLS layer while
+    // this call reports wrrTimeout. lwpt's TransportSecurity exposes no
+    // pending-plaintext query to close that gap yet.
+    //
+    // The deadline comes from GetTickCount64 — monotonic on Linux and
+    // Windows, but a wall-clock fallback on macOS under FPC 3.2.2,
+    // where a clock step during the wait shortens or extends it.
+    //
+    // Control replies owed to the peer (a pong for a ping that arrived
+    // mid-wait) are flushed on a blocking socket, so peer backpressure
+    // can push the call briefly past the bound.
+    function ReadMessage(out AText: Boolean; out AData: TBytes;
+      ATimeoutMs: Integer): TWSReadResult; overload;
 
     // Initiate the closing handshake and wait (bounded) for the echo.
     procedure Close(ACode: Word = 1000; const AReason: string = '');
@@ -143,9 +179,20 @@ begin
   Addr := StrToNetAddr(AHost);
   if Addr.s_addr = 0 then
   begin
-    if not ResolveHostByName(AHost, HE) then
+    // libc resolves names through nsswitch (files before dns), but FPC's
+    // netdb splits the pair: GetHostByName reads /etc/hosts only and
+    // returns the address in host byte order, while ResolveHostByName
+    // queries the resolv.conf nameservers only and returns network byte
+    // order. Names like localhost normally exist only in /etc/hosts, so a
+    // DNS-only lookup fails on any resolver that does not synthesize them
+    // (plain glibc setups; macOS happens to answer). Match libc: hosts
+    // file first — flipping its host-order result — then DNS.
+    if GetHostByName(AHost, HE) then
+      Addr.s_addr := htonl(HE.Addr.s_addr)
+    else if ResolveHostByName(AHost, HE) then
+      Addr := HE.Addr
+    else
       raise EWSClient.CreateFmt('cannot resolve %s', [AHost]);
-    Addr := HE.Addr;
   end;
 
   Result := fpSocket(AF_INET, SOCK_STREAM, 0);
@@ -404,13 +451,65 @@ begin
   if FProto.CloseDone then FOpen := False;
 end;
 
-function TWSClient.ReadMessage(out AText: Boolean; out AData: TBytes): Boolean;
+// True when the socket has bytes to read within ATimeoutMs milliseconds
+// (0 = one non-blocking check). An unrecoverable readiness failure is
+// recorded the way every other death here is — FOpen goes False — so the
+// caller ends the connection instead of spinning on a permanent error.
+// The bounded ReadMessage overload documents what this cannot see over
+// wss://.
+//
+// POSIX uses poll rather than select: select's fd_set caps at
+// FD_MAXFDSET (1024) and fpFD_SET silently does nothing above it, which
+// would leave the read set empty and turn every wait into a full-length
+// false timeout in a process holding many descriptors.
+function TWSClient.WaitReadable(ATimeoutMs: Integer): Boolean;
+var
+  {$ifdef UNIX}
+  PFD: TPollFd;
+  {$else}
+  FDs: TFDSet;
+  TV: TTimeVal;
+  {$endif}
+  Ready: Integer;
 begin
-  while FQHead = FQTail do
+  {$ifdef UNIX}
+  PFD.fd := FSock;
+  PFD.events := POLLIN;
+  PFD.revents := 0;
+  Ready := FpPoll(@PFD, 1, ATimeoutMs);
+  if Ready < 0 then
   begin
-    if not FOpen then Exit(False);
-    PumpOnce;
+    // A signal only cuts the wait short — the caller re-derives the
+    // remainder, so time still advances. Anything else (EBADF, EINVAL)
+    // would repeat forever at full CPU, so it ends the connection.
+    if fpGetErrno <> ESysEINTR then FOpen := False;
+    Exit(False);
   end;
+  // POLLERR/POLLHUP/POLLNVAL count as readable: the read that follows is
+  // what turns them into the right close code or failure, and swallowing
+  // them here would only stall until the deadline.
+  Result := (Ready > 0) and ((PFD.revents and
+    (POLLIN or POLLERR or POLLHUP or POLLNVAL)) <> 0);
+  {$else}
+  TV.tv_sec := ATimeoutMs div 1000;
+  TV.tv_usec := (ATimeoutMs mod 1000) * 1000;
+  WinSock2.FD_ZERO(FDs);
+  WinSock2.FD_SET(FSock, FDs);
+  // WinSock ignores the nfds parameter. One socket per set, and the set
+  // stores handles rather than indexing by them, so FD_SETSIZE is moot.
+  Ready := WinSock2.select(0, @FDs, nil, nil, @TV);
+  if Ready = SOCKET_ERROR then
+  begin
+    // No EINTR here — a failed select is fatal for this connection.
+    FOpen := False;
+    Exit(False);
+  end;
+  Result := Ready > 0;
+  {$endif}
+end;
+
+procedure TWSClient.PopMessage(out AText: Boolean; out AData: TBytes);
+begin
   AText := FQueue[FQHead].Text;
   AData := FQueue[FQHead].Data;
   FQueue[FQHead].Data := nil;
@@ -420,7 +519,68 @@ begin
     FQHead := 0;
     FQTail := 0;
   end;
+end;
+
+function TWSClient.ReadMessage(out AText: Boolean; out AData: TBytes): Boolean;
+begin
+  while FQHead = FQTail do
+  begin
+    if not FOpen then Exit(False);
+    PumpOnce;
+  end;
+  PopMessage(AText, AData);
   Result := True;
+end;
+
+function TWSClient.ReadMessage(out AText: Boolean; out AData: TBytes;
+  ATimeoutMs: Integer): TWSReadResult;
+var
+  Deadline: QWord;
+  Remaining: Int64;
+begin
+  // Already queued: no clock, no poll, no syscall.
+  if FQHead <> FQTail then
+  begin
+    PopMessage(AText, AData);
+    Exit(wrrMessage);
+  end;
+  if not FOpen then Exit(wrrClosed);
+
+  if ATimeoutMs <= 0 then
+  begin
+    // Exactly one non-blocking round. A peer that keeps the socket
+    // readable must not be able to hold this call for another pass.
+    // (Over wss even this round can block: the pump reads through the
+    // TLS layer, which waits for a whole record — see the overload
+    // comment.)
+    if WaitReadable(0) then PumpOnce;
+    if FQHead <> FQTail then
+    begin
+      PopMessage(AText, AData);
+      Exit(wrrMessage);
+    end;
+    if not FOpen then Exit(wrrClosed);
+    Exit(wrrTimeout);
+  end;
+
+  Deadline := GetTickCount64 + QWord(ATimeoutMs);
+  Remaining := ATimeoutMs;
+  // Remaining is re-derived at the foot of the loop, so a wait cut short
+  // (EINTR, a partial frame) resumes with what is left and a wait that
+  // ran its full length falls straight out instead of polling again.
+  while Remaining > 0 do
+  begin
+    if WaitReadable(Integer(Remaining)) then
+      PumpOnce; // a partial frame is fine; the loop re-derives the rest
+    if FQHead <> FQTail then
+    begin
+      PopMessage(AText, AData);
+      Exit(wrrMessage);
+    end;
+    if not FOpen then Exit(wrrClosed);
+    Remaining := Int64(Deadline) - Int64(GetTickCount64);
+  end;
+  Result := wrrTimeout;
 end;
 
 procedure TWSClient.SendText(const S: RawByteString);

@@ -5,9 +5,11 @@ once over one full-duplex connection. RFC 6455 (v13) + RFC 7692
 permessage-deflate in FreePascal, built and tested with
 [lwpt](https://github.com/frostney/lwpt). A sans-I/O protocol core behind a
 blocking client and a server with per-platform transports — epoll on
-Linux, Network.framework on macOS (native `wss://`), IOCP on Windows —
-validated by unit suites, a live-socket battery, and the Autobahn
-testsuite. See [docs/architecture.md](docs/architecture.md).
+Linux, Network.framework on macOS, IOCP on Windows — every one of them
+terminating `wss://` natively (Windows through lwpt's SChannel accept,
+x64 and win32 alike, no OpenSSL DLLs) — validated by unit suites, a
+live-socket battery, and the Autobahn testsuite. See
+[docs/architecture.md](docs/architecture.md).
 
 ## Install
 
@@ -36,12 +38,13 @@ Echo server (Linux, macOS, Windows) and probe, from the shipped programs:
 lwpt build
 ./build/wsecho --port=9001                       # echo server
 ./build/wsprobe ws://localhost:9001/ --deflate   # client probe vs any server
-./build/wsecho --pkcs12=id.p12 --pkcs12-pass=x   # wss:// (macOS, native TLS)
+./build/wsecho --pkcs12=id.p12 --pkcs12-pass=x   # wss:// (native on every platform)
 ```
 
 For the full program set (`wsinterop`, `wsbench`, `wsautobahn`) and every
 development command, see [docs/quick-start.md](docs/quick-start.md) and
-[docs/tooling.md](docs/tooling.md).
+[docs/tooling.md](docs/tooling.md). For serving a browser page alongside
+the socket, see [docs/companion-http.md](docs/companion-http.md).
 
 ## Background
 

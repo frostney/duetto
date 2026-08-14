@@ -3,10 +3,17 @@
 build/
 
 # LWPT toolkit state — the install workspace and the ephemeral install
-# lock. The committed state under .lwpt/modules/ is NOT gitignored
+# lock. The committed state under .lwpt/modules/ is NOT gitignored, and
+# neither are the source archives under .lwpt/archives/ that back it
 # (zero-install, mirroring lwpt's ADR-0002).
 .lwpt/tmp/
 .lwpt/install.lock
+# lwpt 0.4.0 per-invocation compiler-output staging (executables, units,
+# object files) before they are placed under build/.
+.lwpt/sessions/
+# lwpt 0.4.0 repo-local worker-state fallback (mirrors lwpt's own
+# gitignore) — used when the user-level state dir is unavailable.
+.lwpt/workers/
 
 # FPC artefacts. These should never appear with -FE build, but defensive
 # in case a contributor runs fpc by hand without the output-dir flag.
@@ -17,6 +24,11 @@ build/
 
 # Autobahn testsuite output (reports are generated, never committed).
 tests/autobahn/reports/
+
+# Session-local agent handoff state (per the handoff protocol) — working
+# notes, not repo content. Kept out of the tree so the markdownlint docs
+# job (globs **/*.md) never lints .agent/HANDOFF.md.
+.agent/
 
 # OS noise.
 .DS_Store

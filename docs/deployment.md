@@ -31,3 +31,31 @@ duetto = "frostney/duetto@^0.1.0"
 
 During the sandbox phase the dependency can also be a local path
 (`duetto = "../duetto"`), mirroring how duetto itself consumes lwpt's packages.
+
+Browser-facing consumers also need to serve the page that opens the
+WebSocket — duetto deliberately doesn't do that; see the
+[companion HTTP recipe](companion-http.md).
+
+## Runtime dependencies
+
+Plain `ws://` deployments have none beyond the C runtime — the epoll,
+Network.framework and IOCP transports are self-contained. Server-side
+`wss://` adds a runtime dependency on exactly one platform:
+
+- **Linux (epoll).** `libssl.so.3` and `libcrypto.so.3` must be loadable
+  from the usual library paths. They ship with any current distribution's
+  `openssl` / `libssl3` package; without them the TLS server context
+  fails to build at startup.
+- **Windows (IOCP, x64 and win32).** Nothing extra — lwpt 0.6.0's server
+  accept rides SChannel natively, so no OpenSSL DLLs are shipped, loaded,
+  or searched for. One behavioural note: SChannel requires the PKCS#12
+  private key in a persisted CNG container, so lwpt imports it under the
+  running user's profile for the context's lifetime and deletes it on
+  release; a hard kill can leave one container behind in
+  `%APPDATA%\Microsoft\Crypto\Keys`.
+- **macOS (Network.framework).** Nothing extra — TLS terminates inside
+  the platform stack.
+
+Where the Linux OpenSSL libraries are absent, a TLS-terminating reverse
+proxy in front of a plain listener remains a valid deployment shape; see
+[companion-http.md](companion-http.md).

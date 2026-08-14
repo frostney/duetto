@@ -9,9 +9,23 @@ program wsecho;
 //
 // Prints "listening on <port>" once ready so harnesses can wait for it
 // (--port=0 binds an ephemeral port and reports the real one).
-// --pkcs12 serves wss:// with the identity in FILE — native TLS on
-// macOS (Network.framework); the Linux transport rejects it until
-// accept-side TransportSecurity lands (lwpt#70).
+// --pkcs12 serves wss:// with the identity in FILE, natively on every
+// platform (duetto#22): macOS terminates TLS inside Network.framework,
+// while the epoll (Linux) and IOCP (Windows) transports terminate it
+// themselves over lwpt's memory-BIO accept API — OpenSSL on Linux
+// (libssl/libcrypto 3 loadable at runtime), SChannel on Windows (x64
+// and win32, nothing to ship beside the executable).
+//
+// There are deliberately no knobs for the TLS flow-control policy: the
+// program serves with every TWSTransportTls tuning field left at 0, so
+// each falls back to its default. The flow-control watermarks are lwpt's
+// defaults — a 64 KiB encrypted-input watermark (also the per-round
+// socket read bound) with a 32 KiB resume watermark and 64 KiB of
+// encrypted-output capacity — while the handshake-liveness guards are
+// duetto's own (WS.Transport.TlsServer): a 10 s handshake deadline and a
+// 64 KiB pre-handshake inbound budget. Squeezing those is a
+// listener-tuning decision an echo/conformance target has no opinion
+// about; wsinterop is where the extremes are exercised.
 
 {$I Shared.inc}
 

@@ -31,6 +31,30 @@ type
   TSubcommandHandler = function(const APositionals: TStringList;
     const AOptions: TOptionArray): Integer;
 
+  { Neutral dispatch metadata for hosts that need completion reporting.
+    The CLI package owns measurement and resolved command identity; the host
+    decides whether and how to present the result. Completion callbacks are
+    best-effort observers and cannot replace the command's dispatch result. }
+  TSubcommandCompletion = record
+    CommandName: string;
+    ExitCode: Integer;
+    ElapsedMilliseconds: QWord;
+  end;
+  TSubcommandCompletionHandler = procedure(
+    const ACompletion: TSubcommandCompletion);
+
+  { Neutral host hook after option parsing and alias resolution but before the
+    handler runs. Returning a non-empty message rejects dispatch as a command
+    usage error. Hosts may also install invocation-scoped observers here; the
+    CLI package remains unaware of their output policy. }
+  TSubcommandPreparedHandler = function(const ACommandName: string;
+    const AOptions: TOptionArray): string;
+
+  TSubcommandSharedFlag = record
+    LongName: string;
+    HelpText: string;
+  end;
+
   TSubcommand = class
   public
     Name     : string;
@@ -45,15 +69,30 @@ type
   TSubcommandRegistry = class
   private
     FItems : array of TSubcommand;
+    FSharedFlags : array of TSubcommandSharedFlag;
+    FOnCommandCompleted : TSubcommandCompletionHandler;
+    FOnCommandPrepared : TSubcommandPreparedHandler;
   public
     destructor Destroy; override;
+    procedure AddSharedFlag(const ALongName, AHelpText: string);
     procedure Add(ASub: TSubcommand);
     function Find(const AName: string): TSubcommand;
+    { Read iteration over the registered subcommands, in registration
+      order. The registry is the single source of truth for the
+      program's command surface; consumers that render that surface
+      (help printers here, agent-facing reference generators in the
+      host program) iterate it rather than keeping their own list. }
+    function Count: Integer;
+    function Item(AIndex: Integer): TSubcommand;
     procedure PrintTopLevelHelp(const AProgramName: string);
     procedure PrintSubcommandHelp(const AProgramName: string;
       ASub: TSubcommand);
     { Run argv. Returns the process exit code. }
     function Run(const AProgramName: string): Integer;
+    property OnCommandCompleted: TSubcommandCompletionHandler
+      read FOnCommandCompleted write FOnCommandCompleted;
+    property OnCommandPrepared: TSubcommandPreparedHandler
+      read FOnCommandPrepared write FOnCommandPrepared;
   end;
 
 implementation
@@ -84,9 +123,71 @@ begin
 end;
 
 procedure TSubcommandRegistry.Add(ASub: TSubcommand);
+var
+  ExistingOptionIndex, FlagIndex, OptionIndex: Integer;
 begin
+  { Check the complete command surface before appending any shared option so a
+    rejected command remains untouched and owned by its caller. }
+  for FlagIndex := 0 to High(FSharedFlags) do
+    for ExistingOptionIndex := 0 to High(ASub.Options) do
+      if SameText(ASub.Options[ExistingOptionIndex].LongName,
+         FSharedFlags[FlagIndex].LongName) then
+        raise EArgumentException.CreateFmt(
+          'subcommand %s already defines shared flag --%s',
+          [ASub.Name, FSharedFlags[FlagIndex].LongName]);
+
+  for FlagIndex := 0 to High(FSharedFlags) do
+  begin
+    OptionIndex := Length(ASub.Options);
+    SetLength(ASub.Options, OptionIndex + 1);
+    ASub.Options[OptionIndex] := TFlagOption.Create(
+      FSharedFlags[FlagIndex].LongName, FSharedFlags[FlagIndex].HelpText);
+    if ASub.UsageArg <> '' then ASub.UsageArg := ASub.UsageArg + ' ';
+    ASub.UsageArg := ASub.UsageArg + '[--'
+      + FSharedFlags[FlagIndex].LongName + ']';
+  end;
   SetLength(FItems, Length(FItems) + 1);
   FItems[High(FItems)] := ASub;
+end;
+
+procedure TSubcommandRegistry.AddSharedFlag(
+  const ALongName, AHelpText: string);
+var
+  FlagIndex, ItemIndex, OptionIndex: Integer;
+begin
+  if ALongName = '' then
+    raise EArgumentException.Create('shared flag name cannot be empty');
+  for FlagIndex := 0 to High(FSharedFlags) do
+    if SameText(FSharedFlags[FlagIndex].LongName, ALongName) then
+      raise EArgumentException.CreateFmt(
+        'shared flag --%s is already registered', [ALongName]);
+
+  { Validate every existing command before mutating the registry. This keeps a
+    rejected shared flag atomic and prevents ambiguous parser/help entries. }
+  for ItemIndex := 0 to High(FItems) do
+    for OptionIndex := 0 to High(FItems[ItemIndex].Options) do
+      if SameText(FItems[ItemIndex].Options[OptionIndex].LongName,
+         ALongName) then
+        raise EArgumentException.CreateFmt(
+          'subcommand %s already defines shared flag --%s',
+          [FItems[ItemIndex].Name, ALongName]);
+
+  FlagIndex := Length(FSharedFlags);
+  SetLength(FSharedFlags, FlagIndex + 1);
+  FSharedFlags[FlagIndex].LongName := ALongName;
+  FSharedFlags[FlagIndex].HelpText := AHelpText;
+
+  for ItemIndex := 0 to High(FItems) do
+  begin
+    OptionIndex := Length(FItems[ItemIndex].Options);
+    SetLength(FItems[ItemIndex].Options, OptionIndex + 1);
+    FItems[ItemIndex].Options[OptionIndex] := TFlagOption.Create(
+      ALongName, AHelpText);
+    if FItems[ItemIndex].UsageArg <> '' then
+      FItems[ItemIndex].UsageArg := FItems[ItemIndex].UsageArg + ' ';
+    FItems[ItemIndex].UsageArg := FItems[ItemIndex].UsageArg
+      + '[--' + ALongName + ']';
+  end;
 end;
 
 function TSubcommandRegistry.Find(const AName: string): TSubcommand;
@@ -96,6 +197,22 @@ begin
   for i := 0 to High(FItems) do
     if SameText(FItems[i].Name, AName) then
       Exit(FItems[i]);
+end;
+
+function TSubcommandRegistry.Count: Integer;
+begin
+  Result := Length(FItems);
+end;
+
+function TSubcommandRegistry.Item(AIndex: Integer): TSubcommand;
+begin
+  { Explicit bounds guard: production builds compile with range checks
+    off (Shared.inc), so relying on compiler checking would let an
+    out-of-range index return a garbage pointer instead of failing. }
+  if (AIndex < 0) or (AIndex > High(FItems)) then
+    raise EArgumentOutOfRangeException.CreateFmt(
+      'subcommand index %d out of range 0..%d', [AIndex, High(FItems)]);
+  Result := FItems[AIndex];
 end;
 
 procedure TSubcommandRegistry.PrintTopLevelHelp(const AProgramName: string);
@@ -130,17 +247,21 @@ begin
   WriteLn;
   WriteLn('options:');
 
-  { compute max option-name width for aligned descriptions }
+  { compute max option-token width for aligned descriptions.
+    FormatForHelp (not the bare long name) so valued options show
+    their value shape (--name=<value>, --name=<N>, --name=a|b) and
+    every surface rendered from the registry — this help text and the
+    host program's agents block — stays identical by construction. }
   MaxOptWidth := 0;
   for i := 0 to High(ASub.Options) do
   begin
-    W := Length('--' + ASub.Options[i].LongName);
+    W := Length(ASub.Options[i].FormatForHelp);
     if W > MaxOptWidth then MaxOptWidth := W;
   end;
 
   for i := 0 to High(ASub.Options) do
   begin
-    OptName := '--' + ASub.Options[i].LongName;
+    OptName := ASub.Options[i].FormatForHelp;
     Write('  ', OptName);
     for W := Length(OptName) to MaxOptWidth do Write(' ');
     WriteLn('  ', ASub.Options[i].HelpText);
@@ -168,6 +289,9 @@ var
   Sub, AliasSub : TSubcommand;
   Positionals : TStringList;
   ParseStart : Integer;
+  StartedAt : QWord;
+  Completion : TSubcommandCompletion;
+  PreparationError : string;
 begin
   if ParamCount < 1 then
   begin
@@ -190,53 +314,80 @@ begin
     Exit(1);
   end;
 
-  { `lwpt run <subcommand>` subcommand-aliasing (ADR-0013). If the
-    second positional is a registered subcommand, dispatch to THAT
-    subcommand directly with its args starting at argv[3]. The run
-    handler never sees this case — it only fires for user-defined
-    run-scripts (which are forbidden from shadowing subcommand names
-    by the manifest-load guard, so there's no ambiguity here). }
-  ParseStart := 1;
-  if (CmdName = 'run') and (ParamCount >= 2) then
-  begin
-    AliasSub := Find(LowerCase(ParamStr(2)));
-    if AliasSub <> nil then
-    begin
-      Sub := AliasSub;
-      ParseStart := 2;
-      CmdName := LowerCase(ParamStr(2));
-    end;
-  end;
-
-  { Intercept per-subcommand --help / -h before ParseCommandLine sees
-    them and reports "Unknown option". }
-  if WantsHelp then
-  begin
-    PrintSubcommandHelp(AProgramName, Sub);
-    Exit(0);
-  end;
-
-  { ParseCommandLine reads the real argv. We need it to see only argv[2..]
-    for normal dispatch, or argv[3..] for `lwpt run <subcmd>` aliasing.
-    The AStartArg parameter (added to CLI.Parser for this) gates that. }
+  StartedAt := GetTickCount64;
+  Result := 1;
   try
-    Positionals := ParseCommandLine(Sub.Options, ParseStart);
-  except
-    on E: TParseError do
-    begin
-      WriteLn(ErrOutput, AProgramName, ' ', CmdName, ': ', E.Message);
-      Exit(1);
-    end;
-  end;
 
-  try
-    { drop the leading positional (the subcommand name itself) }
-    if (Positionals.Count > 0)
-       and SameText(Positionals[0], CmdName) then
-      Positionals.Delete(0);
-    Result := Sub.Handler(Positionals, Sub.Options);
+    { `lwpt run <subcommand>` subcommand-aliasing (ADR-0013). If the
+      second positional is a registered subcommand, dispatch to THAT
+      subcommand directly with its args starting at argv[3]. The run
+      handler never sees this case — it only fires for user-defined
+      run tasks (which are forbidden from shadowing subcommand names
+      by the manifest-load guard, so there's no ambiguity here). }
+    ParseStart := 1;
+    if (CmdName = 'run') and (ParamCount >= 2) then
+    begin
+      AliasSub := Find(LowerCase(ParamStr(2)));
+      if AliasSub <> nil then
+      begin
+        Sub := AliasSub;
+        ParseStart := 2;
+        CmdName := LowerCase(ParamStr(2));
+      end;
+    end;
+
+    { Intercept per-subcommand --help / -h before ParseCommandLine sees
+      them and reports "Unknown option". }
+    if WantsHelp then
+    begin
+      PrintSubcommandHelp(AProgramName, Sub);
+      Exit(0);
+    end;
+
+    { ParseCommandLine reads the real argv. We need it to see only argv[2..]
+      for normal dispatch, or argv[3..] for `lwpt run <subcmd>` aliasing.
+      The AStartArg parameter (added to CLI.Parser for this) gates that. }
+    try
+      Positionals := ParseCommandLine(Sub.Options, ParseStart);
+    except
+      on E: TParseError do
+      begin
+        WriteLn(ErrOutput, AProgramName, ' ', CmdName, ': ', E.Message);
+        Exit(1);
+      end;
+    end;
+
+    try
+      { drop the leading positional (the subcommand name itself) }
+      if (Positionals.Count > 0)
+         and SameText(Positionals[0], CmdName) then
+        Positionals.Delete(0);
+      PreparationError := '';
+      if Assigned(FOnCommandPrepared) then
+        PreparationError := FOnCommandPrepared(CmdName, Sub.Options);
+      if PreparationError <> '' then
+      begin
+        WriteLn(ErrOutput, AProgramName, ' ', CmdName, ': ',
+          PreparationError);
+        Result := 1;
+      end
+      else
+        Result := Sub.Handler(Positionals, Sub.Options);
+    finally
+      Positionals.Free;
+    end;
   finally
-    Positionals.Free;
+    if Assigned(FOnCommandCompleted) then
+    begin
+      Completion.CommandName := CmdName;
+      Completion.ExitCode := Result;
+      Completion.ElapsedMilliseconds := GetTickCount64 - StartedAt;
+      try
+        FOnCommandCompleted(Completion);
+      except
+        { Completion observers must not replace the command's exit result. }
+      end;
+    end;
   end;
 end;
 

@@ -11,7 +11,7 @@
 - **`lwpt.cfg` and `lwpt.lock` are generated** by `lwpt install`; never
   hand-edit them. `lwpt.toml` is the manifest you edit.
 - **The `units` array in `lwpt.toml` lists only `source/units`** —
-  lwpt 0.2.0 discovers dep units through nested manifests. Keep
+  lwpt discovers dep units through nested manifests. Keep
   `[format] exclude = [".lwpt/**"]` so the formatter never rewrites
   fetched modules.
 - **Programs parse flags via lwpt's `cli` package** (`CLI.Options`,
@@ -22,8 +22,8 @@
   `source/apps/`, one-off automation in `tools/`, E2E corpora in `tests/`.
 - **`build/` and `tests/autobahn/reports/` are generated** — never commit
   them.
-- **No new dependencies** beyond lwpt's `httpclient` and `testing` packages
-  without explicit maintainer approval.
+- **No new dependencies** beyond lwpt's `httpclient`, `testing`, and `cli`
+  packages without explicit maintainer approval.
 - **`WS.Protocol` owns all RFC 6455 rules.** Protocol behaviour (close
   codes, fragmentation, masking policy, UTF-8 failure) must not leak into
   the client, the server, or the apps.
@@ -43,7 +43,7 @@ lwpt install         # resolve deps, regenerate lwpt.cfg + lwpt.lock
 lwpt install --frozen  # CI mode: verify lockfile + committed modules, no network
 lwpt format --check  # formatter gate (no flag = rewrite in place)
 lwpt build           # all programs (Linux, macOS, Windows)
-lwpt test            # five co-located unit suites
+lwpt test            # seven co-located unit suites
 ./build/wsinterop    # live-socket battery (all platforms), exit 0 = pass
 tools/autobahn.sh server   # Autobahn fuzzingclient vs wsecho (Linux + Docker)
 tools/autobahn.sh client   # Autobahn fuzzingserver vs wsautobahn (Docker)
@@ -53,11 +53,11 @@ tools/autobahn.sh client   # Autobahn fuzzingserver vs wsautobahn (Docker)
 
 | Path | Role |
 | --- | --- |
-| `source/units/` | Library: `WS.Frame`, `WS.Utf8`, `WS.Handshake`, `WS.Deflate`, `WS.Protocol` (sans-I/O core), `WS.Client`, `WS.Transport(.Epoll/.NetworkFramework/.Iocp)`, `WS.Server` (session layer) |
+| `source/units/` | Library: `WS.Frame`, `WS.Utf8`, `WS.Handshake`, `WS.Deflate`, `WS.Protocol` (sans-I/O core), `WS.Client`, `WS.Transport(.Epoll/.NetworkFramework/.Iocp)`, `WS.Transport.TlsServer` (server TLS for the fd-owning transports), `WS.Server` (session layer) |
 | `source/apps/` | Programs: `wsecho`, `wsprobe`, `wsinterop`, `wsbench`, `wsautobahn` |
 | `tests/autobahn/` | Autobahn testsuite configs (reports/ is generated) |
 | `tools/` | Cross-implementation checks, benchmarks, Autobahn runner |
-| `docs/` | Architecture, quick-start, tooling, code style, deployment |
+| `docs/` | Architecture, quick-start, tooling, code style, deployment, companion HTTP, comparison |
 
 Layering is strictly bottom-up — see [docs/architecture.md](docs/architecture.md).
 `WS.Server` is a platform-neutral session layer over the `WS.Transport`

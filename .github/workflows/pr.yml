@@ -5,11 +5,11 @@ name: PR
 # sees.
 #
 #   pr.yml — every PR: native install --frozen + format --check + build
-#            + test + wsinterop on one Linux and one macOS runner (the
-#            two platforms with their own transports — a PR touching
-#            WS.Transport.NetworkFramework gets a real pre-merge
-#            signal; no Autobahn). A win64 cross-compile signal joins
-#            when #3 lands, mirroring lwpt's staging.
+#            + test + wsinterop on one Linux, one macOS and one win64
+#            runner (the three platforms with their own transports — a
+#            PR touching WS.Transport.NetworkFramework or
+#            WS.Transport.Iocp gets a real pre-merge signal; no
+#            Autobahn). i386-win32 stays post-merge in ci.yml.
 #   ci.yml — push to main only: the full per-arch platform matrix plus
 #            the Autobahn suite in both directions.
 #
@@ -28,10 +28,13 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.2.0"
+  LWPT_VERSION: "0.6.0"
 
 jobs:
   build-and-test:
+    # Pin the display name to the runner so the matrix's per-leg keys do
+    # not append a shifting tail to the job label.
+    name: build-and-test (${{ matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
@@ -52,7 +55,6 @@ jobs:
             fpc-install: choco
             fpc-win-target: x86_64-win64
             exe: .exe
-            frozen-install: skip   # lwpt#78: frozen tree-hash not path-portable on Windows
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -156,14 +158,7 @@ jobs:
           echo "$RUNNER_TEMP/${ASSET}" >> "$GITHUB_PATH"
 
       - name: lwpt install --frozen (verify lockfile + committed modules)
-        if: matrix.frozen-install != 'skip'
         run: lwpt install --frozen
-
-      # Windows: lwpt#78 — the frozen verifier's tree hash is not yet
-      # path-portable; mirror lwpt's own Windows CI and install online.
-      - name: lwpt install (Windows)
-        if: matrix.frozen-install == 'skip'
-        run: lwpt install
 
       - name: lwpt format --check (formatting drift?)
         if: matrix.fpc-install == 'apt'   # platform-independent; one runner
@@ -172,7 +167,7 @@ jobs:
       - name: lwpt build (compile every [build] entry)
         run: lwpt build
 
-      - name: lwpt test (five co-located unit suites)
+      - name: lwpt test (seven co-located unit suites)
         run: lwpt test
 
       - name: wsinterop (live-socket battery, own client vs own server)
