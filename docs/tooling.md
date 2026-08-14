@@ -85,10 +85,9 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
   Network.framework loopback traffic on a ~60 s timer (duetto#11).
 
 Both workflows install the lwpt release binary from a checksum-verified
-tarball (no sibling checkout, no bootstrap). On every non-Windows leg
-they verify dependencies against the committed lockfile via `lwpt install
---frozen`, every leg and every platform. duetto has no committed
-toolchain binaries.
+tarball (no sibling checkout, no bootstrap). Every leg — Windows
+included — verifies dependencies against the committed lockfile via
+`lwpt install --frozen`. duetto has no committed toolchain binaries.
 
 ### Dependency layout note
 
