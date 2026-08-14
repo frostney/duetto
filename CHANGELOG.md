@@ -1,6 +1,20 @@
 # Changelog
 
 All notable changes to duetto are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); entries are generated from Conventional Commits by git-cliff.
+## [0.4.0] - 2026-08-14
+
+### Documentation
+
+- retro hardening — concurrency re-review rule + spike pattern (#18)
+
+### Internal
+
+- graduate native Autobahn onto the arm64 macOS merge leg (#17)
+
+### New Features
+
+- implement all remaining open issues (#19–#26) on lwpt 0.6.0 (#27)
+
 ## [0.3.0] - 2026-07-19
 
 ### Bug Fixes
