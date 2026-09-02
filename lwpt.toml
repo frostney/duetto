@@ -31,3 +31,17 @@ wsbench   = { source = "source/apps/wsbench.pas",   output = "build/wsbench" }
 wsinterop = { source = "source/apps/wsinterop.pas", output = "build/wsinterop" }
 wsprobe   = { source = "source/apps/wsprobe.pas",   output = "build/wsprobe" }
 wsautobahn = { source = "source/apps/wsautobahn.pas", output = "build/wsautobahn" }
+
+# Analysis gates. Limits sit just above the measured 2026-09 baseline
+# (lwpt health / lwpt duplication): file cyclomatic 234, file cognitive 328, routine cyclomatic 60,
+# routine cognitive 114, duplication 1.01%.
+# Regression ratchets — CI fails when a change pushes a metric past
+# its ceiling.
+[health]
+max-file-cyclomatic = 250
+max-file-cognitive = 350
+max-routine-cyclomatic = 70
+max-routine-cognitive = 130
+
+[duplication]
+maximum-percent = 2
