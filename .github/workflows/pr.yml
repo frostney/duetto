@@ -28,7 +28,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.6.0"
+  LWPT_VERSION: "0.7.0"
 
 jobs:
   build-and-test:
@@ -163,6 +163,10 @@ jobs:
       - name: lwpt format --check (formatting drift?)
         if: matrix.fpc-install == 'apt'   # platform-independent; one runner
         run: lwpt format --check
+
+      - name: lwpt agents --check (generated command reference)
+        if: matrix.fpc-install == 'apt'
+        run: lwpt agents --check
 
       - name: lwpt build (compile every [build] entry)
         run: lwpt build

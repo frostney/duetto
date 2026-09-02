@@ -18,7 +18,7 @@
 min_version: 1.5.0
 
 pre-commit:
-  parallel: true
+  parallel: false
 
   commands:
 
