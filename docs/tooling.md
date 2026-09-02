@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-- FPC **3.2.2** (Delphi mode) is the pinned compiler; the [lwpt](https://github.com/frostney/lwpt) **0.6.0 release binary** is the single toolchain entry point for install / build / test / format.
+- FPC **3.2.2** (Delphi mode) is the pinned compiler; the [lwpt](https://github.com/frostney/lwpt) **0.7.0 release binary** is the single toolchain entry point for install / build / test / format.
 - The Autobahn testsuite runs via Docker (`crossbario/autobahn-testsuite`) through `tools/autobahn.sh`, judged by `tools/autobahn-check.py`.
 - Lefthook runs `lwpt format` pre-commit; markdownlint and the PR workflow are the blocking gates.
 - CI: `pr.yml` is the fast Ubuntu pre-merge gate, `ci.yml` (push to main) adds the platform matrix and the Autobahn suite.
@@ -13,7 +13,7 @@
 | Tool | Version / source | Role |
 | --- | --- | --- |
 | FPC | 3.2.2 (apt / brew) | compiler, Delphi mode via `source/units/Shared.inc` |
-| lwpt | 0.6.0 release binary (checksum-verified tarball, pinned as `LWPT_VERSION` in CI) | build, test discovery, formatter, dependency install |
+| lwpt | 0.7.0 release binary (checksum-verified tarball, pinned as `LWPT_VERSION` in CI) | build, test discovery, formatter, dependency install |
 | Lefthook | ≥ 1.5 | pre-commit formatter hook (`lefthook install`) |
 | Docker | any recent | Autobahn testsuite container |
 | git-cliff | latest | changelog generation from Conventional Commits |

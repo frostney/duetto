@@ -3,7 +3,8 @@
 # Install once per fresh clone:  lefthook install
 #
 # Local pre-commit runs the canonical formatter (`lwpt format`) and
-# re-stages any files it rewrites. The heavyweight gates — `lwpt build`,
+# refreshes the generated agent command reference (`lwpt agents`), re-staging
+# any files they rewrite. The heavyweight gates — `lwpt build`,
 # `lwpt test`, wsinterop, the Autobahn suite — run on the PR / CI
 # workflows (see .github/workflows/) so local commits stay fast.
 #
@@ -17,7 +18,7 @@
 min_version: 1.5.0
 
 pre-commit:
-  parallel: true
+  parallel: false
 
   commands:
 
@@ -30,3 +31,11 @@ pre-commit:
         fails when it cannot parse a file. If lwpt is missing entirely
         (fresh clone), install the release binary first — see
         docs/quick-start.md.
+
+    agents:
+      glob: "*.{pas,toml,md}"
+      run: ${DUETTO_LWPT:-lwpt} agents
+      stage_fixed: true
+      fail_text: |
+        lwpt agents failed. Inspect the output above and regenerate the
+        machine-owned AGENTS.md command block with `lwpt agents`.

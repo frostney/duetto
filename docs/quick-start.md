@@ -14,11 +14,11 @@ Install lwpt from its release (pick the archive for your platform —
 `windows-x64` / `windows-x86` zips):
 
 ```bash
-curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.6.0/lwpt-0.6.0-macos-arm64.tar.gz
-curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.6.0/lwpt-0.6.0-checksums.txt
-shasum -a 256 -c <(grep macos-arm64 lwpt-0.6.0-checksums.txt)
-tar xzf lwpt-0.6.0-macos-arm64.tar.gz
-export PATH="$PWD/lwpt-0.6.0-macos-arm64:$PATH"   # or copy lwpt into ~/bin
+curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.7.0/lwpt-0.7.0-macos-arm64.tar.gz
+curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.7.0/lwpt-0.7.0-checksums.txt
+shasum -a 256 -c <(grep macos-arm64 lwpt-0.7.0-checksums.txt)
+tar xzf lwpt-0.7.0-macos-arm64.tar.gz
+export PATH="$PWD/lwpt-0.7.0-macos-arm64:$PATH"   # or copy lwpt into ~/bin
 ```
 
 Then set up the project:
@@ -30,7 +30,7 @@ lefthook install    # pre-commit formatter hook
 ```
 
 The `httpclient`, `testing`, and `cli` dependencies resolve from the
-`frostney/lwpt` 0.6.0 release tag with include filters (see `lwpt.toml`);
+`frostney/lwpt` 0.7.0 release tag with include filters (see `lwpt.toml`);
 no sibling checkout is needed. The committed `.lwpt/modules/` tree plus
 `lwpt.lock` make `lwpt install --frozen` work offline (CI mode).
 
