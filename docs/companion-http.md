@@ -26,6 +26,11 @@
 - Single-page hosts can skip the second listener entirely:
   `TWSServer.OnPlainRequest` answers body-less GET/HEAD from the
   WebSocket port itself (one response, then close).
+- Browser-facing hosts should also decide who may upgrade:
+  `TWSServer.OnUpgradeRequest` sees the parsed `Origin` (and the raw
+  header block) before the 101 and can refuse with a 403 — and the
+  constructor's bind address keeps a loopback- or tailnet-only server off
+  every other interface.
 
 ## The two-port layout
 
@@ -231,6 +236,65 @@ The contract is deliberately narrow:
   back out through it.
 - **Threading.** The hook fires on the connection's execution context
   like every other callback (ADR-0003).
+
+## Vetoing upgrades: OnUpgradeRequest
+
+A page served from your own origin is not the only thing that can open
+a WebSocket to your port: any page in the same browser can, and
+browsers send the `Origin` header precisely so the server can tell.
+`TWSServer.OnUpgradeRequest` is the veto point — fired for every
+well-formed upgrade after `WS.Handshake` accepted it and before the 101
+is queued:
+
+```pascal
+function THost.UpgradeRequest(const AHS: TWSServerHandshake;
+  const ARawRequest: RawByteString; out AReason: string): Boolean;
+begin
+  // Non-browser clients send no Origin; browsers always do.
+  Result := (AHS.Origin = '') or (AHS.Origin = FAllowedOrigin);
+  if not Result then AReason := 'origin not allowed';
+  // Any other header is one HeaderValue(ARawRequest, ...) away.
+end;
+
+Ws.OnUpgradeRequest := Host.UpgradeRequest;
+```
+
+The contract mirrors `OnPlainRequest`:
+
+- **Return `True` to accept**; the handshake proceeds unchanged and
+  `OnOpen` fires as usual.
+- **Return `False` to refuse**: the server writes
+  `HTTP/1.1 403 Forbidden` with `AReason` as the body (`forbidden` when
+  left empty) and closes the connection. Neither `OnOpen` nor
+  `OnClientClose` fires for it — the connection never opened.
+- **A raising hook is a refusal.** The exception is swallowed and the
+  same 403 goes out, so one misbehaving handler cannot leak the
+  connection or take down the transport's execution context.
+- **Malformed requests never reach it** — they keep the standard 400 (or
+  `OnPlainRequest`, when eligible). Unset, every well-formed upgrade is
+  accepted, exactly as before the hook existed.
+- **Threading.** Same as every other callback: the connection's
+  execution context (ADR-0003).
+
+## Binding one interface
+
+`TWSServer.Create` takes an optional trailing bind address on both
+overloads. Empty (the default) binds every interface; an IPv4
+dotted-quad or an IPv6 literal without brackets binds that one address,
+with the socket family chosen from the literal:
+
+```pascal
+Ws := TWSServer.Create(5801, True, 16 * 1024 * 1024, '127.0.0.1');
+Ws := TWSServer.Create(5801, TlsCfg, True, 16 * 1024 * 1024, '::1');
+```
+
+Hostnames are never resolved — a name, brackets, a zone id or anything
+else that is not a literal raises in the constructor with a message
+naming the address. Port 0 still means kernel-assigned; read it back
+through `Port`. A loopback bind is the right shape for a host that
+fronts duetto with its own reverse proxy or a tailnet daemon, and it
+composes with `OnUpgradeRequest`: the bind decides which interface can
+reach the port, the hook decides which origin may upgrade on it.
 
 The two-port layout above remains the right choice the moment the HTTP
 side outgrows one page — multiple assets, caching, redirects, anything

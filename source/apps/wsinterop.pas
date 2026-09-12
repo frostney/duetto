@@ -4,7 +4,10 @@ program wsinterop;
 // TCP (loopback), plus a raw-socket section that injects protocol
 // violations a conforming client cannot produce and asserts the close
 // codes RFC 6455 (and Autobahn cases 4.x/7.x) require, a plain-request
-// section covering the single-port OnPlainRequest fallback, and a
+// section covering the single-port OnPlainRequest fallback, an
+// upgrade-hook section (a server bound to 127.0.0.1 explicitly whose
+// OnUpgradeRequest vetoes one Origin with a 403 and treats a raising
+// hook the same way), and a
 // concurrent-connections stress section — 33 client threads (28 echo,
 // 4 abrupt-drop, 1 pusher) of echo/burst/clean-close cycles racing
 // abrupt raw-socket drops and server-initiated pushes, ended by a
@@ -83,6 +86,27 @@ type
     procedure Snapshot(out AHits: Integer; out ALastRaw: RawByteString);
   end;
 
+  // OnUpgradeRequest host for the hook section: refuses one Origin with
+  // a reason, raises instead when told to, and counts what the server
+  // went on to do — a refused handshake must produce neither OnOpen nor
+  // OnClientClose. Runs on the connection's execution context, hence
+  // the lock around the counters the battery reads.
+  TUpgradeGate = class
+  private
+    FLock: TCriticalSection;
+    FHits, FOpens, FCloses: Integer;
+    FRaiseMode: Boolean;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    function Check(const AHS: TWSServerHandshake;
+      const ARawRequest: RawByteString; out AReason: string): Boolean;
+    procedure HandleOpen(AConn: TWSConnection);
+    procedure HandleClose(AConn: TWSConnection);
+    procedure SetRaiseMode(AValue: Boolean);
+    procedure Snapshot(out AHits, AOpens, ACloses: Integer);
+  end;
+
   TServerThread = class(TThread)
   public
     Srv: TWSServer;
@@ -92,6 +116,87 @@ type
 procedure TEcho.OnMsg(AConn: TWSConnection; AText: Boolean; P: PByte; Len: NativeInt);
 begin
   if AText then AConn.SendText(P, Len) else AConn.SendBinary(P, Len);
+end;
+
+{ TUpgradeGate }
+
+const
+  ForbiddenOrigin = 'http://evil.example';
+  ForbiddenReason = 'origin not allowed';
+
+constructor TUpgradeGate.Create;
+begin
+  inherited;
+  FLock := TCriticalSection.Create;
+end;
+
+destructor TUpgradeGate.Destroy;
+begin
+  FLock.Free;
+  inherited;
+end;
+
+function TUpgradeGate.Check(const AHS: TWSServerHandshake;
+  const ARawRequest: RawByteString; out AReason: string): Boolean;
+var
+  RaiseNow: Boolean;
+begin
+  FLock.Acquire;
+  try
+    Inc(FHits);
+    RaiseNow := FRaiseMode;
+  finally
+    FLock.Release;
+  end;
+  if RaiseNow then
+    raise Exception.Create('hook exploded on purpose');
+  // The parsed Origin and the raw block must agree — the hook is
+  // promised exactly this request's headers.
+  Result := (AHS.Origin <> ForbiddenOrigin) and
+    (HeaderValue(ARawRequest, 'Origin') = AHS.Origin);
+  if not Result then AReason := ForbiddenReason;
+end;
+
+procedure TUpgradeGate.HandleOpen(AConn: TWSConnection);
+begin
+  FLock.Acquire;
+  try
+    Inc(FOpens);
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TUpgradeGate.HandleClose(AConn: TWSConnection);
+begin
+  FLock.Acquire;
+  try
+    Inc(FCloses);
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TUpgradeGate.SetRaiseMode(AValue: Boolean);
+begin
+  FLock.Acquire;
+  try
+    FRaiseMode := AValue;
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TUpgradeGate.Snapshot(out AHits, AOpens, ACloses: Integer);
+begin
+  FLock.Acquire;
+  try
+    AHits := FHits;
+    AOpens := FOpens;
+    ACloses := FCloses;
+  finally
+    FLock.Release;
+  end;
 end;
 
 { TPlainHost }
@@ -267,6 +372,41 @@ begin
   SetLength(Result, Length(Raw) - HdrEnd);
   if Length(Result) > 0 then
     Move(Raw[HdrEnd + 1], Result[0], Length(Result));
+end;
+
+// Send an upgrade request carrying AExtraHeaders (complete CRLF-terminated
+// lines, or '') and return the response header block — whatever status
+// it carries. AEof reports whether the server closed the socket behind
+// it (read until EOF once the block is complete; a 101 leaves the socket
+// open, so that read is only attempted when the status is not 101).
+function RawUpgrade(AFd: Tsocket; const AExtraHeaders: RawByteString;
+  out AEof: Boolean): RawByteString;
+var
+  Req: RawByteString;
+  Buf: array[0..4095] of Byte;
+  Got, HdrEnd: Integer;
+begin
+  Req := ClientBuildRequest('127.0.0.1', '/', ClientGenerateKey, False);
+  // Splice the extra lines in ahead of the terminating blank line.
+  Insert(AExtraHeaders, Req, Length(Req) - 1);
+  fpSend(AFd, @Req[1], Length(Req), 0);
+  Result := '';
+  AEof := False;
+  repeat
+    Got := fpRecv(AFd, @Buf[0], SizeOf(Buf), 0);
+    if Got <= 0 then Exit;
+    SetLength(Result, Length(Result) + Got);
+    Move(Buf[0], Result[Length(Result) - Got + 1], Got);
+    HdrEnd := HandshakeFindEnd(Result);
+  until HdrEnd > 0;
+  if Pos(' 101 ', Copy(Result, 1, 16)) > 0 then Exit;
+  repeat
+    Got := fpRecv(AFd, @Buf[0], SizeOf(Buf), 0);
+    if Got <= 0 then Break;
+    SetLength(Result, Length(Result) + Got);
+    Move(Buf[0], Result[Length(Result) - Got + 1], Got);
+  until False;
+  AEof := Got = 0;
 end;
 
 // Read frames until a close frame arrives; return its status code
@@ -1345,6 +1485,12 @@ var
   PlainHits, PlainHitsBefore: Integer;
   Eof: Boolean;
   ReadRes: TWSReadResult;
+  // Upgrade-hook section
+  Gate: TUpgradeGate;
+  HookSrvT: TServerThread;
+  HookPort: Word;
+  HookResp: RawByteString;
+  Hits, Opens, Closes: Integer;
   {$ifdef LINUX}
   // Server-TLS section
   TlsDir, TlsUrl: string;
@@ -1619,6 +1765,81 @@ begin
   CloseSocket(Fd);
   Check(Copy(PlainGot, 1, 12) = 'HTTP/1.1 400',
     'plain GET refused 400 when no hook is set');
+
+  // --- bind address + OnUpgradeRequest -----------------------------------
+  // A second server, bound to 127.0.0.1 explicitly (port 0 still
+  // kernel-assigned) and carrying the veto hook; the main instance stays
+  // hook-less so the sections above keep meaning "accept everything".
+  StressPhase := 'upgrade-hook section';
+  Gate := TUpgradeGate.Create;
+  HookSrvT := TServerThread.Create(True);
+  HookSrvT.Srv := TWSServer.Create(0, True, 16 * 1024 * 1024, '127.0.0.1');
+  HookSrvT.Srv.OnMessage := Echo.OnMsg;
+  HookSrvT.Srv.OnOpen := Gate.HandleOpen;
+  HookSrvT.Srv.OnClientClose := Gate.HandleClose;
+  HookSrvT.Srv.OnUpgradeRequest := Gate.Check;
+  HookPort := HookSrvT.Srv.Port;
+  HookSrvT.Start;
+  Check(HookPort <> 0, 'server bound to 127.0.0.1 resolves its port');
+
+  // Refusals first, while no connection has ever been opened on this
+  // server: afterwards the open/close counters must still read zero.
+  Fd := RawConnect(HookPort);
+  HookResp := RawUpgrade(Fd, 'Origin: ' + ForbiddenOrigin + #13#10, Eof);
+  CloseSocket(Fd);
+  Check((Copy(HookResp, 1, 22) = 'HTTP/1.1 403 Forbidden') and Eof and
+    (Pos(#13#10#13#10 + ForbiddenReason, HookResp) > 0),
+    'forbidden Origin -> 403 with the hook''s reason, then EOF');
+
+  Gate.SetRaiseMode(True);
+  Fd := RawConnect(HookPort);
+  HookResp := RawUpgrade(Fd, '', Eof);
+  CloseSocket(Fd);
+  Gate.SetRaiseMode(False);
+  Check((Copy(HookResp, 1, 22) = 'HTTP/1.1 403 Forbidden') and Eof and
+    (Pos(#13#10#13#10'forbidden', HookResp) > 0),
+    'raising hook -> 403 ''forbidden'', then EOF');
+
+  Gate.Snapshot(Hits, Opens, Closes);
+  Check((Hits = 2) and (Opens = 0) and (Closes = 0),
+    'refused handshakes: hook consulted, no OnOpen, no OnClientClose');
+
+  // No Origin at all (a non-browser client): accepted, and the
+  // connection is a normal one — echo proves OnOpen ran ahead of it.
+  Cli := TWSClient.Create;
+  Cli.Connect(Format('ws://127.0.0.1:%d/', [HookPort]));
+  Cli.SendText(HelloProbe);
+  Check(Cli.ReadMessage(IsText, Data) and IsText and
+    (Length(Data) = Length(HelloProbe)) and
+    CompareMem(@Data[0], @HelloProbe[1], Length(HelloProbe)),
+    'loopback-bound server: client handshake without Origin -> 101, echo');
+  Cli.Close(1000, 'done');
+  Cli.Free;
+
+  // An allowed Origin: 101, and the socket stays open for frames.
+  Fd := RawConnect(HookPort);
+  HookResp := RawUpgrade(Fd, 'Origin: http://good.example'#13#10, Eof);
+  Ok := Pos(' 101 ', Copy(HookResp, 1, 16)) > 0;
+  if Ok then
+  begin
+    RawSendFrame(Fd, WS_OP_TEXT, 'still here', True);
+    RawSendFrame(Fd, WS_OP_CLOSE, #$03#$E8, True); // 1000
+    Ok := RawReadCloseCode(Fd, nil) = 1000;
+  end;
+  CloseSocket(Fd);
+  Check(Ok, 'allowed Origin -> 101, frames flow, clean close');
+
+  Gate.Snapshot(Hits, Opens, Closes);
+  Check((Hits = 4) and (Opens = 2),
+    'accepted handshakes: hook consulted, OnOpen fired for each');
+
+  StressPhase := 'upgrade-hook section: teardown';
+  HookSrvT.Terminate;
+  HookSrvT.Srv.Stop;
+  HookSrvT.WaitFor;
+  HookSrvT.Srv.Free;
+  HookSrvT.Free;
+  Gate.Free;
 
   // --- server TLS terminated by the transport (duetto#22) -----------------
   // Linux only, and the reason is the CLIENT half of the battery on the

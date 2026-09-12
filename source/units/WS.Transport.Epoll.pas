@@ -131,7 +131,11 @@ type
     procedure RemoteClosed(AConn: TWSEpollConn);
     procedure DeliverPosts(AChain: PWSPostNode; ADropped: Boolean);
   public
-    constructor Create(APort: Word; const ATls: TWSTransportTls);
+    // ABindAddress: '' = every interface; an IPv4 or IPv6 literal binds
+    // that address (family chosen from the literal; see
+    // WSParseBindAddress, which raises on anything else).
+    constructor Create(APort: Word; const ATls: TWSTransportTls;
+      const ABindAddress: string = '');
     destructor Destroy; override;
     procedure Run(ATimeoutMs: Integer = -1); override;
     procedure Stop; override;
@@ -440,12 +444,16 @@ end;
 
 { TWSEpollTransport }
 
-constructor TWSEpollTransport.Create(APort: Word; const ATls: TWSTransportTls);
+constructor TWSEpollTransport.Create(APort: Word; const ATls: TWSTransportTls;
+  const ABindAddress: string);
 var
+  Bind: TWSBindAddress;
   SA: TInetSockAddr;
-  One: Integer;
+  SA6: TInetSockAddr6;
+  One, Family: Integer;
   Ev: TEPoll_Event;
   Len: TSockLen;
+  Bound: Boolean;
 begin
   inherited Create;
   // Before anything can raise: the destructor closes every fd >= 0, and
@@ -454,6 +462,9 @@ begin
   FEpFd := -1;
   FWakeFd := -1;
   FPosts := TWSPostQueue.Create;
+  // Validated before any fd exists: a bad literal fails the constructor
+  // with nothing to clean up.
+  Bind := WSParseBindAddress(ABindAddress);
   // Resolve and validate the whole TLS policy, and load the identity,
   // before the listener takes a port: a bad watermark or an unreadable
   // PKCS#12 must fail the constructor, not the first handshake.
@@ -473,24 +484,52 @@ begin
   if (FTlsContext <> nil) and (FTlsPolicy.InputHighWater < FTlsReadLen) then
     FTlsReadLen := FTlsPolicy.InputHighWater;
 
-  FListenFd := fpSocket(AF_INET, SOCK_STREAM, 0);
+  if Bind.Family = wbfInet6 then Family := AF_INET6 else Family := AF_INET;
+  FListenFd := fpSocket(Family, SOCK_STREAM, 0);
   if FListenFd < 0 then raise Exception.Create('socket() failed');
   One := 1;
   fpSetSockOpt(FListenFd, SOL_SOCKET, SO_REUSEADDR, @One, SizeOf(One));
 
-  FillChar(SA, SizeOf(SA), 0);
-  SA.sin_family := AF_INET;
-  SA.sin_port := htons(APort);
-  SA.sin_addr.s_addr := 0; // INADDR_ANY
-  if fpBind(FListenFd, @SA, SizeOf(SA)) <> 0 then
-    raise Exception.CreateFmt('bind to port %d failed', [APort]);
+  // Accept never interprets the peer address (fpAccept with nil), so
+  // the family only has to be right here and in the getsockname below.
+  if Bind.Family = wbfInet6 then
+  begin
+    FillChar(SA6, SizeOf(SA6), 0);
+    SA6.sin6_family := AF_INET6;
+    SA6.sin6_port := htons(APort);
+    Move(Bind.Bytes[0], SA6.sin6_addr, 16);
+    Bound := fpBind(FListenFd, @SA6, SizeOf(SA6)) = 0;
+  end
+  else
+  begin
+    FillChar(SA, SizeOf(SA), 0);
+    SA.sin_family := AF_INET;
+    SA.sin_port := htons(APort);
+    Move(Bind.Bytes[0], SA.sin_addr, 4); // all zero = INADDR_ANY
+    Bound := fpBind(FListenFd, @SA, SizeOf(SA)) = 0;
+  end;
+  if not Bound then
+  begin
+    if Bind.Family = wbfAny then
+      raise Exception.CreateFmt('bind to port %d failed', [APort]);
+    raise Exception.CreateFmt('bind to %s port %d failed', [Bind.Text, APort]);
+  end;
   if fpListen(FListenFd, 511) <> 0 then
     raise Exception.Create('listen() failed');
 
   // Port 0 = kernel-assigned; read back what we actually got.
-  Len := SizeOf(SA);
-  fpGetSockName(FListenFd, @SA, @Len);
-  SetPort(ntohs(SA.sin_port));
+  if Bind.Family = wbfInet6 then
+  begin
+    Len := SizeOf(SA6);
+    fpGetSockName(FListenFd, @SA6, @Len);
+    SetPort(ntohs(SA6.sin6_port));
+  end
+  else
+  begin
+    Len := SizeOf(SA);
+    fpGetSockName(FListenFd, @SA, @Len);
+    SetPort(ntohs(SA.sin_port));
+  end;
 
   SetNonBlocking(FListenFd);
 

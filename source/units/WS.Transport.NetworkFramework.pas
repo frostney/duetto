@@ -104,7 +104,12 @@ type
     procedure ConnFinalized(AConn: TWSNwConn);
     procedure PostDone;
   public
-    constructor Create(APort: Word; const ATls: TWSTransportTls);
+    // ABindAddress: '' = every interface; an IPv4 or IPv6 literal binds
+    // that address as the listener's local endpoint (see
+    // WSParseBindAddress, which raises on anything else — nw_endpoint
+    // would happily resolve a hostname, so it is never handed one).
+    constructor Create(APort: Word; const ATls: TWSTransportTls;
+      const ABindAddress: string = '');
     destructor Destroy; override;
     procedure Run(ATimeoutMs: Integer = -1); override;
     procedure Stop; override;
@@ -177,6 +182,10 @@ procedure Nw_tcp_options_set_no_delay(AOptions: Pointer;
 
 function Nw_listener_create_with_port(APort: PAnsiChar;
   AParams: Pointer): Pointer; cdecl; external name 'nw_listener_create_with_port';
+function Nw_listener_create(AParams: Pointer): Pointer; cdecl; external name 'nw_listener_create';
+function Nw_endpoint_create_host(AHostname, APort: PAnsiChar): Pointer; cdecl; external name 'nw_endpoint_create_host';
+procedure Nw_parameters_set_local_endpoint(AParams,
+  AEndpoint: Pointer); cdecl; external name 'nw_parameters_set_local_endpoint';
 procedure Nw_listener_set_queue(AListener, AQueue: Pointer); cdecl; external name 'nw_listener_set_queue';
 procedure Nw_listener_set_state_changed_handler(AListener,
   ABlock: Pointer); cdecl; external name 'nw_listener_set_state_changed_handler';
@@ -559,10 +568,11 @@ end;
 // ---------------------------------------------------------------------------
 
 constructor TWSNetworkFrameworkTransport.Create(APort: Word;
-  const ATls: TWSTransportTls);
+  const ATls: TWSTransportTls; const ABindAddress: string);
 var
-  TlsBlock: Pointer;
-  PortStr: AnsiString;
+  Bind: TWSBindAddress;
+  TlsBlock, Endpoint: Pointer;
+  PortStr, HostStr: AnsiString;
 begin
   inherited Create;
   // GCD callbacks allocate on their own threads; the heap must already
@@ -574,6 +584,11 @@ begin
   FListenerDoneSem := Dispatch_semaphore_create(0);
   FLiveLock := TCriticalSection.Create;
   FListenerQueue := Dispatch_queue_create('org.duetto.listener', nil);
+
+  // Validated before any nw object exists (but after the semaphores and
+  // the lock, which the destructor releases unconditionally): a bad
+  // literal fails the constructor with nothing else to unwind.
+  Bind := WSParseBindAddress(ABindAddress);
 
   if ATls.Enabled then
   begin
@@ -588,9 +603,25 @@ begin
   Nw_parameters_set_reuse_local_address(FParams, True);
 
   PortStr := AnsiString(IntToStr(APort));
-  FListener := Nw_listener_create_with_port(PAnsiChar(PortStr), FParams);
+  if Bind.Family = wbfAny then
+    FListener := Nw_listener_create_with_port(PAnsiChar(PortStr), FParams)
+  else
+  begin
+    // A specific interface: pin the listener's local endpoint. The
+    // literal was validated above, so nw_endpoint_create_host gets an
+    // address it can use without resolution. The parameters retain the
+    // endpoint; our reference goes straight back.
+    HostStr := AnsiString(Bind.Text);
+    Endpoint := Nw_endpoint_create_host(PAnsiChar(HostStr), PAnsiChar(PortStr));
+    if Endpoint = nil then
+      raise Exception.CreateFmt('nw_endpoint_create_host failed for %s',
+        [Bind.Text]);
+    Nw_parameters_set_local_endpoint(FParams, Endpoint);
+    Nw_release(Endpoint);
+    FListener := Nw_listener_create(FParams);
+  end;
   if FListener = nil then
-    raise Exception.Create('nw_listener_create_with_port failed');
+    raise Exception.Create('nw_listener_create failed');
   Nw_listener_set_queue(FListener, FListenerQueue);
   Nw_listener_set_state_changed_handler(FListener,
     MakeBlock(FListenerStateBlock, @ListenerStateInvoke, Self));
@@ -601,7 +632,12 @@ begin
   Dispatch_semaphore_wait(FReadySem,
     Dispatch_time(0, ListenerReadyTimeoutSeconds * NsPerSecond));
   if FListenerState <> NW_LISTENER_STATE_READY then
-    raise Exception.CreateFmt('listener failed to bind port %d', [APort]);
+  begin
+    if Bind.Family = wbfAny then
+      raise Exception.CreateFmt('listener failed to bind port %d', [APort]);
+    raise Exception.CreateFmt('listener failed to bind %s port %d',
+      [Bind.Text, APort]);
+  end;
 end;
 
 destructor TWSNetworkFrameworkTransport.Destroy;

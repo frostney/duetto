@@ -8,6 +8,9 @@ unit WS.Server;
 // "handshaking" to "open". A well-formed non-upgrade request may
 // instead be answered by the host via OnPlainRequest (single-shot,
 // then close); with the hook unset it is refused exactly as before.
+// Between parse and answer of a valid upgrade the host may veto it via
+// OnUpgradeRequest (403, then close); with that hook unset every
+// well-formed upgrade is accepted exactly as before.
 //
 // Concurrency (ADR-0003): callbacks fire on the transport's execution
 // context — the Run thread on Linux (epoll) and Windows (IOCP),
@@ -160,6 +163,22 @@ type
     const ARawRequest: RawByteString;
     out AResponse: RawByteString): Boolean of object;
 
+  // Veto point on the opening handshake (see TWSServer.OnUpgradeRequest).
+  // AHS is the request as parsed by WS.Handshake — Path, Host, Origin,
+  // Protocols and the negotiated Deflate are filled; ARawRequest is
+  // exactly this request's header block (request line through the
+  // terminating blank line) and nothing pipelined behind it, so any
+  // other header can be read with WS.Handshake.HeaderValue. Return True
+  // to accept: the 101 follows and OnOpen fires as usual. Return False
+  // to refuse: the server writes a 403 carrying AReason as its body
+  // ('forbidden' when AReason is left empty) and closes the connection;
+  // OnOpen and OnClientClose never fire for it. An exception escaping
+  // the hook is swallowed and treated as False — one misbehaving
+  // handler must not leak the connection or take down the transport's
+  // execution context.
+  TWSUpgradeRequestEvent = function(const AHS: TWSServerHandshake;
+    const ARawRequest: RawByteString; out AReason: string): Boolean of object;
+
   TWSServer = class
   private
     FTransport: TWSTransport;
@@ -171,6 +190,7 @@ type
     FOnMessage: TWSServerMessage;
     FOnOpen, FOnClose: TWSServerNotify;
     FOnPlainRequest: TWSPlainRequestEvent;
+    FOnUpgradeRequest: TWSUpgradeRequestEvent;
 
     procedure RegistryAdd(AConn: TWSConnection);
     procedure RegistryRemove(AConn: TWSConnection);
@@ -199,11 +219,20 @@ type
     procedure HandlePost(ATConn: TWSTransportConn; AData: Pointer);
     function GetPort: Word;
   public
+    // ABindAddress selects the listening interface: '' (the default)
+    // binds every interface exactly as before; an IPv4 dotted-quad
+    // ('127.0.0.1') or an IPv6 literal without brackets ('::1') binds
+    // that one address, choosing the socket family from the literal.
+    // Anything else — a hostname, brackets, a zone id — raises here
+    // with a message naming the address; names are never resolved.
+    // Port 0 still means kernel-assigned, read back through Port.
     constructor Create(APort: Word; AAllowDeflate: Boolean = True;
-      AMaxMessage: NativeInt = 16 * 1024 * 1024); overload;
+      AMaxMessage: NativeInt = 16 * 1024 * 1024;
+      const ABindAddress: string = ''); overload;
     constructor Create(APort: Word; const ATls: TWSTransportTls;
       AAllowDeflate: Boolean = True;
-      AMaxMessage: NativeInt = 16 * 1024 * 1024); overload;
+      AMaxMessage: NativeInt = 16 * 1024 * 1024;
+      const ABindAddress: string = ''); overload;
     destructor Destroy; override;
 
     // Blocks. ATimeoutMs >= 0 returns after one completion round (test
@@ -229,6 +258,17 @@ type
     // already decrypted, exactly like handshake bytes.
     property OnPlainRequest: TWSPlainRequestEvent
       read FOnPlainRequest write FOnPlainRequest;
+    // Opt-in handshake veto: fired for every well-formed upgrade request
+    // after WS.Handshake accepted it and before the 101 is queued — the
+    // place for Origin allow-lists, identity headers and the like.
+    // Malformed requests never reach it (they get the standard 400 or,
+    // when eligible, OnPlainRequest). Unset = accept everything,
+    // unchanged behaviour. Fires on the connection's execution context
+    // like every other callback (ADR-0003): the Run thread on
+    // Linux/Windows, the connection's dispatch queue on macOS. On a TLS
+    // listener the request arrives already decrypted.
+    property OnUpgradeRequest: TWSUpgradeRequestEvent
+      read FOnUpgradeRequest write FOnUpgradeRequest;
   end;
 
 {$endif}
@@ -331,26 +371,26 @@ end;
 { TWSServer }
 
 constructor TWSServer.Create(APort: Word; AAllowDeflate: Boolean;
-  AMaxMessage: NativeInt);
+  AMaxMessage: NativeInt; const ABindAddress: string);
 begin
-  Create(APort, WSTransportNoTls, AAllowDeflate, AMaxMessage);
+  Create(APort, WSTransportNoTls, AAllowDeflate, AMaxMessage, ABindAddress);
 end;
 
 constructor TWSServer.Create(APort: Word; const ATls: TWSTransportTls;
-  AAllowDeflate: Boolean; AMaxMessage: NativeInt);
+  AAllowDeflate: Boolean; AMaxMessage: NativeInt; const ABindAddress: string);
 begin
   inherited Create;
   FAllowDeflate := AAllowDeflate;
   FMaxMessage := AMaxMessage;
   FLock := TCriticalSection.Create;
   {$ifdef LINUX}
-  FTransport := TWSEpollTransport.Create(APort, ATls);
+  FTransport := TWSEpollTransport.Create(APort, ATls, ABindAddress);
   {$endif}
   {$ifdef DARWIN}
-  FTransport := TWSNetworkFrameworkTransport.Create(APort, ATls);
+  FTransport := TWSNetworkFrameworkTransport.Create(APort, ATls, ABindAddress);
   {$endif}
   {$ifdef WINDOWS}
-  FTransport := TWSIocpTransport.Create(APort, ATls);
+  FTransport := TWSIocpTransport.Create(APort, ATls, ABindAddress);
   {$endif}
   FTransport.OnAccept := HandleAccept;
   FTransport.OnData := HandleData;
@@ -525,7 +565,8 @@ function TWSServer.FinishHandshake(AConn: TWSConnection;
 var
   HS: TWSServerHandshake;
   Resp, HdrBlock: RawByteString;
-  Answered: Boolean;
+  Reason: string;
+  Answered, Accepted: Boolean;
 begin
   Result := False;
   // Parse THIS request only. AHdrEnd is the offset just past the
@@ -580,6 +621,26 @@ begin
     Resp := ServerBuildReject(400, HS.Failure);
     AConn.FTConn.SubmitSend(@Resp[1], Length(Resp)); // best effort
     Exit(DropConn(AConn));
+  end;
+
+  if Assigned(FOnUpgradeRequest) then
+  begin
+    try
+      Accepted := FOnUpgradeRequest(HS, HdrBlock, Reason);
+    except
+      // A raising hook is a refusal, swallowed here — the same reasoning
+      // as OnPlainRequest above: an escaping exception would leave the
+      // connection half-built and take the execution context with it.
+      Accepted := False;
+    end;
+    if not Accepted then
+    begin
+      if Reason = '' then Reason := 'forbidden';
+      Resp := ServerBuildReject(403, Reason);
+      AConn.FTConn.SubmitSend(@Resp[1], Length(Resp)); // best effort
+      // Still wcsHandshake: no OnOpen ever fired, so no OnClientClose.
+      Exit(DropConn(AConn));
+    end;
   end;
 
   AConn.FProto := TWSProtocol.Create(wsrServer, HS.Deflate, FMaxMessage);
