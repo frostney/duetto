@@ -28,6 +28,7 @@ type
     Key: string;
     Version: Integer;
     Protocols: string;          // raw Sec-WebSocket-Protocol value (app decides)
+    Origin: string;             // raw Origin value ('' when absent; app decides)
     Deflate: TWSDeflateParams;  // negotiated result (Enabled=False if none)
     Failure: string;            // set when parse returns False
   end;
@@ -38,6 +39,14 @@ function HandshakeFindEnd(ABuf: PByte; ALen: Integer): Integer; overload;
 function HandshakeFindEnd(const S: RawByteString): Integer; overload;
 
 function ComputeAccept(const AKey: string): string;
+
+// Collect every value of header AName (case-insensitive) from a raw
+// header block, joined with ', ' — RFC 7230 list semantics. Exported so
+// OnUpgradeRequest consumers can query arbitrary headers of the raw
+// request block without a second HTTP parser. Scanning stops at the
+// first empty line: whatever follows the header block is a body or a
+// pipelined request, never a header of this message.
+function HeaderValue(const ARaw, AName: string): string;
 
 // --- server role ---------------------------------------------------------
 function ServerParseRequest(const ARaw: RawByteString; AAllowDeflate: Boolean;
@@ -231,6 +240,10 @@ begin
       if (Line <> '') and (Line[Length(Line)] = #13) then
         SetLength(Line, Length(Line) - 1);
       LineStart := I + 1;
+      // The blank line terminates the header block. Bytes past it are a
+      // body or a pipelined request; folding them in would let a second
+      // message contribute headers to this one.
+      if Line = '' then Exit;
       Colon := Pos(':', Line);
       if Colon > 0 then
       begin
@@ -400,12 +413,12 @@ end;
 // 7230 list folding). Replaces seven full-request rescans on the
 // connection-setup path.
 const
-  SRV_HDR_NAMES: array[0..6] of string = (
+  SRV_HDR_NAMES: array[0..7] of string = (
     'Upgrade', 'Connection', 'Sec-WebSocket-Version', 'Sec-WebSocket-Key',
-    'Host', 'Sec-WebSocket-Protocol', 'Sec-WebSocket-Extensions');
+    'Host', 'Sec-WebSocket-Protocol', 'Sec-WebSocket-Extensions', 'Origin');
 
 type
-  TSrvHeaders = array[0..6] of string;
+  TSrvHeaders = array[0..7] of string;
 
 function NameIsCI(P: PAnsiChar; L: Integer; const N: string): Boolean;
 var
@@ -443,7 +456,10 @@ begin
     LineEnd := P;
     if P < PEnd then Inc(P); // past the LF
     if (LineEnd > LineStart) and ((LineEnd - 1)^ = #13) then Dec(LineEnd);
-    if LineEnd = LineStart then Continue; // blank line (end of headers)
+    // The blank line ends this message's headers. Stop rather than skip:
+    // a pipelined follow-up request sits right behind it and its headers
+    // are not ours to collect, whatever the caller handed us.
+    if LineEnd = LineStart then Break;
     Colon := LineStart;
     while (Colon < LineEnd) and (Colon^ <> ':') do Inc(Colon);
     if Colon = LineEnd then Continue;
@@ -528,6 +544,7 @@ begin
 
   AHS.Host := H[4];
   AHS.Protocols := H[5];
+  AHS.Origin := H[7];
 
   if AAllowDeflate then
     NegotiateDeflate(H[6], AHS.Deflate);
@@ -573,6 +590,7 @@ var
 begin
   case ACode of
     400: StatusText := 'Bad Request';
+    403: StatusText := 'Forbidden';
     426: StatusText := 'Upgrade Required';
   else
     StatusText := 'Error';

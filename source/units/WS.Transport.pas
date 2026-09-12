@@ -78,6 +78,17 @@ type
     Pkcs12Passphrase: string;
   end;
 
+  // A parsed listener bind address (see WSParseBindAddress). wbfAny is
+  // the empty string — every interface, exactly as before the option
+  // existed. The other two carry the literal's bytes in network order:
+  // 4 significant for wbfInet4, 16 for wbfInet6.
+  TWSBindFamily = (wbfAny, wbfInet4, wbfInet6);
+  TWSBindAddress = record
+    Family: TWSBindFamily;
+    Text: string;                 // the literal as given ('' for wbfAny)
+    Bytes: array[0..15] of Byte;
+  end;
+
   TWSTransport = class
   private
     FPort: Word;
@@ -122,13 +133,164 @@ type
 
 function WSTransportNoTls: TWSTransportTls;
 
+// Accepts '' (all interfaces), an IPv4 dotted-quad ('127.0.0.1') or an
+// IPv6 literal without brackets ('::1', '2001:db8::1', '::ffff:1.2.3.4').
+// Anything else — a hostname, brackets, a zone id, garbage — raises an
+// Exception naming the input. Never resolves names: a listener's bind
+// address is a policy decision and DNS must not get a vote in it.
+// Pure string work shared by every transport so the three platforms
+// agree byte for byte on what is and is not a literal.
+function WSParseBindAddress(const AText: string): TWSBindAddress;
+
 implementation
+
+uses
+  SysUtils;
 
 function WSTransportNoTls: TWSTransportTls;
 begin
   Result.Enabled := False;
   Result.Pkcs12Path := '';
   Result.Pkcs12Passphrase := '';
+end;
+
+// --- bind-address literals -------------------------------------------------
+
+// Strict dotted-quad: exactly four decimal fields of 1..3 digits, each
+// 0..255. No octal, no hex, no shorthand ('127.1'), no whitespace.
+function TryParseInet4(const S: string; P: PByte): Boolean;
+var
+  I, Field, Value, Digits: Integer;
+begin
+  Result := False;
+  Field := 0;
+  Value := 0;
+  Digits := 0;
+  for I := 1 to Length(S) do
+    case S[I] of
+      '0'..'9':
+        begin
+          Value := Value * 10 + (Ord(S[I]) - Ord('0'));
+          Inc(Digits);
+          if (Digits > 3) or (Value > 255) then Exit;
+        end;
+      '.':
+        begin
+          if (Digits = 0) or (Field = 3) then Exit;
+          P[Field] := Value;
+          Inc(Field);
+          Value := 0;
+          Digits := 0;
+        end;
+    else
+      Exit;
+    end;
+  if (Field <> 3) or (Digits = 0) then Exit;
+  P[3] := Value;
+  Result := True;
+end;
+
+// One colon-separated run of IPv6 groups into P (2 bytes per group);
+// the last group may be an embedded dotted-quad (two groups' worth).
+// AGroups returns how many 16-bit groups were consumed.
+function ParseInet6Run(const S: string; P: PByte; out AGroups: Integer): Boolean;
+var
+  Rest, Item: string;
+  Colon, I, Value: Integer;
+begin
+  Result := False;
+  AGroups := 0;
+  if S = '' then Exit(True);
+  Rest := S;
+  repeat
+    Colon := Pos(':', Rest);
+    if Colon = 0 then
+    begin
+      Item := Rest;
+      Rest := '';
+    end
+    else
+    begin
+      Item := Copy(Rest, 1, Colon - 1);
+      Rest := Copy(Rest, Colon + 1, MaxInt);
+      if Rest = '' then Exit; // trailing single colon
+    end;
+    if Item = '' then Exit;
+    if AGroups > 7 then Exit;
+    if (Pos('.', Item) > 0) then
+    begin
+      // Embedded IPv4 is legal only as the final two groups.
+      if (Rest <> '') or (AGroups > 6) then Exit;
+      if not TryParseInet4(Item, P + AGroups * 2) then Exit;
+      Inc(AGroups, 2);
+      Exit(True);
+    end;
+    if Length(Item) > 4 then Exit;
+    Value := 0;
+    for I := 1 to Length(Item) do
+      case Item[I] of
+        '0'..'9': Value := Value * 16 + (Ord(Item[I]) - Ord('0'));
+        'a'..'f': Value := Value * 16 + (Ord(Item[I]) - Ord('a') + 10);
+        'A'..'F': Value := Value * 16 + (Ord(Item[I]) - Ord('A') + 10);
+      else
+        Exit;
+      end;
+    P[AGroups * 2] := Value shr 8;
+    P[AGroups * 2 + 1] := Value and $FF;
+    Inc(AGroups);
+  until Rest = '';
+  Result := True;
+end;
+
+// RFC 4291 §2.2 text forms: eight hex groups, at most one '::' standing
+// in for a run of zero groups, an optional trailing dotted-quad. Brackets
+// and zone ids ('%en0') are rejected — a listener address is a plain
+// literal, not a URL host component.
+function TryParseInet6(const S: string; P: PByte): Boolean;
+var
+  Gap: Integer;
+  Head, Tail: string;
+  HeadBytes, TailBytes: array[0..15] of Byte;
+  HeadGroups, TailGroups: Integer;
+begin
+  Result := False;
+  if Pos(':', S) = 0 then Exit;
+  FillChar(HeadBytes, SizeOf(HeadBytes), 0);
+  FillChar(TailBytes, SizeOf(TailBytes), 0);
+  Gap := Pos('::', S);
+  if Gap = 0 then
+  begin
+    if not ParseInet6Run(S, @HeadBytes[0], HeadGroups) then Exit;
+    if HeadGroups <> 8 then Exit;
+    Move(HeadBytes[0], P^, 16);
+    Exit(True);
+  end;
+  Head := Copy(S, 1, Gap - 1);
+  Tail := Copy(S, Gap + 2, MaxInt);
+  if Pos('::', Tail) > 0 then Exit; // a second '::' is ambiguous
+  if not ParseInet6Run(Head, @HeadBytes[0], HeadGroups) then Exit;
+  if not ParseInet6Run(Tail, @TailBytes[0], TailGroups) then Exit;
+  if HeadGroups + TailGroups > 7 then Exit; // '::' must cover >= 1 group
+  FillChar(P^, 16, 0);
+  Move(HeadBytes[0], P^, HeadGroups * 2);
+  Move(TailBytes[0], (P + 16 - TailGroups * 2)^, TailGroups * 2);
+  Result := True;
+end;
+
+function WSParseBindAddress(const AText: string): TWSBindAddress;
+begin
+  Result.Family := wbfAny;
+  Result.Text := AText;
+  FillChar(Result.Bytes, SizeOf(Result.Bytes), 0);
+  if AText = '' then Exit;
+  if TryParseInet4(AText, @Result.Bytes[0]) then
+    Result.Family := wbfInet4
+  else if TryParseInet6(AText, @Result.Bytes[0]) then
+    Result.Family := wbfInet6
+  else
+    raise Exception.CreateFmt(
+      'bind address ''%s'' is not an IPv4 or IPv6 literal (hostnames are ' +
+      'never resolved)', [AText]);
 end;
 
 procedure TWSTransport.Open;

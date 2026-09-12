@@ -5,7 +5,10 @@
   ClientBuildRequest -> ServerParseRequest -> ServerBuildResponse ->
   ClientParseResponse, with the permessage-deflate negotiation matrix
   (plain offer, parameterised offers, junk offer recovery, unknown
-  extensions ignored, unoffered server selection rejected). }
+  extensions ignored, unoffered server selection rejected). Plus what
+  TWSServer.OnUpgradeRequest is built on: the Origin header parsed
+  alongside Host (empty when absent), the exported HeaderValue's list
+  join and blank-line stop, and the byte-exact 403 refusal. }
 
 program WS.Handshake.Test;
 
@@ -44,6 +47,16 @@ type
     procedure TestCaseAndTokenLists;
     procedure TestRejectionMatrix;
     procedure TestFindEnd;
+  end;
+
+  TUpgradeHookHelpers = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestOriginParsed;
+    procedure TestOriginAbsent;
+    procedure TestHeaderValueStopsAtBlankLine;
+    procedure TestHeaderValueJoinsRepeats;
+    procedure TestForbiddenGoldenBytes;
   end;
 
   TClientRole = class(TTestSuite)
@@ -100,6 +113,7 @@ begin
   Expect<string>(HS.Key).ToBe('dGhlIHNhbXBsZSBub25jZQ==');
   Expect<Integer>(HS.Version).ToBe(13);
   Expect<string>(HS.Protocols).ToBe('chat, superchat');
+  Expect<string>(HS.Origin).ToBe('http://example.com');
   Expect<Boolean>(HS.Deflate.Enabled).ToBe(False);
 end;
 
@@ -165,6 +179,73 @@ begin
   S := S + 'EXTRA BYTES AFTER';
   Expect<Integer>(HandshakeFindEnd(PByte(PAnsiChar(S)), Length(S)))
     .ToBe(Length(S) - Length('EXTRA BYTES AFTER'));
+end;
+
+{ ───────── OnUpgradeRequest helpers ───────── }
+
+// Origin rides the same single header walk as Host: case-insensitive
+// name, value trimmed, verbatim otherwise (the hook decides what it means).
+procedure TUpgradeHookHelpers.TestOriginParsed;
+var
+  HS: TWSServerHandshake;
+begin
+  Expect<Boolean>(ServerParseRequest(RFCRequest, False, HS)).ToBe(True);
+  Expect<string>(HS.Origin).ToBe('http://example.com');
+  Expect<Boolean>(ServerParseRequest(
+    StringReplace(RFCRequest, 'Origin: http://example.com',
+      'origin:   https://App.Example:8443  ', []), False, HS)).ToBe(True);
+  Expect<string>(HS.Origin).ToBe('https://App.Example:8443');
+end;
+
+// No Origin header (non-browser clients) is the empty string, not a
+// failure: whether that is acceptable is the hook's call.
+procedure TUpgradeHookHelpers.TestOriginAbsent;
+var
+  HS: TWSServerHandshake;
+begin
+  Expect<Boolean>(ServerParseRequest(MakeRequest(''), False, HS)).ToBe(True);
+  Expect<string>(HS.Origin).ToBe('');
+end;
+
+// OnUpgradeRequest hands the hook one header block and points it at
+// HeaderValue; that helper must not read past the blank line either.
+procedure TUpgradeHookHelpers.TestHeaderValueStopsAtBlankLine;
+var
+  Raw: string;
+begin
+  Raw :=
+    'GET /one HTTP/1.1' + CRLF + 'X-Tag: first' + CRLF + CRLF +
+    'GET /two HTTP/1.1' + CRLF + 'X-Tag: second' + CRLF + CRLF;
+  Expect<string>(HeaderValue(Raw, 'X-Tag')).ToBe('first');
+  // A body is equally out of bounds, even one that looks like a header.
+  Raw :=
+    'POST / HTTP/1.1' + CRLF + 'Content-Length: 14' + CRLF + CRLF +
+    'X-Tag: inbody' + CRLF;
+  Expect<string>(HeaderValue(Raw, 'X-Tag')).ToBe('');
+end;
+
+// RFC 7230 list semantics: repeats inside one block join with ', '.
+procedure TUpgradeHookHelpers.TestHeaderValueJoinsRepeats;
+var
+  Raw: string;
+begin
+  Raw :=
+    'GET / HTTP/1.1' + CRLF + 'Accept: text/html' + CRLF +
+    'accept: text/plain' + CRLF + CRLF;
+  Expect<string>(HeaderValue(Raw, 'Accept')).ToBe('text/html, text/plain');
+  Expect<string>(HeaderValue(Raw, 'X-Absent')).ToBe('');
+end;
+
+// The hook's refusal on the wire: pinned byte for byte so a False
+// return and a raising hook stay indistinguishable to the client.
+procedure TUpgradeHookHelpers.TestForbiddenGoldenBytes;
+begin
+  Expect<string>(string(ServerBuildReject(403, 'origin not allowed'))).ToBe(
+    'HTTP/1.1 403 Forbidden' + CRLF +
+    'Connection: close' + CRLF +
+    'Content-Length: 18' + CRLF +
+    'Content-Type: text/plain' + CRLF + CRLF +
+    'origin not allowed');
 end;
 
 { ───────── client role ───────── }
@@ -308,6 +389,15 @@ begin
   Test('HandshakeFindEnd partial/exact/overrun', TestFindEnd);
 end;
 
+procedure TUpgradeHookHelpers.SetupTests;
+begin
+  Test('Origin parsed alongside Host',          TestOriginParsed);
+  Test('absent Origin is the empty string',      TestOriginAbsent);
+  Test('HeaderValue stops at the blank line',    TestHeaderValueStopsAtBlankLine);
+  Test('HeaderValue joins repeats with '', ''',  TestHeaderValueJoinsRepeats);
+  Test('403 refusal is byte-identical',          TestForbiddenGoldenBytes);
+end;
+
 procedure TClientRole.SetupTests;
 begin
   Test('generated key: 16 bytes, non-repeating', TestKeyShape);
@@ -329,6 +419,7 @@ end;
 begin
   TestRunnerProgram.AddSuite(TAcceptVector.Create('Handshake: accept'));
   TestRunnerProgram.AddSuite(TServerParse.Create('Handshake: server parse'));
+  TestRunnerProgram.AddSuite(TUpgradeHookHelpers.Create('Handshake: upgrade hook helpers'));
   TestRunnerProgram.AddSuite(TClientRole.Create('Handshake: client role'));
   TestRunnerProgram.AddSuite(TDeflateNegotiation.Create('Handshake: deflate negotiation'));
   TestRunnerProgram.Run;
