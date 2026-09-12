@@ -48,6 +48,7 @@ type
     Key: string;
     Version: Integer;
     Protocols: string;          // raw Sec-WebSocket-Protocol value (app decides)
+    Origin: string;             // raw Origin value ('' when absent; app decides)
     Deflate: TWSDeflateParams;  // negotiated result (Enabled=False if none)
     Kind: TWSRequestKind;       // classification (valid even when parse fails)
     Failure: string;            // set when parse returns False
@@ -62,8 +63,9 @@ function ComputeAccept(const AKey: string): string;
 
 // Collect every value of header AName (case-insensitive) from a raw
 // header block, joined with ', ' — RFC 7230 list semantics. Exported so
-// OnPlainRequest consumers can query arbitrary headers of the raw
-// request block without a second HTTP parser. Scanning stops at the
+// OnPlainRequest / OnUpgradeRequest consumers can query arbitrary
+// headers of the raw request block without a second HTTP parser — the
+// same walk the server's own parse uses. Scanning stops at the
 // first empty line: whatever follows the header block is a body or a
 // pipelined request, never a header of this message.
 function HeaderValue(const ARaw, AName: string): string;
@@ -445,12 +447,13 @@ const
   ShiExtensions = 6;
   ShiContentLength = 7;
   ShiTransferEncoding = 8;
-  SrvHdrCount = 9;
+  ShiOrigin = 9;
+  SrvHdrCount = 10;
 
   SRV_HDR_NAMES: array[0..SrvHdrCount - 1] of string = (
     'Upgrade', 'Connection', 'Sec-WebSocket-Version', 'Sec-WebSocket-Key',
     'Host', 'Sec-WebSocket-Protocol', 'Sec-WebSocket-Extensions',
-    'Content-Length', 'Transfer-Encoding');
+    'Content-Length', 'Transfer-Encoding', 'Origin');
 
 type
   // Seen records that the header NAME appeared, independently of Value:
@@ -641,6 +644,7 @@ begin
   end;
 
   AHS.Protocols := H[ShiProtocol].Value;
+  AHS.Origin := H[ShiOrigin].Value;
 
   if AAllowDeflate then
     NegotiateDeflate(H[ShiExtensions].Value, AHS.Deflate);
@@ -686,6 +690,7 @@ var
 begin
   case ACode of
     400: StatusText := 'Bad Request';
+    403: StatusText := 'Forbidden';
     426: StatusText := 'Upgrade Required';
   else
     StatusText := 'Error';

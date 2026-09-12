@@ -132,7 +132,10 @@ type
     FAcceptSocket: TSocket;
     FCompletionPort: THandle;
     FAcceptOverlapped: TOverlapped;
-    FAcceptBuffer: array[0..(2 * (SizeOf(TSockAddrIn) + 16)) - 1] of Byte;
+    // AcceptEx demands room for two addresses of the listener's family
+    // plus 16 bytes each; sized for sockaddr_in6, which covers AF_INET
+    // too. The peer address is never interpreted (no receive prefix).
+    FAcceptBuffer: array[0..(2 * (SizeOf(TSockAddrIn6) + 16)) - 1] of Byte;
     FAcceptPending: Boolean;
     FOpen: Boolean;
     FRunning: Boolean;
@@ -140,6 +143,7 @@ type
     FShutdownDone: Boolean;
     FWinSockStarted: Boolean;
     FNextId: NativeUInt;
+    FFamily: Integer;          // AF_INET or AF_INET6, from the bind literal
     FLive: array of TWSIocpConn;
     FLiveCount: Integer;
     FPosts: TWSPostQueue;      // cross-thread SubmitPost hand-off
@@ -167,7 +171,11 @@ type
     procedure DeliverPosts(AChain: PWSPostNode; ADropped: Boolean);
     procedure SweepPosts;
   public
-    constructor Create(APort: Word; const ATls: TWSTransportTls);
+    // ABindAddress: '' = every interface; an IPv4 or IPv6 literal binds
+    // that address (family chosen from the literal; see
+    // WSParseBindAddress, which raises on anything else).
+    constructor Create(APort: Word; const ATls: TWSTransportTls;
+      const ABindAddress: string = '');
     destructor Destroy; override;
     procedure Run(ATimeoutMs: Integer = -1); override;
     procedure Stop; override;
@@ -199,7 +207,7 @@ const
   // exactly like the post drain does.
   SendReadyCompletionKey = PtrUInt(4);
   LiveTableGrowth = 64;
-  AcceptAddressLength = SizeOf(TSockAddrIn) + 16;
+  AcceptAddressLength = SizeOf(TSockAddrIn6) + 16;
   // Granularity of the TLS deadline sweep. Only ever shortens a wait
   // that would otherwise park, and only while at least one connection
   // carries a deadline — a plaintext listener never sees it.
@@ -638,17 +646,24 @@ end;
 { TWSIocpTransport }
 
 constructor TWSIocpTransport.Create(APort: Word;
-  const ATls: TWSTransportTls);
+  const ATls: TWSTransportTls; const ABindAddress: string);
 var
+  Bind: TWSBindAddress;
   Address: TSockAddrIn;
+  Address6: TSockAddrIn6;
   AddressLength: Integer;
   Data: TWSAData;
   One: Integer;
+  Bound: Boolean;
 begin
   inherited Create;
   FListenSocket := INVALID_SOCKET;
   FAcceptSocket := INVALID_SOCKET;
   FPosts := TWSPostQueue.Create;
+  // Validated before WinSock is even started: a bad literal fails the
+  // constructor with nothing to clean up.
+  Bind := WSParseBindAddress(ABindAddress);
+  if Bind.Family = wbfInet6 then FFamily := AF_INET6 else FFamily := AF_INET;
   // Resolve and validate the whole TLS policy, and load the identity,
   // before the listener takes a port: a bad watermark or an unreadable
   // PKCS#12 must fail the constructor, not the first handshake.
@@ -668,7 +683,7 @@ begin
     raise Exception.Create('WSAStartup failed');
   FWinSockStarted := True;
 
-  FListenSocket := C_WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP,
+  FListenSocket := C_WSASocketW(FFamily, SOCK_STREAM, IPPROTO_TCP,
     nil, 0, WSA_FLAG_OVERLAPPED);
   if FListenSocket = INVALID_SOCKET then
     raise Exception.CreateFmt('WSASocketW() failed (%d)', [WSAGetLastError]);
@@ -678,19 +693,48 @@ begin
   WinSock2.setsockopt(FListenSocket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
     @One, SizeOf(One));
 
-  FillChar(Address, SizeOf(Address), 0);
-  Address.sin_family := AF_INET;
-  Address.sin_port := htons(APort);
-  Address.sin_addr.S_addr := INADDR_ANY;
-  if WinSock2.bind(FListenSocket, @Address, SizeOf(Address)) <> 0 then
-    raise Exception.CreateFmt('bind to port %d failed (%d)', [APort, WSAGetLastError]);
+  if Bind.Family = wbfInet6 then
+  begin
+    FillChar(Address6, SizeOf(Address6), 0);
+    Address6.sin6_family := AF_INET6;
+    Address6.sin6_port := htons(APort);
+    Move(Bind.Bytes[0], Address6.sin6_addr, 16);
+    Bound := WinSock2.bind(FListenSocket, @Address6, SizeOf(Address6)) = 0;
+  end
+  else
+  begin
+    FillChar(Address, SizeOf(Address), 0);
+    Address.sin_family := AF_INET;
+    Address.sin_port := htons(APort);
+    Move(Bind.Bytes[0], Address.sin_addr, 4); // all zero = INADDR_ANY
+    Bound := WinSock2.bind(FListenSocket, @Address, SizeOf(Address)) = 0;
+  end;
+  if not Bound then
+  begin
+    if Bind.Family = wbfAny then
+      raise Exception.CreateFmt('bind to port %d failed (%d)',
+        [APort, WSAGetLastError]);
+    raise Exception.CreateFmt('bind to %s port %d failed (%d)',
+      [Bind.Text, APort, WSAGetLastError]);
+  end;
   if WinSock2.listen(FListenSocket, 511) <> 0 then
     raise Exception.CreateFmt('listen() failed (%d)', [WSAGetLastError]);
 
-  AddressLength := SizeOf(Address);
-  if WinSock2.getsockname(FListenSocket, Address, AddressLength) <> 0 then
-    raise Exception.CreateFmt('getsockname() failed (%d)', [WSAGetLastError]);
-  SetPort(ntohs(Address.sin_port));
+  if Bind.Family = wbfInet6 then
+  begin
+    AddressLength := SizeOf(Address6);
+    if WinSock2.getsockname(FListenSocket, PSockAddr(@Address6)^,
+        AddressLength) <> 0 then
+      raise Exception.CreateFmt('getsockname() failed (%d)', [WSAGetLastError]);
+    SetPort(ntohs(Address6.sin6_port));
+  end
+  else
+  begin
+    AddressLength := SizeOf(Address);
+    if WinSock2.getsockname(FListenSocket, Address, AddressLength) <> 0 then
+      raise Exception.CreateFmt('getsockname() failed (%d)', [WSAGetLastError]);
+    SetPort(ntohs(Address.sin_port));
+  end;
 
   FCompletionPort := C_CreateIoCompletionPort(THandle(FListenSocket), 0,
     ListenerCompletionKey, 1);
@@ -783,7 +827,8 @@ var
 begin
   if FStopping or FAcceptPending then Exit;
   repeat
-    FAcceptSocket := C_WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP,
+    // AcceptEx requires the accept socket to share the listener's family.
+    FAcceptSocket := C_WSASocketW(FFamily, SOCK_STREAM, IPPROTO_TCP,
       nil, 0, WSA_FLAG_OVERLAPPED);
     if FAcceptSocket = INVALID_SOCKET then
       raise Exception.Create('accept WSASocketW() failed');
