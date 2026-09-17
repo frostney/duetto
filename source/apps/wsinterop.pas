@@ -358,6 +358,7 @@ begin
   SrvT := TServerThread.Create(True);
   SrvT.Srv := TWSServer.Create(0, True); // port 0 = kernel-assigned
   SrvT.Srv.OnMessage := Echo.OnMsg;
+  SrvT.Srv.Start;
   Port := SrvT.Srv.Port;
   Url := Format('ws://127.0.0.1:%d/', [Port]);
   SrvT.Start;
@@ -463,6 +464,7 @@ begin
   HookSrvT.Srv.OnOpen := Gate.HandleOpen;
   HookSrvT.Srv.OnClientClose := Gate.HandleClose;
   HookSrvT.Srv.OnUpgradeRequest := Gate.Check;
+  HookSrvT.Srv.Start;
   HookPort := HookSrvT.Srv.Port;
   HookSrvT.Start;
   Check(HookPort <> 0, 'server bound to 127.0.0.1 resolves its port');

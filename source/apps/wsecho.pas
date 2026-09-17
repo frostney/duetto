@@ -116,6 +116,7 @@ begin
       Srv.OnMessage := Echo.OnMsg;
       if not QuietOpt.Present then
         Srv.OnOpen := Echo.OnOpen;
+      Srv.Start;
       WriteLn('listening on ', Srv.Port);
       Flush(Output);
       Srv.Run;

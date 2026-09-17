@@ -93,6 +93,7 @@ type
     FOnMessage: TWSServerMessage;
     FOnOpen, FOnClose: TWSServerNotify;
     FOnUpgradeRequest: TWSUpgradeRequestEvent;
+    FStarted: Boolean;
 
     procedure RegistryAdd(AConn: TWSConnection);
     procedure RegistryRemove(AConn: TWSConnection);
@@ -128,6 +129,11 @@ type
       AMaxMessage: NativeInt = 16 * 1024 * 1024;
       const ABindAddress: string = ''); overload;
     destructor Destroy; override;
+
+    // Opens the listening socket. Call after wiring OnUpgradeRequest
+    // (and the other callbacks) so a peer that connects during Create
+    // cannot race past an unset veto hook. Idempotent.
+    procedure Start;
 
     // Blocks. ATimeoutMs >= 0 returns after one completion round (test
     // use); -1 loops until Stop.
@@ -246,7 +252,14 @@ begin
   FTransport.OnData := HandleData;
   FTransport.OnSendReady := HandleSendReady;
   FTransport.OnClosed := HandleClosed;
+  FStarted := False;
+end;
+
+procedure TWSServer.Start;
+begin
+  if FStarted then Exit;
   FTransport.Open;
+  FStarted := True;
 end;
 
 destructor TWSServer.Destroy;
