@@ -411,6 +411,7 @@ begin
   Head := Copy(S, 1, Gap - 1);
   Tail := Copy(S, Gap + 2, MaxInt);
   if Pos('::', Tail) > 0 then Exit; // a second '::' is ambiguous
+  if Pos('.', Head) > 0 then Exit; // embedded IPv4 must end the literal
   if not ParseInet6Run(Head, @HeadBytes[0], HeadGroups) then Exit;
   if not ParseInet6Run(Tail, @TailBytes[0], TailGroups) then Exit;
   if HeadGroups + TailGroups > 7 then Exit; // '::' must cover >= 1 group

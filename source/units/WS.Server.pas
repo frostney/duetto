@@ -637,9 +637,20 @@ begin
     begin
       if Reason = '' then Reason := 'forbidden';
       Resp := ServerBuildReject(403, Reason);
-      AConn.FTConn.SubmitSend(@Resp[1], Length(Resp)); // best effort
+      // Same backpressure path as OnPlainRequest answers: queue the 403
+      // through the protocol out buffer and drop once it drains. A bare
+      // SubmitSend + DropConn can truncate under OnSendReady deferral.
+      AConn.FProto := TWSProtocol.Create(wsrServer, HS.Deflate, FMaxMessage);
+      AConn.FProto.QueueRaw(@Resp[1], Length(Resp));
+      AConn.FHsBuf := '';
+      AConn.FDropPending := True;
+      if FlushConn(AConn) then
+      begin
+        if AConn.FProto.OutPending = 0 then
+          DropConn(AConn);
+      end;
       // Still wcsHandshake: no OnOpen ever fired, so no OnClientClose.
-      Exit(DropConn(AConn));
+      Exit;
     end;
   end;
 

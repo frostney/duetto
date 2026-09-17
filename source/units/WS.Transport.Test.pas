@@ -60,7 +60,7 @@ end;
 const
   // Names (never resolved), URL host syntax (brackets, zone ids, ports),
   // IPv4 strictness, IPv6 strictness, and plain garbage.
-  RejectedLiterals: array[0..28] of string = (
+  RejectedLiterals: array[0..30] of string = (
     'localhost', 'example.com',
     '[::1]', '[]', 'fe80::1%en0', '127.0.0.1:80',
     '256.0.0.1', '1.2.3', '1.2.3.4.5', '1..2.3', '1.2.3.', '.1.2.3',
@@ -68,6 +68,7 @@ const
     '1:2:3:4:5:6:7', '1:2:3:4:5:6:7:8:9', '1::2::3', '1:2:3:4:5:6:7:8::',
     ':::', ':', ':1', '1:', '1::2:', '12345::', 'g::1', '::ffff:1.2.3',
     '::1.2.3.4:5', '1:2:3:4:5:6:7:1.2.3.4',
+    '1.2.3.4::', '1.2.3.4::1',
     'garbage');
 
 procedure TBindLiterals.ExpectLiteral(const AText: string;
