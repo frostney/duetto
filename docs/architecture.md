@@ -30,13 +30,13 @@ once on protocol failure, after queueing the appropriate close frame
 | `WS.Deflate` | RFC 7692 over paszlib: raw deflate, sync flush, 4-byte tail, context takeover control, inflate output cap |
 | `WS.Protocol` | the sans-I/O machine above |
 | `WS.Client` | blocking client, `ws://` and `wss://` (TLS via lwpt's TransportSecurity) |
-| `WS.Transport` | the completion-shaped transport contract (ADR-0001): submit sends/closes, receive data/lifecycle completions on the transport's execution context (ADR-0003) |
+| `WS.Transport` | the completion-shaped transport contract (ADR-0001): submit sends/closes, receive data/lifecycle completions on the transport's execution context (ADR-0003); also `WSParseBindAddress`, the strict IPv4/IPv6 literal parser every transport binds through (never a resolver) |
 | `WS.Transport.PostQueue` | thread-safe FIFO behind the reactor transports' `SubmitPost` (cross-thread `Conn.Post` hand-off); the Network.framework transport posts straight onto its per-connection GCD queues instead |
 | `WS.Transport.TlsServer` | platform-neutral per-connection server TLS over lwpt's memory-BIO accept API: handshake pump, accepted-prefix re-offer, input/output flow accounting, `close_notify` drain; used by the fd-owning transports only |
 | `WS.Transport.Epoll` | Linux transport: nonblocking sockets, one shared 256 KB read buffer, `EPOLLOUT` armed only while a connection has backlog; native `wss://` through `WS.Transport.TlsServer`, with the handshake deadline, the inbound pre-handshake budget and the `EPOLLIN` pause/resume owned by the reactor |
 | `WS.Transport.NetworkFramework` | macOS transport (ADR-0002): `nw_listener`/`nw_connection` C API, one serial dispatch queue per connection, native TLS via a PKCS#12 `SecIdentity` |
 | `WS.Transport.Iocp` | Windows transport: one completion-port thread, `AcceptEx`/`WSARecv`/`WSASend` always armed overlapped, copy-on-send, outstanding-operation pinning for deferred frees; native `wss://` (x64 and win32, via lwpt's SChannel accept — no OpenSSL on Windows) through `WS.Transport.TlsServer`, with the handshake deadline, the inbound pre-handshake budget and the `WSARecv` suppress/resume owned by the completion loop |
-| `WS.Server` | platform-neutral session layer: handshake accumulation, protocol wiring, flush/backpressure policy over the transport seam; `SendText`/`SendBinary` return False when the transport dropped (and freed) the connection mid-flush, and `Conn.Post` is the any-thread hand-off for server-driven pushes (ADR-0003 amendment) |
+| `WS.Server` | platform-neutral session layer: handshake accumulation, protocol wiring, flush/backpressure policy over the transport seam; `SendText`/`SendBinary` return False when the transport dropped (and freed) the connection mid-flush, and `Conn.Post` is the any-thread hand-off for server-driven pushes (ADR-0003 amendment); `OnUpgradeRequest` vetoes a parsed upgrade (403, then close — no `OnOpen`/`OnClientClose`) before the 101 is queued, and the constructors take an optional bind address (`''` = every interface; an IPv4 or IPv6 literal binds that one, no DNS) |
 
 Units higher in the table never depend on units lower down. The programs in
 `source/apps/` depend on the library, never the other way around.
@@ -52,13 +52,18 @@ Four nets, from innermost to outermost:
    asserting *wire* close codes for the violation matrix in both roles,
    and a `WS.Transport.PostQueue` suite covering FIFO order through
    drain, the stop rendezvous (pending handed back exactly once, pushes
-   refused afterwards), and per-producer order under contention, and a
-   `WS.Transport.TlsServer` suite covering the flow-control policy
+   refused afterwards), and per-producer order under contention, and a `WS.Transport.TlsServer` suite covering the flow-control policy
    (independent input/output capacities, low-water rules, defaults) and
-   the accepted-prefix carry buffer (order, re-offer, compaction).
+   the accepted-prefix carry buffer (order, re-offer, compaction), and a
+   `WS.Transport` suite pinning the bind-address literal parser (strict
+   dotted-quad, RFC 4291 IPv6 forms, and a rejection matrix that names
+   the offending input).
 2. **`wsinterop`**: own client ↔ own server over real TCP, plus raw-socket
    violations (unmasked frame → 1002, invalid close code → 1002, fragmented
-   ping → 1002, invalid UTF-8 → 1007), and — on Linux — a `wss://` section
+   ping → 1002, invalid UTF-8 → 1007), an upgrade-hook section (a server
+   bound to `127.0.0.1` explicitly whose `OnUpgradeRequest` refuses one
+   `Origin` with a 403 — no `OnOpen`, no `OnClientClose` — and treats a
+   raising hook the same way), and — on Linux — a `wss://` section
    against a TLS listener built from a runtime-generated identity
    (handshake, echo, flow-control windows, `close_notify`, handshake
    deadline, inbound pre-handshake budget).
