@@ -1587,9 +1587,9 @@ var
   LimPort: Word;
   Fd, FdA, FdB, FdC: Tsocket;
   Elapsed, Rounds, SentBytes, I, Opens, Closes: Integer;
-  Chunk: RawByteString;
+  Chunk, Got: RawByteString;
   Cli: TWSClient;
-  IsText, Ok: Boolean;
+  IsText, Ok, Eof: Boolean;
   Data: TBytes;
   ReadRes: TWSReadResult;
   Deadline: QWord;
@@ -1683,27 +1683,33 @@ begin
   // staging absorb a few MiB before the transport reports the stall
   // back as backpressure, and the cap is judged on what is stuck
   // behind that.
-  // Once dropped, the server stops reading too, so the flood's own
-  // sends start blocking — bound them, and let the transport's 300 ms
-  // close drain (a close deferred behind a send the peer never takes)
-  // be what ends the connection: the peer never reads a byte.
+  // What the peer can observe on every transport: far fewer echo bytes
+  // come back than went in, and the connection ends. How the flood's
+  // own sends fare differs — epoll resets at once so they fail
+  // part-way, Network.framework stops reading so they block (hence the
+  // send bound), IOCP keeps draining input behind its FIN so they all
+  // land — and the transport's 300 ms close drain (a close deferred
+  // behind a send the peer never takes) bounds the end on the transports
+  // that defer.
   Fd := RawUpgraded(LimPort, 4096);
   RawSetSendTimeout(Fd, 1000);
   SetLength(Chunk, 64 * 1024);
   FillChar(Chunk[1], Length(Chunk), Ord('x'));
   SentBytes := 0;
-  LastTick := GetTickCount64;
   for I := 1 to 160 do
   begin
     if not RawSendFrame(Fd, WS_OP_BINARY, Chunk, True) then Break;
     Inc(SentBytes, Length(Chunk));
   end;
-  Elapsed := RawWaitForClose(Fd, 6000);
+  LastTick := GetTickCount64;
+  Got := RawReadToEof(Fd, Eof);
+  Elapsed := Integer(GetTickCount64 - LastTick);
   CloseSocket(Fd);
-  Check((Elapsed >= 0) and (SentBytes < 160 * Length(Chunk)),
-    Format('non-reading flood dropped by the 1 MiB output cap and ' +
-    'cancelled by the 300 ms close drain (%d KiB accepted, hung up ' +
-    '%d ms after the flood)', [SentBytes div 1024, Elapsed]));
+  Check((Length(Got) < SentBytes) and (Elapsed < 4000),
+    Format('non-reading flood dropped by the 1 MiB output cap ' +
+    '(%d KiB accepted, %d KiB echoed back, connection ended %d ms ' +
+    'after the flood)', [SentBytes div 1024, Length(Got) div 1024,
+    Elapsed]));
 
   // Connection cap: two in, the third is closed before any response;
   // once one leaves, the next is admitted.
