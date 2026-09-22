@@ -66,6 +66,7 @@ type
     FDead: Boolean;            // SubmitClose called; drop everything
     FClosedNotified: Boolean;  // OnClosed fired (or suppressed)
     procedure ArmReceive;
+    procedure ArmDrainDeadline;
     procedure RemoteClosed;
   public
     function SubmitSend(P: PByte; ALen: NativeInt): NativeInt; override;
@@ -82,6 +83,7 @@ type
     FDrainSem: Pointer;
     FListenerDoneSem: Pointer;
     FTlsIdentity: Pointer;     // sec_identity_t
+    FDrainDeadlineMs: Integer; // close-drain budget (see the default)
     FTempKeychain: Pointer;    // private import keychain (see LoadIdentity)
     FListenerState: Integer;
     FActive: LongInt;          // live nw connections (finalize pending)
@@ -141,6 +143,17 @@ type
 const
   DISPATCH_TIME_FOREVER = UInt64($FFFFFFFFFFFFFFFF);
   NsPerMs = Int64(1000000);
+  // Default for how long a close may wait behind an in-flight send
+  // before the connection is cancelled regardless. The deferral exists
+  // so the final bytes (a close frame) reach a peer that is reading; a
+  // peer that is not reading never completes that send, and without a
+  // bound it would pin the connection — and everything the session
+  // queued behind the send — for as long as it likes. Configured
+  // through TWSTransportTls.HandshakeDeadlineMs, the field the
+  // fd-owning transports already reuse as their close-drain budget, so
+  // the one knob means the same thing on all three; the default matches
+  // theirs.
+  DefaultCloseDrainDeadlineMs = 10000;
   NsPerSecond = Int64(1000000000);
   ListenerReadyTimeoutSeconds = 10;
   DrainPollMs = 100;
@@ -158,10 +171,12 @@ const
 function Dispatch_queue_create(ALabel: PAnsiChar; AAttr: Pointer): Pointer; cdecl; external name 'dispatch_queue_create';
 procedure Dispatch_async(AQueue, ABlock: Pointer); cdecl; external name 'dispatch_async';
 procedure Dispatch_release(AObj: Pointer); cdecl; external name 'dispatch_release';
+procedure Dispatch_retain(AObj: Pointer); cdecl; external name 'dispatch_retain';
 function Dispatch_semaphore_create(AValue: NativeInt): Pointer; cdecl; external name 'dispatch_semaphore_create';
 function Dispatch_semaphore_wait(ASem: Pointer; ATimeout: UInt64): NativeInt; cdecl; external name 'dispatch_semaphore_wait';
 function Dispatch_semaphore_signal(ASem: Pointer): NativeInt; cdecl; external name 'dispatch_semaphore_signal';
 function Dispatch_time(AWhen: UInt64; ADeltaNs: Int64): UInt64; cdecl; external name 'dispatch_time';
+procedure Dispatch_after(AWhen: UInt64; AQueue, ABlock: Pointer); cdecl; external name 'dispatch_after';
 function Dispatch_data_create(ABuffer: Pointer; ASize: NativeUInt;
   AQueue: Pointer; ADestructor: Pointer): Pointer; cdecl; external name 'dispatch_data_create';
 function Dispatch_data_create_map(AData: Pointer; ABuffer: PPointer;
@@ -327,6 +342,29 @@ type
     Block: TWSBlock;
   end;
 
+  // The close-drain timer's capture: a retained nw_connection and
+  // nothing else. The Pascal connection object may already be freed
+  // by the time the timer fires (the send completed, the cancel ran,
+  // the cancelled state landed), so the block must not name it —
+  // nw_connection_cancel is idempotent and safe on a cancelled
+  // connection, which is all the timer needs. Freed by its own invoke.
+  PWSNwDrainTimer = ^TWSNwDrainTimer;
+  TWSNwDrainTimer = record
+    Nw: Pointer;
+    Block: TWSBlock;
+  end;
+
+procedure DrainTimerInvoke(ABlock: PWSBlock); cdecl;
+var
+  D: PWSNwDrainTimer;
+begin
+  EnsureThreadInit;
+  D := PWSNwDrainTimer(ABlock^.Ctx);
+  Nw_connection_cancel(D^.Nw);
+  Nw_release(D^.Nw);
+  Dispose(D);
+end;
+
 procedure TlsConfigInvoke(ABlock: PWSBlock; AOptions: Pointer); cdecl;
 var
   T: TWSNetworkFrameworkTransport;
@@ -483,6 +521,15 @@ begin
   C.Id := T.FNextId;
   InterLockedIncrement(T.FActive);
   if Assigned(T.OnAccept) then T.OnAccept(C);
+  if C.FDead then
+  begin
+    // Refused inside OnAccept (the session's connection cap). The
+    // cancel SubmitClose issued landed before set_queue/start, and a
+    // never-started connection delivers no cancelled state, so nothing
+    // downstream would ever finalize it: do it here, unpublished.
+    T.ConnFinalized(C);
+    Exit;
+  end;
   Nw_connection_set_queue(ANwConn, C.FQueue);
   // Publishing to the live table is what makes the connection reachable
   // from SubmitPost, so it happens LAST — after OnAccept has returned
@@ -500,12 +547,6 @@ begin
   // connection reference in OnOpen, which runs from OnData on this
   // connection's own queue, strictly after everything here.
   //
-  // A connection closed inside OnAccept is published too — FindLiveById
-  // filters FDead, so posts still cannot reach it. Publishing it keeps
-  // it in Shutdown's cancel sweep: SubmitClose's cancel fired before
-  // set_queue/start, and rather than rest on nw delivering a cancelled
-  // state for a pre-start cancel, the sweep's (idempotent) second
-  // cancel guarantees ConnFinalized runs and FActive drains.
   T.LiveTrack(C);
   Nw_connection_set_state_changed_handler(ANwConn,
     MakeBlock(C.FStateBlock, @ConnStateInvoke, C));
@@ -522,6 +563,20 @@ begin
     MakeBlock(FRecvBlock, @RecvInvoke, Self));
 end;
 
+// A close is waiting behind an in-flight send: bound the wait. The
+// timer runs on this connection's queue, serialized with everything
+// else here, and captures only the retained nw_connection.
+procedure TWSNwConn.ArmDrainDeadline;
+var
+  D: PWSNwDrainTimer;
+begin
+  New(D);
+  Nw_retain(FNw);
+  D^.Nw := FNw;
+  Dispatch_after(Dispatch_time(0, FTransport.FDrainDeadlineMs * NsPerMs),
+    FQueue, MakeBlock(D^.Block, @DrainTimerInvoke, D));
+end;
+
 procedure TWSNwConn.RemoteClosed;
 begin
   if FClosedNotified or FDead then Exit;
@@ -530,9 +585,13 @@ begin
   // The session has dropped its references; tear the nw side down. The
   // cancelled state is the final callback and frees this object.
   // A send still in flight performs the cancel from its completion
-  // instead (no need to abort the final bytes; cancel is idempotent).
+  // instead (no need to abort the final bytes; cancel is idempotent) —
+  // within the drain budget.
   FDead := True;
-  if not FInFlight then Nw_connection_cancel(FNw);
+  if FInFlight then
+    ArmDrainDeadline
+  else
+    Nw_connection_cancel(FNw);
 end;
 
 function TWSNwConn.SubmitSend(P: PByte; ALen: NativeInt): NativeInt;
@@ -556,8 +615,13 @@ begin
   if FDead then Exit;
   FDead := True;
   // A send still in flight carries the final bytes (typically the close
-  // frame) — the send completion performs the deferred cancel.
-  if FInFlight then Exit;
+  // frame) — the send completion performs the deferred cancel, unless
+  // the peer stops reading first and the drain deadline does it.
+  if FInFlight then
+  begin
+    ArmDrainDeadline;
+    Exit;
+  end;
   Nw_connection_cancel(FNw);
   // Freed in ConnFinalized once the cancelled state lands — callbacks
   // may still be queued behind us on this connection's queue.
@@ -578,6 +642,8 @@ begin
   // GCD callbacks allocate on their own threads; the heap must already
   // be in thread-safe mode before the first one can fire.
   IsMultiThread := True;
+  FDrainDeadlineMs := ATls.HandshakeDeadlineMs;
+  if FDrainDeadlineMs <= 0 then FDrainDeadlineMs := DefaultCloseDrainDeadlineMs;
   FStopSem := Dispatch_semaphore_create(0);
   FReadySem := Dispatch_semaphore_create(0);
   FDrainSem := Dispatch_semaphore_create(0);
@@ -668,7 +734,6 @@ end;
 // their own cancelled handlers during the drain).
 procedure TWSNetworkFrameworkTransport.Shutdown;
 var
-  Doomed: array of TWSNwConn;
   I: Integer;
 begin
   if FShutdownDone then Exit;
@@ -684,17 +749,19 @@ begin
       Dispatch_semaphore_wait(FListenerDoneSem,
         Dispatch_time(0, DrainPollMs * NsPerMs));
   end;
+  // Cancel under the live lock: a connection whose peer hangs up at
+  // this very moment runs ConnFinalized on its own queue, and that
+  // frees the object — a snapshot read outside the lock would
+  // dereference it. nw_connection_cancel is thread-safe, idempotent
+  // and asynchronous, so holding the lock across it blocks nothing
+  // but the finalizers' own LiveUntrack, briefly.
   FLiveLock.Acquire;
   try
-    SetLength(Doomed, FLiveCount);
     for I := 0 to FLiveCount - 1 do
-      Doomed[I] := FLive[I];
+      Nw_connection_cancel(FLive[I].FNw);
   finally
     FLiveLock.Release;
   end;
-  // nw_connection_cancel is thread-safe and idempotent.
-  for I := 0 to High(Doomed) do
-    Nw_connection_cancel(Doomed[I].FNw);
   // Drain live connections AND in-flight posts: a posted block queued
   // behind a cancelled state still touches this object when it runs,
   // so Shutdown may not return (and Destroy may not free the locks)
@@ -706,9 +773,15 @@ begin
 end;
 
 procedure TWSNetworkFrameworkTransport.PostDone;
+var
+  Sem: Pointer;
 begin
+  // Same discipline as ConnFinalized: the decrement releases Shutdown.
+  Sem := FDrainSem;
+  Dispatch_retain(Sem);
   InterLockedDecrement(FPostsPending);
-  Dispatch_semaphore_signal(FDrainSem);
+  Dispatch_semaphore_signal(Sem);
+  Dispatch_release(Sem);
 end;
 
 procedure TWSNetworkFrameworkTransport.SubmitPost(AConnId: NativeUInt;
@@ -752,13 +825,21 @@ begin
 end;
 
 procedure TWSNetworkFrameworkTransport.ConnFinalized(AConn: TWSNwConn);
+var
+  Sem: Pointer;
 begin
   LiveUntrack(AConn);
   Nw_release(AConn.FNw);
   Dispatch_release(AConn.FQueue);
   AConn.Free;
+  // The decrement is what lets Shutdown return and Destroy release
+  // FDrainSem; nothing on Self may be touched after it. Hold our own
+  // reference on the semaphore for the signal.
+  Sem := FDrainSem;
+  Dispatch_retain(Sem);
   InterLockedDecrement(FActive);
-  Dispatch_semaphore_signal(FDrainSem);
+  Dispatch_semaphore_signal(Sem);
+  Dispatch_release(Sem);
 end;
 
 // Live-table lookup by transport-neutral connection id. THE CALLER MUST
