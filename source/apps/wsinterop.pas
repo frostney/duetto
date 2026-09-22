@@ -707,7 +707,7 @@ begin
     end;
     if R = wprProtocolError then Exit(0);
     SetLength(Buf, Len + 4096);
-    Got := TransportSecurityRead(ATls, PByte(@Buf[Len])^, 4096);
+    Got := TransportSecurityRead(ATls, PWSByteSpan(@Buf[Len])^, 4096);
     if Got <= 0 then Exit(0);
     Len := Len + Got;
     SetLength(Buf, Len);
@@ -775,7 +775,7 @@ begin
     end;
     if R = wprProtocolError then Exit(False);
     SetLength(Buf, Len + 65536);
-    Got := TransportSecurityRead(ATls, PByte(@Buf[Len])^, 65536);
+    Got := TransportSecurityRead(ATls, PWSByteSpan(@Buf[Len])^, 65536);
     if Got <= 0 then Exit(False);
     Len := Len + Got;
     SetLength(Buf, Len);
@@ -2003,6 +2003,23 @@ begin
           Format('tls: %d KiB echo intact and in order through %d-byte ' +
           'input/output windows',
           [TlsBigEchoBytes div 1024, TlsInputHighWater]));
+
+        // The bounded form over wss: a multi-KiB echo arrives as one TLS
+        // record, which the client used to ingest one byte per read —
+        // the first byte woke the poll, the rest sat decrypted inside
+        // the TLS layer where a readiness poll cannot see them, and the
+        // call reported wrrTimeout with the message stuck. Generous
+        // bound; only the outcome is asserted.
+        SetLength(Big, 12 * 1024);
+        for I := 0 to High(Big) do
+          Big[I] := Byte((I * 7 + 3) and $FF);
+        TlsCli.SendBinary(@Big[0], Length(Big));
+        Check((TlsCli.ReadMessage(IsText, Data, 5000) = wrrMessage) and
+          (not IsText) and (Length(Data) = Length(Big)) and
+          CompareMem(@Data[0], @Big[0], Length(Big)),
+          'tls: bounded read over wss delivers a 12 KiB echo whole');
+        Check(TlsCli.ReadMessage(IsText, Data, 200) = wrrTimeout,
+          'tls: bounded read on an idle wss stream reports wrrTimeout');
 
         TlsCli.Close(1000, 'done');
         Check(TlsCli.CloseCode = 1000, 'tls: clean close echoes 1000 over wss');
