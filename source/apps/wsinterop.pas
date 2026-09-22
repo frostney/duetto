@@ -89,12 +89,17 @@ type
   // OnUpgradeRequest host for the hook section: refuses one Origin with
   // a reason, raises instead when told to, and counts what the server
   // went on to do — a refused handshake must produce neither OnOpen nor
-  // OnClientClose. Runs on the connection's execution context, hence
-  // the lock around the counters the battery reads.
+  // OnClientClose. Its OnClientClose also sends into the connection it
+  // is being told about (the "user left" broadcast that still lists the
+  // leaver): every such send must report False, and the close must be
+  // delivered exactly once — a flush into the dead transport used to
+  // release the session object a second time. Runs on the connection's
+  // execution context, hence the lock around the counters the battery
+  // reads.
   TUpgradeGate = class
   private
     FLock: TCriticalSection;
-    FHits, FOpens, FCloses: Integer;
+    FHits, FOpens, FCloses, FCloseSendsAlive: Integer;
     FRaiseMode: Boolean;
   public
     constructor Create;
@@ -104,7 +109,7 @@ type
     procedure HandleOpen(AConn: TWSConnection);
     procedure HandleClose(AConn: TWSConnection);
     procedure SetRaiseMode(AValue: Boolean);
-    procedure Snapshot(out AHits, AOpens, ACloses: Integer);
+    procedure Snapshot(out AHits, AOpens, ACloses, ACloseSendsAlive: Integer);
   end;
 
   TServerThread = class(TThread)
@@ -168,10 +173,17 @@ begin
 end;
 
 procedure TUpgradeGate.HandleClose(AConn: TWSConnection);
+const
+  Bye: RawByteString = 'someone left';
+var
+  Alive: Boolean;
 begin
+  Alive := AConn.SendText(@Bye[1], Length(Bye));
+  Alive := AConn.Close(1001, 'going away') or Alive;
   FLock.Acquire;
   try
     Inc(FCloses);
+    if Alive then Inc(FCloseSendsAlive);
   finally
     FLock.Release;
   end;
@@ -187,13 +199,15 @@ begin
   end;
 end;
 
-procedure TUpgradeGate.Snapshot(out AHits, AOpens, ACloses: Integer);
+procedure TUpgradeGate.Snapshot(out AHits, AOpens, ACloses,
+  ACloseSendsAlive: Integer);
 begin
   FLock.Acquire;
   try
     AHits := FHits;
     AOpens := FOpens;
     ACloses := FCloses;
+    ACloseSendsAlive := FCloseSendsAlive;
   finally
     FLock.Release;
   end;
@@ -1490,7 +1504,7 @@ var
   HookSrvT: TServerThread;
   HookPort: Word;
   HookResp: RawByteString;
-  Hits, Opens, Closes: Integer;
+  Hits, Opens, Closes, CloseSendsAlive: Integer;
   {$ifdef LINUX}
   // Server-TLS section
   TlsDir, TlsUrl: string;
@@ -1800,7 +1814,7 @@ begin
     (Pos(#13#10#13#10'forbidden', HookResp) > 0),
     'raising hook -> 403 ''forbidden'', then EOF');
 
-  Gate.Snapshot(Hits, Opens, Closes);
+  Gate.Snapshot(Hits, Opens, Closes, CloseSendsAlive);
   Check((Hits = 2) and (Opens = 0) and (Closes = 0),
     'refused handshakes: hook consulted, no OnOpen, no OnClientClose');
 
@@ -1829,9 +1843,27 @@ begin
   CloseSocket(Fd);
   Check(Ok, 'allowed Origin -> 101, frames flow, clean close');
 
-  Gate.Snapshot(Hits, Opens, Closes);
+  Gate.Snapshot(Hits, Opens, Closes, CloseSendsAlive);
   Check((Hits = 4) and (Opens = 2),
     'accepted handshakes: hook consulted, OnOpen fired for each');
+
+  // A peer that vanishes without a close frame: the transport reports
+  // the hangup, OnClientClose runs, and the handler's send into the
+  // connection it is losing must come back False — once. The two
+  // orderly closes above take the DropConn route; this one takes
+  // HandleClosed, which used to leave the connection sendable.
+  Fd := RawConnect(HookPort);
+  HookResp := RawUpgrade(Fd, 'Origin: http://good.example'#13#10, Eof);
+  Ok := Pos(' 101 ', Copy(HookResp, 1, 16)) > 0;
+  CloseSocket(Fd);
+  Deadline := GetTickCount64 + 5000;
+  repeat
+    Gate.Snapshot(Hits, Opens, Closes, CloseSendsAlive);
+    if Closes >= 3 then Break;
+    Sleep(10);
+  until GetTickCount64 > Deadline;
+  Check(Ok and (Opens = 3) and (Closes = 3) and (CloseSendsAlive = 0),
+    'send inside OnClientClose after an abrupt hangup: False, closed once');
 
   StressPhase := 'upgrade-hook section: teardown';
   HookSrvT.Terminate;

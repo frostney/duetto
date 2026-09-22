@@ -93,7 +93,9 @@ type
     // protocol layer discarded the message for its own reasons. The
     // only thing this result reports is False = dropped; if you need to
     // know that bytes were actually queued, track it at the protocol
-    // layer, not here.
+    // layer, not here. Inside your own OnClientClose handler the
+    // connection is already being dropped, so these return False
+    // without queueing anything.
     function SendText(P: PByte; ALen: NativeInt): Boolean;
     function SendBinary(P: PByte; ALen: NativeInt): Boolean;
     // Same contract as SendText/SendBinary: False = the transport
@@ -334,6 +336,11 @@ end;
 
 function TWSConnection.SendText(P: PByte; ALen: NativeInt): Boolean;
 begin
+  // Teardown already running (an OnClientClose handler sending into the
+  // connection it is being told about): the transport side is gone, so
+  // report the drop without touching it — a flush here would re-enter
+  // DropConn and free the object a second time.
+  if FDropping then Exit(False);
   Result := True;
   if FState = wcsOpen then
   begin
@@ -344,6 +351,7 @@ end;
 
 function TWSConnection.SendBinary(P: PByte; ALen: NativeInt): Boolean;
 begin
+  if FDropping then Exit(False);
   Result := True;
   if FState = wcsOpen then
   begin
@@ -359,6 +367,7 @@ end;
 
 function TWSConnection.Close(ACode: Word; const AReason: string): Boolean;
 begin
+  if FDropping then Exit(False);
   Result := True;
   if FState = wcsOpen then
   begin
@@ -662,9 +671,12 @@ begin
   // handler queues).
   Resp := ServerBuildResponse(HS);
   AConn.FProto.QueueRaw(@Resp[1], Length(Resp));
-  AConn.FState := wcsOpen;
   AConn.FHsBuf := '';
+  // Open only once the 101 is on its way: a peer that resets right after
+  // sending its request fails this flush, and the drop must not look
+  // like a closed session to OnClientClose when OnOpen never ran.
   if not FlushConn(AConn) then Exit;
+  AConn.FState := wcsOpen;
 
   // Same deferral guard as the Ingest run: a send inside OnOpen may
   // find the peer dead, and the caller still reads Conn state after we
@@ -786,17 +798,18 @@ var
 begin
   Conn := TWSConnection(ATConn.UserData);
   if Conn = nil then Exit;
+  // The TLS transports report send-ready after their own handshake
+  // flight completes, before any HTTP upgrade has been parsed: nothing
+  // is queued yet and no protocol object exists to flush.
+  if Conn.FProto = nil then Exit;
   if not FlushConn(Conn) then Exit;
-  if Conn.FProto <> nil then
+  if Conn.FDropPending and (Conn.FProto.OutPending = 0) then
   begin
-    if Conn.FDropPending and (Conn.FProto.OutPending = 0) then
-    begin
-      DropConn(Conn);
-      Exit;
-    end;
-    if Conn.FProto.CloseDone and (Conn.FProto.OutPending = 0) then
-      DropConn(Conn);
+    DropConn(Conn);
+    Exit;
   end;
+  if Conn.FProto.CloseDone and (Conn.FProto.OutPending = 0) then
+    DropConn(Conn);
 end;
 
 procedure TWSServer.HandleClosed(ATConn: TWSTransportConn);
@@ -806,6 +819,10 @@ begin
   Conn := TWSConnection(ATConn.UserData);
   if Conn = nil then Exit;
   ATConn.UserData := nil;
+  // Same teardown marker DropConn sets: a send or Close inside the
+  // OnClientClose handler must return False, not flush into the dead
+  // transport connection and release the session object a second time.
+  Conn.FDropping := True;
   ReleaseConn(Conn);
   // The transport frees ATConn after this callback returns.
 end;
