@@ -197,8 +197,13 @@ begin
     if (R <> Z_OK) and (R <> Z_BUF_ERROR) then Exit;
     FOutSize := Length(FOut) - FStrm.avail_out;
     if FOutSize > FMaxOut then Exit;
+    // Drive the loop on output space, never on input alone: inflate can
+    // swallow every input byte into its 32 KB window while decoded bytes
+    // are still queued behind a full output buffer. A full buffer means
+    // "pump again"; room left over means inflate emitted all it had.
+    if FStrm.avail_out = 0 then Continue;
     if FStrm.avail_in = 0 then Break;
-    if (R = Z_BUF_ERROR) and (FStrm.avail_out > 0) then Exit; // no progress
+    if R = Z_BUF_ERROR then Exit; // input and room left, yet no progress
   until False;
   Result := True;
 end;
