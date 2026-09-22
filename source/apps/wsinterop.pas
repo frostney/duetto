@@ -596,6 +596,22 @@ begin
   AEof := Got = 0;
 end;
 
+// Connect and upgrade in one go: the socket, open on a 101, or -1 with
+// the socket already closed when the server answered anything else.
+function RawUpgraded(APort: Word; ARecvBuf: Integer = 0): Tsocket;
+var
+  Resp: RawByteString;
+  Eof: Boolean;
+begin
+  Result := RawConnectEx(APort, True, ARecvBuf);
+  Resp := RawUpgrade(Result, '', Eof);
+  if Pos(' 101 ', Copy(Resp, 1, 16)) = 0 then
+  begin
+    CloseSocket(Result);
+    Result := -1;
+  end;
+end;
+
 // Bound a blocking send: a flood into a server that has stopped reading
 // must return to the battery rather than sit on a full send buffer.
 procedure RawSetSendTimeout(AFd: Tsocket; AMs: Integer);
@@ -1558,6 +1574,186 @@ const
   PipelinedMsgs: array[0..2] of RawByteString = ('one', 'two', 'three');
   LingerProbe: RawByteString = 'linger';
 
+// --- resource limits -------------------------------------------------------
+// A third server with every bound set tight enough to observe inside the
+// battery: a peer that stalls, goes mute, idles, stops reading or arrives
+// one too many must each be shed within its budget, and a live peer that
+// merely says nothing must be kept by the keepalive.
+procedure RunLimitsSection(var AStressPhase: ShortString);
+var
+  Limits: TLimitsHost;
+  LimTls: TWSTransportTls;
+  LimSrvT: TServerThread;
+  LimPort: Word;
+  Fd, FdA, FdB, FdC: Tsocket;
+  Elapsed, Rounds, SentBytes, I, Opens, Closes: Integer;
+  Chunk: RawByteString;
+  Cli: TWSClient;
+  IsText, Ok: Boolean;
+  Data: TBytes;
+  ReadRes: TWSReadResult;
+  Deadline: QWord;
+begin
+  AStressPhase := 'limits section';
+  Limits := TLimitsHost.Create;
+  LimSrvT := TServerThread.Create(True);
+  // Plaintext, but the TLS record still carries the one transport-level
+  // budget: how long a close may wait behind a send the peer is not
+  // taking (the fd-owning transports' close-drain deadline, and the
+  // Network.framework transport's).
+  LimTls := WSTransportNoTls;
+  LimTls.HandshakeDeadlineMs := 300;
+  LimSrvT.Srv := TWSServer.Create(0, LimTls, True, 16 * 1024 * 1024,
+    '127.0.0.1');
+  LimSrvT.Srv.OnMessage := Limits.OnMsg;
+  LimSrvT.Srv.OnOpen := Limits.HandleOpen;
+  LimSrvT.Srv.OnClientClose := Limits.HandleClose;
+  LimSrvT.Srv.HandshakeTimeoutMs := 300;
+  LimSrvT.Srv.CloseTimeoutMs := 300;
+  LimSrvT.Srv.IdleTimeoutMs := 600;
+  LimSrvT.Srv.PingIntervalMs := 200;
+  LimSrvT.Srv.MaxPendingOutput := 1024 * 1024;
+  LimSrvT.Srv.MaxConnections := 2;
+  LimPort := LimSrvT.Srv.Port;
+  LimSrvT.Start;
+
+  // A peer that connects and trickles half a request line.
+  Fd := RawConnect(LimPort);
+  Chunk := 'GET / HTTP/1.1'#13#10;
+  fpSend(Fd, @Chunk[1], Length(Chunk), 0);
+  Elapsed := RawWaitForClose(Fd, 3000);
+  CloseSocket(Fd);
+  Limits.Snapshot(Opens, Closes);
+  Check((Elapsed >= 150) and (Elapsed < 3000) and (Opens = 0) and (Closes = 0),
+    Format('stalled handshake dropped by the 300 ms budget (after %d ms), ' +
+    'no OnOpen/OnClientClose', [Elapsed]));
+
+  // The server closes; the peer reads the close frame and never answers.
+  Fd := RawUpgraded(LimPort);
+  RawSendFrame(Fd, WS_OP_TEXT, CloseCue, True);
+  Ok := RawReadCloseCode(Fd, nil) = 1000;
+  Elapsed := RawWaitForClose(Fd, 3000);
+  CloseSocket(Fd);
+  Check(Ok and (Elapsed >= 0) and (Elapsed < 3000),
+    Format('server-side Close with a mute peer dropped by the 300 ms ' +
+    'budget (after %d ms)', [Elapsed]));
+
+  // A peer that says nothing after the handshake: pinged, never pongs,
+  // told 1001 at the idle bound, then dropped.
+  Fd := RawUpgraded(LimPort);
+  LastTick := GetTickCount64;
+  Ok := RawReadCloseCode(Fd, nil) = 1001;
+  Elapsed := Integer(GetTickCount64 - LastTick);
+  Ok := Ok and (RawWaitForClose(Fd, 3000) >= 0);
+  CloseSocket(Fd);
+  Check(Ok and (Elapsed >= 400) and (Elapsed < 3000),
+    Format('silent open peer closed 1001 by the 600 ms idle bound ' +
+    '(after %d ms), then dropped', [Elapsed]));
+
+  // A live peer that merely has nothing to say: the client's pump
+  // answers the keepalive pings, so it outlives several idle bounds.
+  Cli := TWSClient.Create;
+  Cli.Connect(Format('ws://127.0.0.1:%d/', [LimPort]));
+  Rounds := 0;
+  LastTick := GetTickCount64;
+  while GetTickCount64 - LastTick < 1500 do
+  begin
+    ReadRes := Cli.ReadMessage(IsText, Data, 100);
+    if ReadRes = wrrClosed then Break;
+    Inc(Rounds);
+  end;
+  Ok := Cli.Open;
+  if Ok then
+  begin
+    Cli.SendText(HelloProbe);
+    Ok := Cli.ReadMessage(IsText, Data) and IsText and
+      (Length(Data) = Length(HelloProbe)) and
+      CompareMem(@Data[0], @HelloProbe[1], Length(HelloProbe));
+    Cli.Close(1000, 'done');
+  end;
+  Cli.Free;
+  Check(Ok, 'quiet but live peer kept open by the 200 ms keepalive ' +
+    'for 1.5 s, then echoes');
+
+  // A peer that floods echo requests and never reads: with a 4 KiB
+  // receive window on its side the server's egress stalls, and the
+  // pending output crosses the 1 MiB cap long before 10 MiB of echoes
+  // could be delivered. The volume is deliberately far above the cap:
+  // the kernel's send buffer and, on macOS, Network.framework's own
+  // staging absorb a few MiB before the transport reports the stall
+  // back as backpressure, and the cap is judged on what is stuck
+  // behind that.
+  // Once dropped, the server stops reading too, so the flood's own
+  // sends start blocking — bound them, and let the transport's 300 ms
+  // close drain (a close deferred behind a send the peer never takes)
+  // be what ends the connection: the peer never reads a byte.
+  Fd := RawUpgraded(LimPort, 4096);
+  RawSetSendTimeout(Fd, 1000);
+  SetLength(Chunk, 64 * 1024);
+  FillChar(Chunk[1], Length(Chunk), Ord('x'));
+  SentBytes := 0;
+  LastTick := GetTickCount64;
+  for I := 1 to 160 do
+  begin
+    if not RawSendFrame(Fd, WS_OP_BINARY, Chunk, True) then Break;
+    Inc(SentBytes, Length(Chunk));
+  end;
+  Elapsed := RawWaitForClose(Fd, 6000);
+  CloseSocket(Fd);
+  Check((Elapsed >= 0) and (SentBytes < 160 * Length(Chunk)),
+    Format('non-reading flood dropped by the 1 MiB output cap and ' +
+    'cancelled by the 300 ms close drain (%d KiB accepted, hung up ' +
+    '%d ms after the flood)', [SentBytes div 1024, Elapsed]));
+
+  // Connection cap: two in, the third is closed before any response;
+  // once one leaves, the next is admitted.
+  FdA := RawUpgraded(LimPort);
+  FdB := RawUpgraded(LimPort);
+  // Refused before any session state: closed with no bytes at all (FIN
+  // or RST — the transports differ on which they send here).
+  FdC := RawUpgraded(LimPort);
+  Ok := (FdA <> -1) and (FdB <> -1) and (FdC = -1);
+  RawSendFrame(FdA, WS_OP_CLOSE, #$03#$E8, True);
+  RawReadCloseCode(FdA, nil);
+  RawWaitForClose(FdA, 3000);
+  CloseSocket(FdA);
+  // The slot frees when the server has released the connection, which
+  // trails the peer's view of the close by a scheduling round.
+  Deadline := GetTickCount64 + 3000;
+  repeat
+    FdC := RawUpgraded(LimPort);
+    if FdC <> -1 then Break;
+    Sleep(20);
+  until GetTickCount64 > Deadline;
+  Ok := Ok and (FdC <> -1);
+  RawSendFrame(FdC, WS_OP_CLOSE, #$03#$E8, True);
+  RawReadCloseCode(FdC, nil);
+  CloseSocket(FdC);
+  RawSendFrame(FdB, WS_OP_CLOSE, #$03#$E8, True);
+  RawReadCloseCode(FdB, nil);
+  CloseSocket(FdB);
+  Check(Ok, 'third connection refused at MaxConnections = 2, admitted ' +
+    'once a slot frees');
+
+  Deadline := GetTickCount64 + 3000;
+  repeat
+    Limits.Snapshot(Opens, Closes);
+    if (Opens = Closes) then Break;
+    Sleep(10);
+  until GetTickCount64 > Deadline;
+  Check((Opens = 7) and (Closes = 7),
+    Format('limits section: every OnOpen paired with one OnClientClose ' +
+    '(%d/%d)', [Opens, Closes]));
+
+  AStressPhase := 'limits section: teardown';
+  LimSrvT.Terminate;
+  LimSrvT.Srv.Stop;
+  LimSrvT.WaitFor;
+  LimSrvT.Srv.Free;
+  LimSrvT.Free;
+  Limits.Free;
+end;
+
 var
   Echo: TEcho;
   SrvT: TServerThread;
@@ -1602,14 +1798,6 @@ var
   HookPort: Word;
   HookResp: RawByteString;
   Hits, Opens, Closes, CloseSendsAlive: Integer;
-  Limits: TLimitsHost;
-  LimTls: TWSTransportTls;
-  LimSrvT: TServerThread;
-  LimPort: Word;
-  FdA, FdB, FdC: Tsocket;
-  Elapsed, Rounds, SentBytes: Integer;
-  Got: RawByteString;
-  Chunk: RawByteString;
   {$ifdef LINUX}
   // Server-TLS section
   TlsDir, TlsUrl: string;
@@ -1978,187 +2166,7 @@ begin
   HookSrvT.Free;
   Gate.Free;
 
-  // --- resource limits -----------------------------------------------------
-  // A third server with every bound set tight enough to observe inside
-  // the battery: a peer that stalls, goes mute, idles, stops reading or
-  // arrives one too many must each be shed within its budget, and a
-  // live peer that merely says nothing must be kept by the keepalive.
-  StressPhase := 'limits section';
-  Limits := TLimitsHost.Create;
-  LimSrvT := TServerThread.Create(True);
-  // Plaintext, but the TLS record still carries the one transport-level
-  // budget: how long a close may wait behind a send the peer is not
-  // taking (the fd-owning transports' close-drain deadline, and the
-  // Network.framework transport's).
-  LimTls := WSTransportNoTls;
-  LimTls.HandshakeDeadlineMs := 300;
-  LimSrvT.Srv := TWSServer.Create(0, LimTls, True, 16 * 1024 * 1024,
-    '127.0.0.1');
-  LimSrvT.Srv.OnMessage := Limits.OnMsg;
-  LimSrvT.Srv.OnOpen := Limits.HandleOpen;
-  LimSrvT.Srv.OnClientClose := Limits.HandleClose;
-  LimSrvT.Srv.HandshakeTimeoutMs := 300;
-  LimSrvT.Srv.CloseTimeoutMs := 300;
-  LimSrvT.Srv.IdleTimeoutMs := 600;
-  LimSrvT.Srv.PingIntervalMs := 200;
-  LimSrvT.Srv.MaxPendingOutput := 1024 * 1024;
-  LimSrvT.Srv.MaxConnections := 2;
-  LimPort := LimSrvT.Srv.Port;
-  LimSrvT.Start;
-
-  // A peer that connects and trickles half a request line.
-  Fd := RawConnect(LimPort);
-  Chunk := 'GET / HTTP/1.1'#13#10;
-  fpSend(Fd, @Chunk[1], Length(Chunk), 0);
-  Elapsed := RawWaitForClose(Fd, 3000);
-  CloseSocket(Fd);
-  Limits.Snapshot(Opens, Closes);
-  Check((Elapsed >= 150) and (Elapsed < 3000) and (Opens = 0) and (Closes = 0),
-    Format('stalled handshake dropped by the 300 ms budget (after %d ms), ' +
-    'no OnOpen/OnClientClose', [Elapsed]));
-
-  // The server closes; the peer reads the close frame and never answers.
-  Fd := RawConnect(LimPort);
-  HookResp := RawUpgrade(Fd, '', Eof);
-  Ok := Pos(' 101 ', Copy(HookResp, 1, 16)) > 0;
-  RawSendFrame(Fd, WS_OP_TEXT, CloseCue, True);
-  Ok := Ok and (RawReadCloseCode(Fd, nil) = 1000);
-  Elapsed := RawWaitForClose(Fd, 3000);
-  CloseSocket(Fd);
-  Check(Ok and (Elapsed >= 0) and (Elapsed < 3000),
-    Format('server-side Close with a mute peer dropped by the 300 ms ' +
-    'budget (after %d ms)', [Elapsed]));
-
-  // A peer that says nothing after the handshake: pinged, never pongs,
-  // told 1001 at the idle bound, then dropped.
-  Fd := RawConnect(LimPort);
-  HookResp := RawUpgrade(Fd, '', Eof);
-  Ok := Pos(' 101 ', Copy(HookResp, 1, 16)) > 0;
-  LastTick := GetTickCount64;
-  Ok := Ok and (RawReadCloseCode(Fd, nil) = 1001);
-  Elapsed := Integer(GetTickCount64 - LastTick);
-  Ok := Ok and (RawWaitForClose(Fd, 3000) >= 0);
-  CloseSocket(Fd);
-  Check(Ok and (Elapsed >= 400) and (Elapsed < 3000),
-    Format('silent open peer closed 1001 by the 600 ms idle bound ' +
-    '(after %d ms), then dropped', [Elapsed]));
-
-  // A live peer that merely has nothing to say: the client's pump
-  // answers the keepalive pings, so it outlives several idle bounds.
-  Cli := TWSClient.Create;
-  Cli.Connect(Format('ws://127.0.0.1:%d/', [LimPort]));
-  Rounds := 0;
-  LastTick := GetTickCount64;
-  while GetTickCount64 - LastTick < 1500 do
-  begin
-    ReadRes := Cli.ReadMessage(IsText, Data, 100);
-    if ReadRes = wrrClosed then Break;
-    Inc(Rounds);
-  end;
-  Ok := Cli.Open;
-  if Ok then
-  begin
-    Cli.SendText(HelloProbe);
-    Ok := Cli.ReadMessage(IsText, Data) and IsText and
-      (Length(Data) = Length(HelloProbe)) and
-      CompareMem(@Data[0], @HelloProbe[1], Length(HelloProbe));
-    Cli.Close(1000, 'done');
-  end;
-  Cli.Free;
-  Check(Ok, 'quiet but live peer kept open by the 200 ms keepalive ' +
-    'for 1.5 s, then echoes');
-
-  // A peer that floods echo requests and never reads: with a 4 KiB
-  // receive window on its side the server's egress stalls, and the
-  // pending output crosses the 1 MiB cap long before 10 MiB of echoes
-  // could be delivered. The volume is deliberately far above the cap:
-  // the kernel's send buffer and, on macOS, Network.framework's own
-  // staging absorb a few MiB before the transport reports the stall
-  // back as backpressure, and the cap is judged on what is stuck
-  // behind that.
-  // Once dropped, the server stops reading too, so the flood's own
-  // sends start blocking — bound them, and let the transport's 300 ms
-  // close drain (a close deferred behind a send the peer never takes)
-  // be what ends the connection: the peer never reads a byte.
-  Fd := RawConnectEx(LimPort, True, 4096);
-  RawSetSendTimeout(Fd, 1000);
-  HookResp := RawUpgrade(Fd, '', Eof);
-  Ok := Pos(' 101 ', Copy(HookResp, 1, 16)) > 0;
-  SetLength(Chunk, 64 * 1024);
-  FillChar(Chunk[1], Length(Chunk), Ord('x'));
-  SentBytes := 0;
-  LastTick := GetTickCount64;
-  for I := 1 to 160 do
-  begin
-    if not RawSendFrame(Fd, WS_OP_BINARY, Chunk, True) then Break;
-    Inc(SentBytes, Length(Chunk));
-  end;
-  Elapsed := RawWaitForClose(Fd, 6000);
-  CloseSocket(Fd);
-  Check(Ok and (Elapsed >= 0) and (SentBytes < 160 * Length(Chunk)),
-    Format('non-reading flood dropped by the 1 MiB output cap and ' +
-    'cancelled by the 300 ms close drain (%d KiB accepted, hung up ' +
-    '%d ms after the flood)', [SentBytes div 1024, Elapsed]));
-
-  // Connection cap: two in, the third is closed before any response;
-  // once one leaves, the next is admitted.
-  FdA := RawConnect(LimPort);
-  Ok := Pos(' 101 ', Copy(RawUpgrade(FdA, '', Eof), 1, 16)) > 0;
-  FdB := RawConnect(LimPort);
-  Ok := Ok and (Pos(' 101 ', Copy(RawUpgrade(FdB, '', Eof), 1, 16)) > 0);
-  FdC := RawConnect(LimPort);
-  HookResp := RawUpgrade(FdC, '', Eof);
-  CloseSocket(FdC);
-  // Refused before any session state: closed with no bytes at all.
-  // (RawUpgrade reports an early hangup as an empty response, FIN or
-  // RST alike — the transports differ on which they send here.)
-  if HookResp <> '' then WriteLn('  unexpected response: ', Copy(HookResp, 1, 40));
-  Ok := Ok and (HookResp = '');
-  RawSendFrame(FdA, WS_OP_CLOSE, #$03#$E8, True);
-  Ok := Ok and (RawReadCloseCode(FdA, nil) = 1000);
-  RawWaitForClose(FdA, 3000);
-  CloseSocket(FdA);
-  // The slot frees when the server has released the connection, which
-  // trails the peer's view of the close by a scheduling round.
-  Deadline := GetTickCount64 + 3000;
-  repeat
-    FdC := RawConnect(LimPort);
-    HookResp := RawUpgrade(FdC, '', Eof);
-    if Pos(' 101 ', Copy(HookResp, 1, 16)) > 0 then Break;
-    CloseSocket(FdC);
-    FdC := -1;
-    Sleep(20);
-  until GetTickCount64 > Deadline;
-  Ok := Ok and (FdC <> -1);
-  if FdC <> -1 then
-  begin
-    RawSendFrame(FdC, WS_OP_CLOSE, #$03#$E8, True);
-    RawReadCloseCode(FdC, nil);
-    CloseSocket(FdC);
-  end;
-  RawSendFrame(FdB, WS_OP_CLOSE, #$03#$E8, True);
-  RawReadCloseCode(FdB, nil);
-  CloseSocket(FdB);
-  Check(Ok, 'third connection refused at MaxConnections = 2, admitted ' +
-    'once a slot frees');
-
-  Deadline := GetTickCount64 + 3000;
-  repeat
-    Limits.Snapshot(Opens, Closes);
-    if (Opens = Closes) then Break;
-    Sleep(10);
-  until GetTickCount64 > Deadline;
-  Check((Opens = 7) and (Closes = 7),
-    Format('limits section: every OnOpen paired with one OnClientClose ' +
-    '(%d/%d)', [Opens, Closes]));
-
-  StressPhase := 'limits section: teardown';
-  LimSrvT.Terminate;
-  LimSrvT.Srv.Stop;
-  LimSrvT.WaitFor;
-  LimSrvT.Srv.Free;
-  LimSrvT.Free;
-  Limits.Free;
+  RunLimitsSection(StressPhase);
 
   // --- server TLS terminated by the transport (duetto#22) -----------------
   // Linux only, and the reason is the CLIENT half of the battery on the
