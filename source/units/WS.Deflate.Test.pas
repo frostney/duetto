@@ -38,6 +38,7 @@ type
     procedure SetupTests; override;
     procedure TestBombCap;
     procedure TestCorruptStream;
+    procedure TestTooFarBackReadsZeros;
   end;
 
 function RoundTrip(C: TWSDeflater; D: TWSInflater;
@@ -292,6 +293,48 @@ begin
   end;
 end;
 
+procedure TDeflateDefence.TestTooFarBackReadsZeros;
+const
+  // One fixed-Huffman block: literal 'a', then <length 3, distance 4> —
+  // a back-reference reaching three bytes before the start of the
+  // output. zlib 1.2 rejects this ("invalid distance too far back");
+  // paszlib copies from its sliding window. The window must therefore
+  // never hold anything the peer did not send: zeros on a fresh
+  // inflater, and zeros again after a no-context-takeover reset.
+  Stream: array[0..4] of Byte = ($4A, $04, $62, $00, $00);
+var
+  D: TWSInflater;
+  Round, I: Integer;
+  Primer: array[0..7] of Pointer;
+begin
+  // A fresh process gets never-touched pages from the allocator, which
+  // would make an uncleared window read as zeros by luck. Real servers
+  // allocate a connection's window after other connections freed
+  // theirs, so recycle window-sized blocks full of a marker first.
+  for I := 0 to High(Primer) do
+  begin
+    GetMem(Primer[I], 32768);
+    FillChar(Primer[I]^, 32768, $A5);
+  end;
+  for I := High(Primer) downto 0 do FreeMem(Primer[I]);
+  D := TWSInflater.Create(15, True, 1 shl 20);
+  try
+    for Round := 1 to 2 do
+    begin
+      D.BeginMessage;
+      Expect<Boolean>(D.Feed(@Stream[0], Length(Stream))).ToBe(True);
+      Expect<Boolean>(D.Finish).ToBe(True);
+      Expect<Integer>(Integer(D.OutSize)).ToBe(4);
+      Expect<Integer>(D.OutData[0]).ToBe(Ord('a'));
+      Expect<Integer>(D.OutData[1]).ToBe(0);
+      Expect<Integer>(D.OutData[2]).ToBe(0);
+      Expect<Integer>(D.OutData[3]).ToBe(0);
+    end;
+  finally
+    D.Free;
+  end;
+end;
+
 procedure TDeflateRoundTrip.SetupTests;
 begin
   Test('empty message is #$00 and round-trips',  TestEmptyMessage);
@@ -311,6 +354,7 @@ procedure TDeflateDefence.SetupTests;
 begin
   Test('decompression bomb hits output cap',     TestBombCap);
   Test('corrupt stream rejected',                TestCorruptStream);
+  Test('too-far back-reference reads zeros',    TestTooFarBackReadsZeros);
 end;
 
 begin
