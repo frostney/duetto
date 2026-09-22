@@ -77,6 +77,8 @@ type
     procedure TestBadUtf8CloseReason;
     procedure TestDataAfterCloseIgnored;
     procedure TestOversizeMessage;
+    procedure TestSendCloseWireCodes;
+    procedure TestOversizeHeaderBeyond32Bits;
   end;
 
   TProtoDeflate = class(TTestSuite)
@@ -719,6 +721,72 @@ begin
   end;
 end;
 
+procedure TProtoClose.TestSendCloseWireCodes;
+const
+  // code, what the wire carries (1005 = no-status form)
+  Cases: array[0..9] of record Code, Wire: Word end = (
+    (Code: 1000; Wire: 1000), (Code: 1001; Wire: 1001),
+    (Code: 3000; Wire: 3000), (Code: 4999; Wire: 4999),
+    (Code: 1004; Wire: 1005), (Code: 1005; Wire: 1005),
+    (Code: 1006; Wire: 1005), (Code: 1015; Wire: 1005),
+    (Code: 999;  Wire: 1005), (Code: 5000; Wire: 1005)
+  );
+var
+  C, S: TWSProtocol;
+  CS, SS: TSink;
+  I: Integer;
+begin
+  // Whatever the application asks for is what it reads back locally;
+  // the wire only ever carries a code the peer may legally receive —
+  // §7.4.1 forbids 1005/1006/1015 in a close frame, and a conformant
+  // peer answers any other reserved or out-of-range code with 1002.
+  for I := 0 to High(Cases) do
+  begin
+    CS := TSink.Create; SS := TSink.Create;
+    C := Hook(TWSProtocol.Create(wsrClient, NoDeflate), CS);
+    S := Hook(TWSProtocol.Create(wsrServer, NoDeflate), SS);
+    try
+      C.SendClose(Cases[I].Code, 'x');
+      Expect<Integer>(Integer(C.CloseCode)).ToBe(Integer(Cases[I].Code));
+      Expect<Integer>(Integer(WireCloseCode(C))).ToBe(Integer(Cases[I].Wire));
+      Pump(C, S);
+      Expect<Boolean>(SS.CloseFired).ToBe(True);
+      Expect<Integer>(Integer(SS.CloseCode)).ToBe(Integer(Cases[I].Wire));
+      Expect<Boolean>(S.Failed).ToBe(False);
+      Expect<Boolean>(C.CloseDone and S.CloseDone).ToBe(True);
+    finally
+      C.Free; S.Free; CS.Free; SS.Free;
+    end;
+  end;
+end;
+
+procedure TProtoClose.TestOversizeHeaderBeyond32Bits;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Hdr: TBytes;
+begin
+  // A masked binary frame announcing 2^32 + 1 payload bytes, header
+  // only. The cap check must compare in the header's 64-bit width: a
+  // 32-bit build that narrowed first would see length 1, admit the
+  // frame, and start buffering whatever the peer then sends.
+  SS := TSink.Create;
+  S := NewServer(SS, 64);
+  try
+    SetLength(Hdr, 14);
+    Hdr[0] := $80 or WS_OP_BINARY;             // FIN, binary
+    Hdr[1] := $80 or 127;                      // masked, 64-bit length
+    FillChar(Hdr[2], 8, 0);
+    Hdr[5] := 1;                               // 0x0000000100000001
+    Hdr[9] := 1;
+    Hdr[10] := 1; Hdr[11] := 2; Hdr[12] := 3; Hdr[13] := 4; // mask key
+    Expect<Boolean>(S.Ingest(@Hdr[0], Length(Hdr))).ToBe(False);
+    Expect<Integer>(Integer(WireCloseCode(S))).ToBe(1009);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
 { ───────── permessage-deflate end to end ───────── }
 
 // Run the REAL handshake to get both sides' negotiated params, then build
@@ -867,6 +935,8 @@ begin
   Test('one-byte close payload -> 1002',       TestOneByteClosePayload);
   Test('bad UTF-8 close reason -> 1007',       TestBadUtf8CloseReason);
   Test('data after close is discarded',        TestDataAfterCloseIgnored);
+  Test('SendClose puts only legal codes on the wire', TestSendCloseWireCodes);
+  Test('2^32+1 header fails 1009 before any payload', TestOversizeHeaderBeyond32Bits);
   Test('message over cap -> 1009',             TestOversizeMessage);
 end;
 
