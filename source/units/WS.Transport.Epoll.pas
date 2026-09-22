@@ -99,6 +99,9 @@ type
     procedure SubmitClose; override;
   end;
 
+  // What spending the reserve descriptor on one accept achieved.
+  TWSShedResult = (wsrShed, wsrDrained, wsrNoReserve);
+
   TWSEpollTransport = class(TWSTransport)
   private
     FListenFd, FEpFd: Integer;
@@ -115,11 +118,24 @@ type
     FTimedCount: Integer;      // connections carrying a live deadline
     FTlsReadLen: Integer;      // per-round socket read bound on a TLS conn
     FNextSweepTick: QWord;     // deadline sweeps are amortized on the clock
+    // Descriptor exhaustion. A level-triggered listener that cannot
+    // accept stays readable, so an accept failure that is simply
+    // returned from spins epoll_wait at full CPU without ever draining
+    // the backlog. FReserveFd is one descriptor held open on /dev/null
+    // for exactly that moment: close it, accept the waiting peer, close
+    // the peer, take the reserve back — the backlog is shed instead of
+    // spun on. When even that is not possible the listener leaves the
+    // interest set until FAcceptBackoffUntil.
+    FReserveFd: Integer;
+    FAcceptBackoffUntil: QWord;
 
     procedure EpollMod(AConn: TWSEpollConn; AEvents: Cardinal);
     procedure Track(AConn: TWSEpollConn);
     procedure Untrack(AConn: TWSEpollConn);
     procedure AcceptPending;
+    procedure ListenerArm(AArmed: Boolean);
+    procedure OpenReserveFd;
+    function ShedOneAccept: TWSShedResult;
     procedure HandleReadable(AConn: TWSEpollConn);
     procedure HandleReadableTls(AConn: TWSEpollConn);
     procedure HandleTlsEvent(AConn: TWSEpollConn; AEvents: Cardinal);
@@ -156,6 +172,11 @@ const
   // epoll_wait that would otherwise park, and only while at least one
   // connection carries a deadline — a plaintext listener never sees it.
   TlsDeadlinePollMs = 100;
+  // How long the listener stays out of the interest set after accept
+  // fails for lack of a resource the reserve descriptor cannot cover
+  // (ENOBUFS/ENOMEM, or ENFILE with the reserve already spent). Short:
+  // the backlog is still queueing peers meanwhile.
+  AcceptBackoffMs = 100;
   ShutdownWrite = 1; // shutdown(): SHUT_WR
 
 // The RTL's Linux unit predates eventfd on some targets; bind libc
@@ -461,6 +482,7 @@ begin
   FListenFd := -1;
   FEpFd := -1;
   FWakeFd := -1;
+  FReserveFd := -1;
   FPosts := TWSPostQueue.Create;
   // Validated before any fd exists: a bad literal fails the constructor
   // with nothing to clean up.
@@ -541,6 +563,7 @@ begin
   // garbage in the tag half.
   Ev.data.u64 := QWord(Cardinal(FListenFd));
   epoll_ctl(FEpFd, EPOLL_CTL_ADD, FListenFd, @Ev);
+  OpenReserveFd;
 
   // Stop() must unblock a Run(-1) parked in epoll_wait from another
   // thread; an eventfd in the interest set is the wakeup channel.
@@ -563,6 +586,7 @@ begin
   if FWakeFd >= 0 then FileClose(FWakeFd);
   if FEpFd >= 0 then FileClose(FEpFd);
   if FListenFd >= 0 then CloseSocket(FListenFd);
+  if FReserveFd >= 0 then FileClose(FReserveFd);
   inherited;
 end;
 
@@ -721,15 +745,87 @@ begin
   FConns[AConn.FFd] := nil;
 end;
 
-procedure TWSEpollTransport.AcceptPending;
+procedure TWSEpollTransport.ListenerArm(AArmed: Boolean);
+var
+  Ev: TEPoll_Event;
+begin
+  if AArmed then
+  begin
+    Ev.events := EPOLLIN;
+    Ev.data.u64 := QWord(Cardinal(FListenFd));
+    epoll_ctl(FEpFd, EPOLL_CTL_ADD, FListenFd, @Ev);
+    FAcceptBackoffUntil := 0;
+  end
+  else
+  begin
+    epoll_ctl(FEpFd, EPOLL_CTL_DEL, FListenFd, nil);
+    FAcceptBackoffUntil := GetTickCount64 + QWord(AcceptBackoffMs);
+  end;
+end;
+
+procedure TWSEpollTransport.OpenReserveFd;
+begin
+  if FReserveFd < 0 then
+    FReserveFd := fpOpen('/dev/null', O_RDONLY or O_CLOEXEC);
+end;
+
+// The table is full: give the reserve back to the kernel, accept the
+// peer at the head of the backlog, close it, take the reserve again.
+// The peer sees an immediate close — the honest answer from a server
+// with no descriptor to serve it — and the listener stops being
+// readable for it. Linux checks the descriptor table before the
+// backlog, so the outer accept reports EMFILE even once the backlog is
+// empty: only the accept made with the reserve released can tell
+// "another peer shed" from "nothing left to accept".
+function TWSEpollTransport.ShedOneAccept: TWSShedResult;
 var
   Fd: Integer;
+begin
+  if FReserveFd < 0 then Exit(wsrNoReserve);
+  FileClose(FReserveFd);
+  FReserveFd := -1;
+  Fd := fpAccept(FListenFd, nil, nil);
+  if Fd >= 0 then
+  begin
+    CloseSocket(Fd);
+    Result := wsrShed;
+  end
+  else
+    Result := wsrDrained;
+  OpenReserveFd;
+end;
+
+procedure TWSEpollTransport.AcceptPending;
+var
+  Fd, Err: Integer;
   Conn: TWSEpollConn;
   Ev: TEPoll_Event;
 begin
   repeat
     Fd := fpAccept(FListenFd, nil, nil);
-    if Fd < 0 then Exit; // EAGAIN: drained
+    if Fd < 0 then
+    begin
+      Err := fpGetErrno;
+      case Err of
+        ESysEINTR, ESysECONNABORTED:
+          Continue; // interrupted, or the peer left the backlog: next
+        ESysEMFILE, ESysENFILE:
+          case ShedOneAccept of
+            wsrShed: Continue;
+            wsrDrained: Exit;
+          else
+            ListenerArm(False);
+            Exit;
+          end;
+        ESysENOBUFS, ESysENOMEM:
+          begin
+            ListenerArm(False);
+            Exit;
+          end;
+      else
+        Exit; // EAGAIN: drained
+      end;
+    end;
     SetNonBlocking(Fd);
     SetNoDelay(Fd);
     Conn := TWSEpollConn.Create;
@@ -1055,7 +1151,13 @@ begin
     Wait := ATimeoutMs;
     if FTimedCount > 0 then
       if (Wait < 0) or (Wait > TlsDeadlinePollMs) then Wait := TlsDeadlinePollMs;
+    // A backed-off listener needs the same courtesy: wake in time to
+    // put it back.
+    if FAcceptBackoffUntil <> 0 then
+      if (Wait < 0) or (Wait > AcceptBackoffMs) then Wait := AcceptBackoffMs;
     N := epoll_wait(FEpFd, @Evs[0], Length(Evs), Wait);
+    if (FAcceptBackoffUntil <> 0) and (GetTickCount64 >= FAcceptBackoffUntil) then
+      ListenerArm(True);
     for I := 0 to N - 1 do
     begin
       Fd := Integer(Cardinal(Evs[I].data.u64)); // low half: the fd
