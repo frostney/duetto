@@ -47,7 +47,8 @@ path; replacing it is justified by a `wsbench` number, not by taste.
 ## Formatter
 
 `lwpt format` rewrites sources in place (uses-clause grouping, identifier
-casing); `lwpt format --check` exits non-zero on drift and is what CI and
-the Lefthook pre-commit hook run. Style rules are encoded in the tool —
+casing); `lwpt format --check` exits non-zero on drift and is what CI
+runs, while the Lefthook pre-commit hook runs the rewriting form and
+re-stages what it changed. Style rules are encoded in the tool —
 adding a rule means changing lwpt's formatter, not adding a config file
 here.

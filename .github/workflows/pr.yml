@@ -27,6 +27,11 @@ on:
 permissions:
   contents: read
 
+# A superseded push must not keep three runners busy on a stale head.
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   LWPT_VERSION: "0.7.0"
 
@@ -56,11 +61,14 @@ jobs:
             fpc-win-target: x86_64-win64
             exe: .exe
     runs-on: ${{ matrix.runner }}
+    # A wedged loopback battery would otherwise hold the runner for the
+    # six-hour default (issue #11 documents nw delivery stalls).
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -70,12 +78,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fpc
           fpc -iV
+          [ "$(fpc -iV)" = "3.2.2" ] || { echo "::error::FPC $(fpc -iV) installed, 3.2.2 pinned"; exit 1; }
 
       - name: Install FPC (brew)
         if: matrix.fpc-install == 'brew'
         run: |
           brew install fpc
           fpc -iV
+          [ "$(fpc -iV)" = "3.2.2" ] || { echo "::error::FPC $(fpc -iV) installed, 3.2.2 pinned"; exit 1; }
 
       # One official installer carries native win32 and the win64 cross
       # set (choco's package is i386-only and downloads.freepascal.org
@@ -168,23 +178,40 @@ jobs:
         if: matrix.fpc-install == 'apt'
         run: lwpt agents --check
 
+      # The [health] and [duplication] ceilings in lwpt.toml are
+      # regression ratchets; they only ratchet if something runs them.
+      - name: lwpt health (complexity ceilings)
+        if: matrix.fpc-install == 'apt'
+        run: lwpt health
+
+      - name: lwpt duplication (clone ceiling)
+        if: matrix.fpc-install == 'apt'
+        run: lwpt duplication
+
       - name: lwpt build (compile every [build] entry)
         run: lwpt build
 
-      - name: lwpt test (seven co-located unit suites)
+      - name: lwpt test (co-located unit suites)
         run: lwpt test
 
+      # WSINTEROP_REQUIRE_TLS turns the wss:// section from "skip when
+      # OpenSSL is missing" into a failure: the Linux leg is the only
+      # runtime TLS coverage the server has, and a green run that
+      # silently skipped it is no coverage at all.
       - name: wsinterop (live-socket battery, own client vs own server)
+        env:
+          WSINTEROP_REQUIRE_TLS: ${{ matrix.fpc-install == 'apt' && '1' || '' }}
         run: ./build/wsinterop${{ matrix.exe }}
 
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Lint Markdown
-        uses: DavidAnson/markdownlint-cli2-action@v19
+        uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
         with:
           globs: "**/*.md"

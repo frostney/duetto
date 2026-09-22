@@ -4,9 +4,9 @@
 #
 #   tools/autobahn.sh client   # fuzzingserver in Docker tests build/wsautobahn
 #   tools/autobahn.sh server   # fuzzingclient in Docker tests build/wsecho
-#                              # (Linux only — wsecho is the epoll server,
-#                              #  and the container reaches it via host
-#                              #  networking)
+#                              # (Linux only — the container reaches the
+#                              #  host's listener via --network=host,
+#                              #  which Docker only offers on Linux)
 #
 # Reports land under tests/autobahn/reports/ (gitignored). Binaries are
 # expected in build/ — run `lwpt build` first.
@@ -16,7 +16,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG_DIR="$ROOT/tests/autobahn"
 REPORT_DIR="$CONFIG_DIR/reports"
-IMAGE="crossbario/autobahn-testsuite"
+# Tag + digest: the suite's verdicts are only comparable run to run if
+# the judge does not change underneath them. Bump both together.
+IMAGE="crossbario/autobahn-testsuite:25.10.1@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074"
 MODE="${1:-}"
 
 wait_for_port() {
@@ -55,8 +57,8 @@ run_client_suite() {
 
 run_server_suite() {
   # Direction 2: the suite is the client, our server (wsecho) is the peer
-  # under test. wsecho is Linux/epoll only, and the container reaches the
-  # host's listeners via --network=host, which also only works on Linux.
+  # under test. wsecho runs on every platform, but the container reaches
+  # the host's listeners via --network=host, which only works on Linux.
   if [ "$(uname -s)" != "Linux" ]; then
     echo "error: the server direction needs Linux (epoll server + host networking)" >&2
     exit 1
