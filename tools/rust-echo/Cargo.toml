@@ -1,7 +1,8 @@
-# tungstenite echo baseline for COMPARISON.md.
-# On rustc 1.75 (Ubuntu 24.04 apt), after `cargo build` resolves, run:
-#   cargo update -p idna_adapter --precise 1.1.0
-# (newer idna_adapter requires edition2024), then `cargo build --release`.
+# tungstenite echo baseline for docs/comparison.md (tools/benchmatrix.sh).
+# Cargo.lock is committed (resolved with rustc 1.98): `cargo build
+# --release --locked` builds the measured versions. An older toolchain
+# (e.g. rustc 1.75 from Ubuntu 24.04 apt) may need newer crates held back,
+# e.g. `cargo update -p idna_adapter --precise 1.1.0`.
 [package]
 name = "rust-echo"
 version = "0.1.0"

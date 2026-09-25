@@ -39,6 +39,6 @@ Thumbs.db
 reports-macos/
 
 # tools/rust-echo cargo output (tools/benchmatrix.sh's default RUST_ECHO
-# path builds here).
+# path builds here). Its Cargo.lock is committed: the contender should
+# build the same dependency versions on every machine.
 tools/rust-echo/target/
-tools/rust-echo/Cargo.lock

@@ -132,10 +132,17 @@ run_one() { # name size command... (call next_port first; the command uses $PORT
     return
   fi
   local out best
+  local rc=0
   run_generator "$TIMEOUT" "$DUR" ${GEN_PIN[@]+"${GEN_PIN[@]}"} "$STDBUF" -oL \
-    "$LOAD_TEST" 100 127.0.0.1 "$PORT" 0 0 "$size"
-  out=$(grep -o 'Msg/sec: [0-9.]*' "$GEN_LOG" | awk '{print $2}')
+    "$LOAD_TEST" 100 127.0.0.1 "$PORT" 0 0 "$size" || rc=$?
   stop_server
+  # The run is meant to end by timeout (124). Anything else means the
+  # generator stopped early, and its samples are not a full run.
+  if [ "$rc" -ne 124 ] && [ "$rc" -ne 0 ]; then
+    printf '%-14s payload=%-7s ->  generator exited early (status %s)\n' "$name" "$size" "$rc"
+    return
+  fi
+  out=$(grep -o 'Msg/sec: [0-9.]*' "$GEN_LOG" | awk '{print $2}')
   if [ -z "$out" ]; then
     printf '%-14s payload=%-7s ->  no samples (generator failed or DUR too short)\n' "$name" "$size"
     return
@@ -154,7 +161,7 @@ echo "== plain echo, 100 connections, ${DUR}s each," \
 [ -x "$DUETTO" ] ||
   echo "duetto         skipped ($DUETTO missing — lwpt build --mode release)"
 [ -x "$RUST_ECHO" ] ||
-  echo "tungstenite    skipped ($RUST_ECHO missing — cargo build --release in tools/rust-echo)"
+  echo "tungstenite    skipped ($RUST_ECHO missing — cargo build --release --locked in tools/rust-echo)"
 [ -n "$PY_MAJOR" ] ||
   echo "py-websockets  skipped ($PYTHON has no websockets module)"
 for size in $SIZES; do
