@@ -112,14 +112,9 @@ type
   // the drop; the handler must run exactly once per connection and the
   // server must survive it.
   TCloseSender = class
-  private
-    FLock: TCriticalSection;
-    FCloses: Integer;
   public
-    constructor Create;
-    destructor Destroy; override;
+    Closes: LongInt; // interlocked: handlers may run on any queue
     procedure HandleClose(AConn: TWSConnection);
-    function Closes: Integer;
   end;
 
   TServerThread = class(TThread)
@@ -269,43 +264,15 @@ begin
   end;
 end;
 
-constructor TCloseSender.Create;
-begin
-  inherited Create;
-  FLock := TCriticalSection.Create;
-end;
-
-destructor TCloseSender.Destroy;
-begin
-  FLock.Free;
-  inherited;
-end;
-
 procedure TCloseSender.HandleClose(AConn: TWSConnection);
 var
   Farewell: RawByteString;
-  I: Integer;
 begin
-  FLock.Acquire;
-  try
-    Inc(FCloses);
-  finally
-    FLock.Release;
-  end;
+  InterLockedIncrement(Closes);
+  // The peer reset: this send fails, and the result is the only thing
+  // it may report (False = dropped; the reference is dead afterwards).
   Farewell := StringOfChar('x', 4096);
-  // False = dropped: the reference is dead, stop touching it.
-  for I := 1 to 4 do
-    if not AConn.SendText(@Farewell[1], Length(Farewell)) then Exit;
-end;
-
-function TCloseSender.Closes: Integer;
-begin
-  FLock.Acquire;
-  try
-    Result := FCloses;
-  finally
-    FLock.Release;
-  end;
+  AConn.SendText(@Farewell[1], Length(Farewell));
 end;
 
 procedure TServerThread.Execute;
@@ -526,28 +493,6 @@ begin
   if AMasked then
     ApplyMask(PByte(Body), Length(Body), Key, 0);
   Move(Body[0], Result[HLen + 1], Length(Body));
-end;
-
-// Read (and discard) one complete frame after ALeftover; False on EOF or
-// timeout. Used where a round trip only has to prove the peer is live.
-function RawReadEchoOnce(AFd: Tsocket; const ALeftover: TBytes): Boolean;
-var
-  Buf: TBytes;
-  Len, Got: NativeInt;
-  H: TWSFrameHeader;
-begin
-  Buf := Copy(ALeftover);
-  Len := Length(Buf);
-  repeat
-    if (ParseFrameHeader(PByte(Buf), Len, H) = wprOK) and
-       (Len - H.HeaderLen >= NativeInt(H.PayloadLen)) then
-      Exit(True);
-    SetLength(Buf, Len + 4096);
-    Got := fpRecv(AFd, @Buf[Len], 4096, 0);
-    if Got <= 0 then Exit(False);
-    Inc(Len, Got);
-    SetLength(Buf, Len);
-  until False;
 end;
 
 // False = the peer is already gone (the send failed or went short). Only
@@ -2051,11 +1996,9 @@ begin
   begin
     Fd := RawConnect(CloseSrvT.Srv.Port);
     fpSetSockOpt(Fd, SOL_SOCKET, SO_LINGER, @CloseHard, SizeOf(CloseHard));
-    Left := RawHandshake(Fd);
-    // One echo round proves OnOpen ran, so the reset hits an open
-    // connection rather than a handshake.
-    RawSendFrame(Fd, WS_OP_TEXT, 'open', True);
-    RawReadEchoOnce(Fd, Left);
+    // The server is open (and OnOpen has run) before its 101 is queued,
+    // so the reset below hits an open connection, not a handshake.
+    RawHandshake(Fd);
     CloseSocket(Fd); // SO_LINGER 0: RST
   end;
   Deadline := GetTickCount64 + 5000;
