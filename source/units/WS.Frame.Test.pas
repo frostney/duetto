@@ -56,6 +56,7 @@ type
     procedure TestSplitEqualsWhole;
     procedure TestRFCMaskVector;
     procedure TestZeroLengthIsSafe;
+    procedure TestMovePayload;
   end;
 
 { ───────── helpers ───────── }
@@ -402,6 +403,28 @@ begin
   Test('NeedMore at every truncation point',      TestNeedMoreAtEveryTruncation);
 end;
 
+procedure TFrameMasking.TestMovePayload;
+var
+  Src, Dst: array[0..299] of Byte;
+  Len, I, Mismatch: Integer;
+begin
+  RandSeed := 4242;
+  for I := 0 to High(Src) do Src[I] := Byte(Random(256));
+  Mismatch := 0;
+  for Len := 0 to 260 do
+  begin
+    FillChar(Dst, SizeOf(Dst), $A5);
+    MovePayload(@Src[3], @Dst[5], Len);
+    if not CompareMem(@Src[3], @Dst[5], Len) then Inc(Mismatch);
+    // nothing outside [5, 5 + Len) is touched
+    for I := 0 to 4 do
+      if Dst[I] <> $A5 then Inc(Mismatch);
+    for I := 5 + Len to High(Dst) do
+      if Dst[I] <> $A5 then Inc(Mismatch);
+  end;
+  Expect<Integer>(Mismatch).ToBe(0);
+end;
+
 procedure TFrameMasking.SetupTests;
 begin
   Test('naive = u64 = sse2 = ApplyMask, len 0..130 x off 0..3',
@@ -410,6 +433,7 @@ begin
   Test('split-chunk unmask equals whole',         TestSplitEqualsWhole);
   Test('RFC mask key vector',                     TestRFCMaskVector);
   Test('zero length is safe in every impl',       TestZeroLengthIsSafe);
+  Test('MovePayload copies exactly len 0..260',   TestMovePayload);
 end;
 
 begin

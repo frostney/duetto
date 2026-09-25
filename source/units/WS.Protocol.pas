@@ -256,7 +256,7 @@ begin
   Need := FOutLen + ALen;
   if Need > Length(FOut) then
     SetLength(FOut, Need + Need shr 1 + 256);
-  Move(P^, FOut[FOutLen], ALen);
+  MovePayload(P, @FOut[FOutLen], ALen);
   Inc(FOutLen, ALen);
 end;
 
@@ -523,7 +523,7 @@ begin
     Need := FMsgLen + ALen;
     if Need > Length(FMsg) then
       SetLength(FMsg, Need + Need shr 1 + 64);
-    Move(P^, FMsg[FMsgLen], ALen);
+    MovePayload(P, @FMsg[FMsgLen], ALen);
     FMsgLen := Need;
   end;
 end;
@@ -558,7 +558,7 @@ begin
     // never sit in the carry, so this stays small (header + 125 max).
     if FCarryLen + ALen > Length(FCarry) then
       SetLength(FCarry, FCarryLen + ALen);
-    Move(P^, FCarry[FCarryLen], ALen);
+    MovePayload(P, @FCarry[FCarryLen], ALen);
     Inc(FCarryLen, ALen);
     Work := @FCarry[0];
     WLen := FCarryLen;

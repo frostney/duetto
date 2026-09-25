@@ -58,6 +58,12 @@ function WriteFrameHeader(ABuf: PByte; AFin: Boolean; ARsv1: Boolean;
 // available implementation.
 procedure ApplyMask(P: PByte; ALen: PtrUInt; AKey: UInt32; AKeyOffset: PtrUInt);
 
+// Non-overlapping copy for payload bytes. The RTL's Move runs 3-4x
+// slower than libc memcpy from 1 KiB up (wsbench "payload copy"), so on
+// Unix this is memcpy; elsewhere it stays Move. Overlapping ranges must
+// use Move.
+procedure MovePayload(ASrc, ADst: PByte; ALen: PtrUInt); inline;
+
 // Individual implementations, exported so wsbench can race them and the
 // tests can assert equivalence.
 procedure UnmaskNaive(P: PByte; ALen: PtrUInt; ARotKey: UInt32);
@@ -197,6 +203,22 @@ begin
   end;
 
   Result := N;
+end;
+
+{$ifdef UNIX}
+// Named library, not a bare external: a program without cthreads links
+// statically unless something asks for libc.
+function C_memcpy(ADst, ASrc: Pointer; ALen: PtrUInt): Pointer; cdecl;
+  external 'c' name 'memcpy';
+{$endif}
+
+procedure MovePayload(ASrc, ADst: PByte; ALen: PtrUInt);
+begin
+{$ifdef UNIX}
+  C_memcpy(ADst, ASrc, ALen);
+{$else}
+  Move(ASrc^, ADst^, ALen);
+{$endif}
 end;
 
 procedure UnmaskNaive(P: PByte; ALen: PtrUInt; ARotKey: UInt32);

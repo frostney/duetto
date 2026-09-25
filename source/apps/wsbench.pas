@@ -3,6 +3,7 @@ program wsbench;
 // Component benchmarks for every duetto layer, bottom-up:
 //
 //   masking      — naive byte loop vs UInt64 XOR vs SSE2 (GB/s)
+//   payload copy — RTL Move vs MovePayload at 1 KiB / 16 KiB / 256 KiB
 //   frame parse  — ParseFrameHeader over a packed stream (frames/s)
 //   utf-8        — fast-path Utf8Advance vs pure-DFA, ASCII + multibyte
 //   handshake    — ServerParseRequest + ServerBuildResponse (ops/s)
@@ -97,6 +98,52 @@ begin
   Sum := 0;
   for I := 0 to 63 do Sum := Sum xor Buf[I];
   if Sum = 173 then Write('');
+end;
+
+type
+  TCopyProc = procedure(ASrc, ADst: PByte; ALen: PtrUInt);
+
+procedure RtlMove(ASrc, ADst: PByte; ALen: PtrUInt);
+begin
+  Move(ASrc^, ADst^, ALen);
+end;
+
+procedure MovePayloadProc(ASrc, ADst: PByte; ALen: PtrUInt);
+begin
+  MovePayload(ASrc, ADst, ALen);
+end;
+
+// Repeats AProc over ASize bytes until MaskSecs has passed; GB/s.
+function TimeCopy(AProc: TCopyProc; ASrc, ADst: PByte; ASize: PtrUInt): Double;
+var
+  T, Deadline, Reps: Int64;
+  I: Integer;
+begin
+  Reps := 0;
+  T := Now64;
+  Deadline := T + Round(MaskSecs * 1e6);
+  repeat
+    for I := 1 to 64 do AProc(ASrc, ADst, ASize);
+    Inc(Reps, 64);
+  until Now64 >= Deadline;
+  Result := ASize / (1024.0 * 1024 * 1024) * Reps / ((Now64 - T) / 1e6);
+end;
+
+procedure BenchCopy;
+const
+  Sizes: array[0..2] of Integer = (1024, 16 * 1024, 256 * 1024);
+var
+  Src, Dst: TBytes;
+  I: Integer;
+begin
+  SetLength(Src, 256 * 1024);
+  SetLength(Dst, 256 * 1024);
+  for I := 0 to High(Src) do Src[I] := Byte(I);
+  WriteLn('-- payload copy (cache-warm, repeated for ', MaskSecs:0:1, ' s each) --');
+  for I := 0 to High(Sizes) do
+    WriteLn(Format('%7d B : RTL Move %6.1f GB/s   MovePayload %6.1f GB/s',
+      [Sizes[I], TimeCopy(RtlMove, PByte(Src), PByte(Dst), Sizes[I]),
+       TimeCopy(MovePayloadProc, PByte(Src), PByte(Dst), Sizes[I])]));
 end;
 
 procedure BenchFrameParse;
@@ -342,6 +389,7 @@ begin
     {$ifdef PRODUCTION} 'release build' {$else} 'DEV BUILD, checks on: numbers are not representative' {$endif}, ')');
   WriteLn;
   BenchMasking; WriteLn;
+  BenchCopy; WriteLn;
   BenchFrameParse; WriteLn;
   BenchUtf8; WriteLn;
   BenchHandshake; WriteLn;
