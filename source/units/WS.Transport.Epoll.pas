@@ -11,9 +11,11 @@ unit WS.Transport.Epoll;
 // remainder; EPOLLIN reads into ONE shared 256 KB buffer delivered via
 // OnData, so by the next readiness event the buffer is free again. Zero
 // steady-state allocation on the hot echo path. A readiness event reads
-// until a short read (the queue is drained) or MaxFullReadsPerEvent full
-// ones, never to EAGAIN: that last recv is a wasted syscall per message,
-// and a peer that keeps its queue full would hold the loop forever.
+// until a short read (nothing more was readable at that instant) or
+// MaxFullReadsPerEvent full ones, never to EAGAIN: that last recv is a
+// wasted syscall per message, and a peer that keeps its queue full would
+// hold the loop forever. Readiness is level-triggered, so whatever is
+// left is re-reported on the next epoll_wait.
 //
 // Server TLS (duetto#22) rides WS.Transport.TlsServer, which wraps
 // lwpt's memory-BIO accept API. The reactor stays a byte mover: it owns
@@ -168,10 +170,13 @@ const
   // connection carries a deadline — a plaintext listener never sees it.
   TlsDeadlinePollMs = 100;
   // Full-length reads one readiness event may take before the reactor
-  // moves on to the rest of the batch (4 x 256 KB plaintext, 4 x the
-  // encrypted-input watermark under TLS). Level-triggered EPOLLIN
-  // re-reports whatever is left on the next epoll_wait, so this bounds
-  // how long one peer holds the loop without dropping any of its bytes.
+  // moves on to the rest of the batch: 4 x 256 KB on a non-TLS
+  // connection, 4 x the encrypted-input watermark under TLS. Level-
+  // triggered EPOLLIN re-reports whatever is left on the next
+  // epoll_wait, so this bounds how long one peer holds the loop without
+  // dropping any of its bytes. 4 lets a bulk sender move ~1 MB per turn,
+  // so epoll_wait round trips stay rare, and caps what any one peer can
+  // take per turn at that same ~1 MB.
   MaxFullReadsPerEvent = 4;
   ShutdownWrite = 1; // shutdown(): SHUT_WR
 
@@ -911,11 +916,12 @@ begin
     // generation compare cannot.
     if (Fd >= Length(FConns)) or (FConns[Fd] = nil) or
       (FConns[Fd].Id <> Gen) then Exit;
-    // A short read drained the receive queue: the next recv would only
-    // report EAGAIN, and anything landing meanwhile is re-reported by
-    // level-triggered EPOLLIN. A full buffer may have more behind it, but
-    // only up to MaxFullReadsPerEvent, so one flooding peer cannot starve
-    // the rest of the batch.
+    // A short read means nothing more was readable at that instant: the
+    // next recv would almost always report EAGAIN, and anything that is
+    // or becomes readable is re-reported by level-triggered EPOLLIN. A
+    // full buffer may have more behind it, but only up to
+    // MaxFullReadsPerEvent, so one flooding peer cannot starve the rest
+    // of the batch.
     if Got < Length(FRecv) then Exit;
     Inc(FullReads);
     if FullReads >= MaxFullReadsPerEvent then Exit;
