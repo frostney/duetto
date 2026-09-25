@@ -90,7 +90,10 @@ type
     // in freed memory). True = the connection is still alive,
     // including the no-op cases (not yet open, already closing). This
     // matches the pre-seam reactor's drop semantics; ignoring the
-    // result is legal Pascal and keeps old callers valid.
+    // result is legal Pascal and keeps old callers valid. Inside
+    // OnClientClose the connection is already being torn down: a send
+    // reports False and does nothing else — no second OnClientClose —
+    // and the reference stays valid until the handler returns.
     //
     // True is a liveness signal, NOT a delivery or queueing one: it is
     // also what you get when the call did nothing at all (state is not

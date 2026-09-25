@@ -113,7 +113,9 @@ type
   // server must survive it.
   TCloseSender = class
   public
-    Closes: LongInt; // interlocked: handlers may run on any queue
+    // Interlocked: handlers may run on any queue.
+    Closes: LongInt;
+    Accepted: LongInt; // farewell sends that claimed success: must stay 0
     procedure HandleClose(AConn: TWSConnection);
   end;
 
@@ -267,12 +269,29 @@ end;
 procedure TCloseSender.HandleClose(AConn: TWSConnection);
 var
   Farewell: RawByteString;
+  {$ifdef UNIX}
+  Pair: array[0..1] of cint;
+  {$endif}
 begin
   InterLockedIncrement(Closes);
-  // The peer reset: this send fails, and the result is the only thing
-  // it may report (False = dropped; the reference is dead afterwards).
+  {$ifdef UNIX}
+  // Take the lowest free descriptors first: on a transport that closed
+  // the connection's fd before this callback, one of them now carries
+  // that number, and a send that still reached the fd would succeed.
+  Pair[0] := -1;
+  fpsocketpair(AF_UNIX, SOCK_STREAM, 0, @Pair[0]);
+  {$endif}
+  // The peer reset: the send may only report the drop.
   Farewell := StringOfChar('x', 4096);
-  AConn.SendText(@Farewell[1], Length(Farewell));
+  if AConn.SendText(@Farewell[1], Length(Farewell)) then
+    InterLockedIncrement(Accepted);
+  {$ifdef UNIX}
+  if Pair[0] >= 0 then
+  begin
+    CloseSocket(Pair[0]);
+    CloseSocket(Pair[1]);
+  end;
+  {$endif}
 end;
 
 procedure TServerThread.Execute;
@@ -2008,6 +2027,9 @@ begin
   Check(CloseSender.Closes = CloseResetCount,
     Format('%d reset peers: OnClientClose once each despite sending (%d)',
       [CloseResetCount, CloseSender.Closes]));
+  Check(CloseSender.Accepted = 0,
+    Format('farewell sends into reset peers all report the drop (%d did not)',
+      [CloseSender.Accepted]));
   Cli := TWSClient.Create;
   Cli.Connect(Format('ws://127.0.0.1:%d/', [CloseSrvT.Srv.Port]));
   Cli.SendText(HelloProbe);
