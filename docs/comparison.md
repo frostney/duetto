@@ -186,8 +186,9 @@ server's core. uSockets, under uWebSockets, also stops at a short read
 uWebSockets' own `EchoServer` on its io_uring backend (liburing, same
 commit) against its epoll build, separate cores, same session: +5.6% at
 20 B (747,143 vs 707,594), +10.5% at 1 KiB (759,608 vs 687,467); the
-io_uring backend crashed at 16 KiB and above. A single-digit gain for a
-new transport did not justify the work.
+io_uring backend crashed at 16 KiB and above. A 6–10% gain at small
+payloads, from a backend that did not survive large ones, did not justify
+a new transport.
 
 ### permessage-deflate
 
