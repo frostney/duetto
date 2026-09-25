@@ -8,6 +8,9 @@
   carry-buffer path. The delivery suite pins both payload paths: a whole
   frame is handed over from the ingested buffer itself, a frame split
   across reads is assembled, and either way the bytes are the payload.
+  The direct-send suite pins the gather-write contract: when a header
+  may be built at all, and that whatever part of header + payload the
+  transport did not take lands in the out queue byte for byte.
   Wire close codes are asserted by parsing the actual queued close frame,
   not by trusting the property. }
 
@@ -93,6 +96,14 @@ type
     procedure TestSplitTextAtEveryCut;
     procedure TestBadUtf8WholeFrame;
     procedure TestFragmentsAssembled;
+  end;
+
+  TProtoDirect = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestHeaderOnlyWhenEligible;
+    procedure TestHeaderMatchesQueuedFrame;
+    procedure TestRemainderForEveryTakenCount;
   end;
 
   TProtoDeflate = class(TTestSuite)
@@ -1076,6 +1087,126 @@ begin
   Test('byte-by-byte compressed ingest',       TestByteByByteCompressed);
 end;
 
+{ ───────── direct (gather-write) send ───────── }
+
+function QueuedBytes(P: TWSProtocol): TBytes;
+begin
+  SetLength(Result, P.OutPending);
+  if Length(Result) > 0 then Move(P.OutPtr^, Result[0], Length(Result));
+end;
+
+procedure TProtoDirect.TestHeaderOnlyWhenEligible;
+var
+  S, C, SD, CD: TWSProtocol;
+  SS: TSink;
+  Hdr: array[0..WS_MAX_HEADER - 1] of Byte;
+begin
+  SS := TSink.Create;
+  S := NewServer(SS);
+  C := TWSProtocol.Create(wsrClient, NoDeflate);
+  NegotiatedPair(CD, SD);
+  try
+    // Server, nothing queued, no deflate: eligible.
+    Expect<Integer>(S.DirectHeader(False, 100, @Hdr[0])).ToBe(2);
+    Expect<Integer>(S.DirectHeader(True, 70000, @Hdr[0])).ToBe(10);
+    // Client frames are masked into our own copy: never direct.
+    Expect<Integer>(C.DirectHeader(False, 100, @Hdr[0])).ToBe(0);
+    // Deflate rewrites the payload: never direct.
+    Expect<Integer>(SD.DirectHeader(False, 100, @Hdr[0])).ToBe(0);
+    // Something already queued: a direct write would overtake it.
+    S.SendPing(nil, 0);
+    Expect<Integer>(S.DirectHeader(False, 100, @Hdr[0])).ToBe(0);
+    S.OutConsume(S.OutPending);
+    Expect<Integer>(S.DirectHeader(False, 100, @Hdr[0])).ToBe(2);
+    // Close sent: data must be dropped, as SendBinary would.
+    S.SendClose(1000, '');
+    S.OutConsume(S.OutPending);
+    Expect<Integer>(S.DirectHeader(False, 100, @Hdr[0])).ToBe(0);
+  finally
+    S.Free; C.Free; SD.Free; CD.Free; SS.Free;
+  end;
+end;
+
+// Header + payload sent directly must be byte-identical to the frame
+// SendBinary / SendText would have queued.
+procedure TProtoDirect.TestHeaderMatchesQueuedFrame;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Hdr: array[0..WS_MAX_HEADER - 1] of Byte;
+  Payload, Queued, Direct: TBytes;
+  HLen, I, Bad: Integer;
+  Sizes: array[0..4] of Integer = (0, 125, 126, 65535, 65536);
+begin
+  Bad := 0;
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    for I := 0 to High(Sizes) do
+    begin
+      Payload := Pattern(Sizes[I], 9);
+      S.SendBinary(PByte(Payload), Length(Payload));
+      Queued := QueuedBytes(S);
+      S.OutConsume(S.OutPending);
+      HLen := S.DirectHeader(False, Length(Payload), @Hdr[0]);
+      SetLength(Direct, HLen);
+      Move(Hdr[0], Direct[0], HLen);
+      Direct := Concat(Direct, Payload);
+      if not SameBytes(Direct, Queued) then Inc(Bad);
+    end;
+    S.SendText('text opcode');
+    Queued := QueuedBytes(S);
+    S.OutConsume(S.OutPending);
+    HLen := S.DirectHeader(True, 11, @Hdr[0]);
+    if (HLen <> 2) or (Hdr[0] <> Queued[0]) or (Hdr[1] <> Queued[1]) then
+      Inc(Bad);
+  finally
+    S.Free; SS.Free;
+  end;
+  Expect<Integer>(Bad).ToBe(0);
+end;
+
+// For every possible "bytes taken" 0..HLen+Len, the out queue must hold
+// exactly the untaken tail of header + payload.
+procedure TProtoDirect.TestRemainderForEveryTakenCount;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Hdr: array[0..WS_MAX_HEADER - 1] of Byte;
+  Payload, Whole, Tail: TBytes;
+  HLen, Taken, Bad: Integer;
+begin
+  Bad := 0;
+  Payload := Pattern(300, 5);
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    HLen := S.DirectHeader(False, Length(Payload), @Hdr[0]);
+    SetLength(Whole, HLen);
+    Move(Hdr[0], Whole[0], HLen);
+    Whole := Concat(Whole, Payload);
+    for Taken := 0 to Length(Whole) do
+    begin
+      S.DirectSent(@Hdr[0], HLen, PByte(Payload), Length(Payload), Taken);
+      Tail := System.Copy(Whole, Taken, Length(Whole) - Taken);
+      if not SameBytes(QueuedBytes(S), Tail) then Inc(Bad);
+      S.OutConsume(S.OutPending);
+    end;
+  finally
+    S.Free; SS.Free;
+  end;
+  Expect<Integer>(Bad).ToBe(0);
+end;
+
+procedure TProtoDirect.SetupTests;
+begin
+  Test('header only for server, no deflate, empty queue, open',
+                                                   TestHeaderOnlyWhenEligible);
+  Test('header + payload = the frame SendBinary queues',
+                                                   TestHeaderMatchesQueuedFrame);
+  Test('untaken tail queued for every taken count', TestRemainderForEveryTakenCount);
+end;
+
 begin
   NoDeflate.Reset;
   TestRunnerProgram.AddSuite(TProtoEcho.Create('Protocol: echo'));
@@ -1083,6 +1214,7 @@ begin
   TestRunnerProgram.AddSuite(TProtoUtf8.Create('Protocol: UTF-8 policing'));
   TestRunnerProgram.AddSuite(TProtoClose.Create('Protocol: close handshake'));
   TestRunnerProgram.AddSuite(TProtoDelivery.Create('Protocol: payload delivery'));
+  TestRunnerProgram.AddSuite(TProtoDirect.Create('Protocol: direct send'));
   TestRunnerProgram.AddSuite(TProtoDeflate.Create('Protocol: permessage-deflate'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;

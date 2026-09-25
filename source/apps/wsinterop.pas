@@ -1441,6 +1441,90 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Egress backpressure probe (plaintext)
+// ---------------------------------------------------------------------------
+
+const
+  // Eight 1 MiB echoes against a 64 KiB client receive buffer: more than
+  // Linux's 4 MiB autotuned send buffer can absorb, so the server's
+  // write is guaranteed to go short mid-message.
+  EgressCount = 8;
+  EgressSize = 1024 * 1024;
+  EgressRecvBuf = 64 * 1024;
+  EgressStallMs = 300;
+
+type
+  // Writes the frames from its own thread, so the probe can stall its
+  // reader without deadlocking against a transport that stops reading
+  // while its output is backed up.
+  TEgressSender = class(TThread)
+  public
+    Fd: Tsocket;
+    Ok: Boolean;
+    procedure Execute; override;
+  end;
+
+function EgressPayload(AIndex: Integer): RawByteString;
+var
+  I: Integer;
+begin
+  SetLength(Result, EgressSize);
+  for I := 1 to EgressSize do
+    Result[I] := AnsiChar((I * 13 + AIndex * 71) and $FF);
+end;
+
+procedure TEgressSender.Execute;
+var
+  I: Integer;
+begin
+  Ok := True;
+  for I := 0 to EgressCount - 1 do
+    Ok := RawSendFrame(Fd, WS_OP_BINARY, EgressPayload(I), True) and Ok;
+end;
+
+// Read EgressCount unmasked binary frames and compare each with
+// EgressPayload(i), in order. False on EOF / timeout, an unexpected
+// frame, or a byte mismatch.
+function RawReadEgressEchoes(AFd: Tsocket; const ALeftover: TBytes): Boolean;
+var
+  Buf: TBytes;
+  Len, Off, Got: NativeInt;
+  H: TWSFrameHeader;
+  Seen: Integer;
+  Want: RawByteString;
+begin
+  Result := False;
+  Buf := Copy(ALeftover);
+  Len := Length(Buf);
+  Off := 0;
+  Seen := 0;
+  while Seen < EgressCount do
+  begin
+    // Pointer arithmetic, not @Buf[Off]: Off = Len is the normal
+    // "need more" state and would trip the range check.
+    if (ParseFrameHeader(PByte(Buf) + Off, Len - Off, H) = wprOK) and
+       (Len - Off - H.HeaderLen >= NativeInt(H.PayloadLen)) then
+    begin
+      if (H.Opcode <> WS_OP_BINARY) or H.Masked or
+         (NativeInt(H.PayloadLen) <> EgressSize) then
+        Exit;
+      Want := EgressPayload(Seen);
+      if not CompareMem(PByte(Buf) + Off + H.HeaderLen, @Want[1], EgressSize) then
+        Exit;
+      Inc(Off, H.HeaderLen + NativeInt(H.PayloadLen));
+      Inc(Seen);
+      Continue;
+    end;
+    if Length(Buf) - Len < 65536 then
+      SetLength(Buf, Len + 256 * 1024);
+    Got := fpRecv(AFd, @Buf[Len], Length(Buf) - Len, 0);
+    if Got <= 0 then Exit;
+    Inc(Len, Got);
+  end;
+  Result := True;
+end;
+
+// ---------------------------------------------------------------------------
 
 const
   HelloProbe: RawByteString = 'hello duetto';
@@ -1473,6 +1557,7 @@ var
   Deadline: QWord;
   LiveEcho: LongInt;
   Watchdog: TStressWatchdog;
+  EgressSender: TEgressSender;
   StressDone: Boolean;
   StressPhase: ShortString;
   TotalCycles, TotalPushes, TotalDrops, TotalTransient: Integer;
@@ -1687,6 +1772,27 @@ begin
   Code := RawReadCloseCode(Fd, Left);
   CloseSocket(Fd);
   Check(Code = 1007, 'invalid UTF-8 text -> close 1007');
+
+  // --- server egress backpressure (plaintext) ----------------------------
+  // A reader with a small receive buffer holds off while EgressCount
+  // large frames go out: the server's echo overflows the socket, so its
+  // write goes short and the rest of that frame — and every echo behind
+  // it — waits in the out queue for OnSendReady. Everything must arrive
+  // intact and in order.
+  StressPhase := 'egress backpressure';
+  Fd := RawConnectEx(Port, True, EgressRecvBuf);
+  Left := RawHandshake(Fd);
+  EgressSender := TEgressSender.Create(True);
+  EgressSender.Fd := Fd;
+  EgressSender.Start;
+  Sleep(EgressStallMs);
+  Ok := RawReadEgressEchoes(Fd, Left);
+  EgressSender.WaitFor;
+  Ok := Ok and EgressSender.Ok;
+  EgressSender.Free;
+  CloseSocket(Fd);
+  Check(Ok, Format('%d x %d KiB echoed through a stalled reader, in order',
+    [EgressCount, EgressSize div 1024]));
 
   // --- plain HTTP on the WebSocket port (OnPlainRequest) ------------------
   // A second, short-lived server carries the hook: the fallback is

@@ -34,6 +34,7 @@ uses
   syncobjs,
   SysUtils,
 
+  WS.Frame,
   WS.Handshake,
   WS.Protocol,
   WS.Transport;
@@ -71,6 +72,12 @@ type
     FRegistryIndex: Integer;
     procedure ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
     function GetId: NativeUInt;
+    // Gather-write fast path for SendText/SendBinary: header + the
+    // caller's payload go to the transport in one write, and only what
+    // it did not take is queued — no copy into the protocol's out queue
+    // on the common path. ADone = False: not eligible, use the queue.
+    function SendDirect(AText: Boolean; P: PByte; ALen: NativeInt;
+      out ADone: Boolean): Boolean;
   public
     UserData: Pointer;
     constructor Create;
@@ -290,6 +297,8 @@ uses
 
 const
   HandshakeMaxBytes = 16 * 1024;
+  // Smallest payload worth a gather write over a copy into the queue.
+  DirectSendMin = 1024;
   RegistryGrowth = 64;
 
 type
@@ -332,21 +341,47 @@ begin
     FServer.FOnMessage(Self, AText, P, ALen);
 end;
 
+function TWSConnection.SendDirect(AText: Boolean; P: PByte;
+  ALen: NativeInt; out ADone: Boolean): Boolean;
+var
+  Hdr: array[0..WS_MAX_HEADER - 1] of Byte;
+  HLen: Integer;
+  W: NativeInt;
+begin
+  Result := True;
+  ADone := False;
+  if (ALen < DirectSendMin) or (not FTConn.SupportsGather) then Exit;
+  HLen := FProto.DirectHeader(AText, ALen, @Hdr[0]);
+  if HLen = 0 then Exit;
+  ADone := True;
+  W := FTConn.SubmitSendV(@Hdr[0], HLen, P, ALen);
+  if W < 0 then Exit(FServer.DropConn(Self));
+  FProto.DirectSent(@Hdr[0], HLen, P, ALen, W);
+end;
+
 function TWSConnection.SendText(P: PByte; ALen: NativeInt): Boolean;
+var
+  Done: Boolean;
 begin
   Result := True;
   if FState = wcsOpen then
   begin
+    Result := SendDirect(True, P, ALen, Done);
+    if Done then Exit;
     FProto.SendText(P, ALen);
     Result := FServer.FlushConn(Self);
   end;
 end;
 
 function TWSConnection.SendBinary(P: PByte; ALen: NativeInt): Boolean;
+var
+  Done: Boolean;
 begin
   Result := True;
   if FState = wcsOpen then
   begin
+    Result := SendDirect(False, P, ALen, Done);
+    if Done then Exit;
     FProto.SendBinary(P, ALen);
     Result := FServer.FlushConn(Self);
   end;

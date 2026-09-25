@@ -56,6 +56,16 @@ type
     // -1 when the connection is dead. Short return arms OnSendReady.
     function SubmitSend(P: PByte; ALen: NativeInt): NativeInt; virtual; abstract;
 
+    // Gather send: SubmitSend's contract over P1[0..L1) followed by
+    // P2[0..L2), in one write where the transport can. Only offered by a
+    // transport that writes synchronously and holds neither pointer past
+    // the call (SupportsGather); a completion transport must own the
+    // bytes until completion, so it copies anyway and leaves this off.
+    // The default runs two SubmitSends and is correct everywhere.
+    function SupportsGather: Boolean; virtual;
+    function SubmitSendV(AP1: PByte; AL1: NativeInt; AP2: PByte;
+      AL2: NativeInt): NativeInt; virtual;
+
     // Teardown. The caller must drop every reference before calling and
     // receives no further completions; OnClosed does not fire. The
     // transport frees this object (possibly deferred — see the
@@ -284,6 +294,25 @@ implementation
 
 uses
   SysUtils;
+
+{ TWSTransportConn }
+
+function TWSTransportConn.SupportsGather: Boolean;
+begin
+  Result := False;
+end;
+
+function TWSTransportConn.SubmitSendV(AP1: PByte; AL1: NativeInt; AP2: PByte;
+  AL2: NativeInt): NativeInt;
+var
+  W: NativeInt;
+begin
+  Result := SubmitSend(AP1, AL1);
+  if (Result < AL1) or (AL2 <= 0) then Exit;
+  W := SubmitSend(AP2, AL2);
+  if W < 0 then Exit(-1);
+  Inc(Result, W);
+end;
 
 function WSTransportNoTls: TWSTransportTls;
 begin

@@ -3,7 +3,10 @@
   IPv4, RFC 4291 IPv6 text forms (full, '::' compression, embedded IPv4),
   and a rejection table (hostnames, brackets, zone ids, bad octets,
   wrong group counts, double '::', stray colons) — every row of which
-  must raise naming the input rather than fall through to a resolver. }
+  must raise naming the input rather than fall through to a resolver.
+  Plus the gather-send default every transport inherits: off unless a
+  transport opts in, and when called it behaves as two SubmitSends —
+  stopping at a short first write, reporting a dead connection. }
 
 program WS.Transport.Test;
 
@@ -31,6 +34,142 @@ type
     procedure TestInet6EmbeddedInet4;
     procedure TestRejections;
   end;
+
+  // Scripted SubmitSend: takes up to Budget bytes per call (-1 = dead),
+  // recording what it was offered.
+  TFakeConn = class(TWSTransportConn)
+  public
+    Budget: array of NativeInt;
+    Calls: Integer;
+    Taken: TBytes;
+    function SubmitSend(P: PByte; ALen: NativeInt): NativeInt; override;
+    procedure SubmitClose; override;
+  end;
+
+  TGatherDefault = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestOffByDefault;
+    procedure TestBothTaken;
+    procedure TestShortFirstStops;
+    procedure TestShortSecond;
+    procedure TestDead;
+  end;
+
+function TFakeConn.SubmitSend(P: PByte; ALen: NativeInt): NativeInt;
+var
+  N: NativeInt;
+begin
+  N := Budget[Calls];
+  Inc(Calls);
+  if N < 0 then Exit(-1);
+  if N > ALen then N := ALen;
+  if N > 0 then
+  begin
+    SetLength(Taken, Length(Taken) + N);
+    Move(P^, Taken[Length(Taken) - N], N);
+  end;
+  Result := N;
+end;
+
+procedure TFakeConn.SubmitClose;
+begin
+end;
+
+const
+  HdrBytes: array[0..1] of Byte = ($82, $03);
+  BodyBytes: array[0..2] of Byte = (7, 8, 9);
+
+function NewFake(const ABudget: array of NativeInt): TFakeConn;
+var
+  I: Integer;
+begin
+  Result := TFakeConn.Create;
+  SetLength(Result.Budget, Length(ABudget));
+  for I := 0 to High(ABudget) do Result.Budget[I] := ABudget[I];
+end;
+
+procedure TGatherDefault.TestOffByDefault;
+var
+  C: TFakeConn;
+begin
+  C := NewFake([0]);
+  try
+    Expect<Boolean>(C.SupportsGather).ToBe(False);
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TGatherDefault.TestBothTaken;
+var
+  C: TFakeConn;
+begin
+  C := NewFake([100, 100]);
+  try
+    Expect<Integer>(Integer(C.SubmitSendV(@HdrBytes[0], 2, @BodyBytes[0], 3))).ToBe(5);
+    Expect<Integer>(C.Calls).ToBe(2);
+    Expect<Integer>(Length(C.Taken)).ToBe(5);
+    Expect<Integer>(C.Taken[0]).ToBe($82);
+    Expect<Integer>(C.Taken[4]).ToBe(9);
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TGatherDefault.TestShortFirstStops;
+var
+  C: TFakeConn;
+begin
+  C := NewFake([1, 100]);
+  try
+    // The second buffer must not be offered after a short first write:
+    // it would reach the wire ahead of the header's tail.
+    Expect<Integer>(Integer(C.SubmitSendV(@HdrBytes[0], 2, @BodyBytes[0], 3))).ToBe(1);
+    Expect<Integer>(C.Calls).ToBe(1);
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TGatherDefault.TestShortSecond;
+var
+  C: TFakeConn;
+begin
+  C := NewFake([2, 1]);
+  try
+    Expect<Integer>(Integer(C.SubmitSendV(@HdrBytes[0], 2, @BodyBytes[0], 3))).ToBe(3);
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TGatherDefault.TestDead;
+var
+  C: TFakeConn;
+begin
+  C := NewFake([-1]);
+  try
+    Expect<Integer>(Integer(C.SubmitSendV(@HdrBytes[0], 2, @BodyBytes[0], 3))).ToBe(-1);
+  finally
+    C.Free;
+  end;
+  C := NewFake([2, -1]);
+  try
+    Expect<Integer>(Integer(C.SubmitSendV(@HdrBytes[0], 2, @BodyBytes[0], 3))).ToBe(-1);
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TGatherDefault.SetupTests;
+begin
+  Test('gather send is off unless a transport opts in', TestOffByDefault);
+  Test('both buffers taken',                     TestBothTaken);
+  Test('short first write never offers the second', TestShortFirstStops);
+  Test('short second write reports the total',   TestShortSecond);
+  Test('dead connection reports -1',             TestDead);
+end;
 
 function HexOf(const A: TWSBindAddress; ACount: Integer): string;
 var
@@ -142,6 +281,7 @@ end;
 
 begin
   TestRunnerProgram.AddSuite(TBindLiterals.Create('Transport: bind literals'));
+  TestRunnerProgram.AddSuite(TGatherDefault.Create('Transport: gather-send default'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

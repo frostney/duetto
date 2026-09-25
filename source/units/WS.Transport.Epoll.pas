@@ -47,6 +47,7 @@ uses
 
   Linux,
   Sockets,
+  Syscall,
   TransportSecurity,
   WS.Transport,
   WS.Transport.PostQueue,
@@ -96,6 +97,9 @@ type
   public
     destructor Destroy; override;
     function SubmitSend(P: PByte; ALen: NativeInt): NativeInt; override;
+    function SupportsGather: Boolean; override;
+    function SubmitSendV(AP1: PByte; AL1: NativeInt; AP2: PByte;
+      AL2: NativeInt): NativeInt; override;
     procedure SubmitClose; override;
   end;
 
@@ -253,6 +257,87 @@ begin
       Exit(-1);
     end;
     Result := Result + W;
+  end;
+end;
+
+type
+  TIoVec = record
+    Base: Pointer;
+    Len: PtrUInt;
+  end;
+
+  TMsgHdr = record
+    Name: Pointer;
+    NameLen: Cardinal;
+    Iov: ^TIoVec;
+    IovLen: PtrUInt;
+    Control: Pointer;
+    ControlLen: PtrUInt;
+    Flags: Integer;
+  end;
+
+// Plaintext only: a TLS connection encrypts into its own buffers, so
+// there is nothing to gather.
+function TWSEpollConn.SupportsGather: Boolean;
+begin
+  Result := FTls = nil;
+end;
+
+// One sendmsg over both buffers (the raw syscall, so errno lands where
+// fpgeterrno reads it, exactly as fpSend's does). Same result contract as
+// RawSend: bytes taken, EPOLLOUT armed on EAGAIN, -1 when dead.
+function TWSEpollConn.SubmitSendV(AP1: PByte; AL1: NativeInt; AP2: PByte;
+  AL2: NativeInt): NativeInt;
+var
+  Iov: array[0..1] of TIoVec;
+  Msg: TMsgHdr;
+  W, Total: NativeInt;
+begin
+  if FDead then Exit(-1);
+  if FTls <> nil then Exit(inherited SubmitSendV(AP1, AL1, AP2, AL2));
+  Total := AL1 + AL2;
+  Result := 0;
+  FillChar(Msg, SizeOf(Msg), 0);
+  while Result < Total do
+  begin
+    if Result < AL1 then
+    begin
+      Iov[0].Base := AP1 + Result;
+      Iov[0].Len := AL1 - Result;
+      Iov[1].Base := AP2;
+      Iov[1].Len := AL2;
+      Msg.Iov := @Iov[0];
+      Msg.IovLen := 2;
+    end
+    else
+    begin
+      Iov[0].Base := AP2 + (Result - AL1);
+      Iov[0].Len := Total - Result;
+      Msg.Iov := @Iov[0];
+      Msg.IovLen := 1;
+    end;
+    W := Do_SysCall(syscall_nr_sendmsg, TSysParam(FFd), TSysParam(@Msg),
+      TSysParam(MSG_NOSIGNAL));
+    if W < 0 then
+    begin
+      if fpgeterrno = ESysEAGAIN then
+      begin
+        if not FWantWrite then
+        begin
+          FWantWrite := True;
+          ApplyInterest;
+        end;
+        Exit;
+      end;
+      FDead := True;
+      Exit(-1);
+    end;
+    Result := Result + W;
+  end;
+  if FWantWrite then
+  begin
+    FWantWrite := False;
+    ApplyInterest;
   end;
 end;
 

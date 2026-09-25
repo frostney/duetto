@@ -121,6 +121,17 @@ type
     // OutConsume(however many the socket took).
     function OutPtr: PByte; inline;
     function OutPending: NativeInt; inline;
+
+    // Direct send (gather write). When nothing is queued and a data
+    // message needs no transformation — server role (unmasked), no
+    // deflate, close not yet sent — writes the frame header into AHdr
+    // (WS_MAX_HEADER bytes) and returns its length; the caller may then
+    // hand header + its own payload to the wire in one gather write and
+    // report the bytes taken to DirectSent, which queues the rest.
+    // Returns 0 when the message must go through SendText/SendBinary.
+    function DirectHeader(AText: Boolean; ALen: NativeInt; AHdr: PByte): Integer;
+    procedure DirectSent(AHdr: PByte; AHLen: Integer; P: PByte;
+      ALen, ATaken: NativeInt);
     procedure OutConsume(N: NativeInt);
 
     // Both close frames exchanged (or we failed): time to drop TCP.
@@ -227,6 +238,29 @@ end;
 function TWSProtocol.OutPending: NativeInt;
 begin
   Result := FOutLen - FOutOff;
+end;
+
+function TWSProtocol.DirectHeader(AText: Boolean; ALen: NativeInt;
+  AHdr: PByte): Integer;
+const
+  Opcodes: array[Boolean] of Byte = (WS_OP_BINARY, WS_OP_TEXT);
+begin
+  if (FRole <> wsrServer) or (FDeflater <> nil) or FCloseSent or
+     (FOutLen > FOutOff) then
+    Exit(0);
+  Result := WriteFrameHeader(AHdr, True, False, Opcodes[AText], False, 0, ALen);
+end;
+
+procedure TWSProtocol.DirectSent(AHdr: PByte; AHLen: Integer; P: PByte;
+  ALen, ATaken: NativeInt);
+begin
+  if ATaken < AHLen then
+  begin
+    OutAppend(AHdr + ATaken, AHLen - ATaken);
+    OutAppend(P, ALen);
+  end
+  else
+    OutAppend(P + (ATaken - AHLen), ALen - (ATaken - AHLen));
 end;
 
 procedure TWSProtocol.OutConsume(N: NativeInt);
