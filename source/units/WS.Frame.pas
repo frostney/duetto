@@ -245,11 +245,12 @@ end;
 
 // The main loops of UnmaskU64 / UnmaskCopyU64 run 64 bytes per pass up
 // to an end pointer. The earlier 32-byte form that counted a length down
-// ran anywhere from 36 to 53 GB/s on Zen 5 depending only on where the
-// linker happened to place it (identical code, different address); this
-// shape measured 52-57 GB/s at every placement tried (wsbench, and a
-// harness shifting the loop through eight 8-byte offsets). The tails keep
-// the key phase: every step is a multiple of 4 bytes.
+// ran anywhere from 35 to 53 GB/s on Zen 5 for reasons outside the code:
+// where the loop was placed (a static harness shifting it through eight
+// 8-byte offsets: 35.6-52.5) and how the binary was linked (the same
+// bytes at the same address: ~52 static, ~36 once libc is linked). This
+// shape measured 52-58 GB/s in every one of those configurations. The
+// tails keep the key phase: every step is a multiple of 4 bytes.
 procedure UnmaskU64(P: PByte; ALen: PtrUInt; ARotKey: UInt32);
 var
   K64: UInt64;

@@ -14,9 +14,12 @@ unit WS.Protocol;
 // frame with the appropriate status code (1002 protocol error, 1007 bad
 // payload, 1009 too big). The owner flushes the out buffer, then drops TCP.
 //
-// Ingest MUTATES the buffer it is given (in-place unmask). Socket recv
-// buffers are private to their connection, so this costs nothing and
-// avoids a copy per frame.
+// Ingest MUTATES the buffer it is given (in-place unmask), and may hand
+// OnMessage a pointer into it: the caller must neither reuse nor free
+// that buffer while Ingest runs (a transport's read buffer — shared by
+// every connection on epoll — is refilled only after OnData returns).
+// Ingest is not re-entrant: do not call it from inside its own
+// callbacks.
 
 {$I Shared.inc}
 
@@ -99,6 +102,7 @@ type
     function HandleControl(const H: TWSFrameHeader; P: PByte): Boolean;
     function BeginDataFrame(const H: TWSFrameHeader): Boolean;
     function DataChunk(P: PByte; ALen: NativeInt): Boolean;
+    function MsgReserve(ALen: NativeInt): PByte;
     function AssembleMaskedChunk(P: PByte; ALen: NativeInt): Boolean;
     function FinishMessage: Boolean;
     function FinishInPlace(P: PByte; ALen: NativeInt): Boolean;
@@ -108,8 +112,9 @@ type
       AMaxMessage: NativeInt = 16 * 1024 * 1024);
     destructor Destroy; override;
 
-    // Feed bytes read from the socket. Mutates the buffer. False means the
-    // connection has failed: flush the out queue, then close TCP.
+    // Feed bytes read from the socket. Mutates the buffer (see the unit
+    // header). Not re-entrant. False means the connection has failed:
+    // flush the out queue, then close TCP.
     function Ingest(P: PByte; ALen: NativeInt): Boolean;
 
     procedure SendText(const S: RawByteString); overload;
@@ -493,7 +498,7 @@ begin
 end;
 
 // An uncompressed message whose whole payload is one final frame sitting
-// in the Ingest buffer (already unmasked and UTF-8 checked chunk-wise):
+// in the Ingest buffer (already unmasked and UTF-8 checked as a whole):
 // deliver it from there.
 function TWSProtocol.FinishInPlace(P: PByte; ALen: NativeInt): Boolean;
 begin
@@ -571,7 +576,7 @@ end;
 
 function TWSProtocol.DataChunk(P: PByte; ALen: NativeInt): Boolean;
 var
-  Prev, Need: NativeInt;
+  Prev: NativeInt;
 begin
   Result := True;
   if ALen = 0 then Exit;
@@ -597,12 +602,21 @@ begin
     if FMsgText then
       if not Utf8Advance(FUtf8, P, ALen) then
         Exit(Fail(1007, 'invalid UTF-8'));
-    Need := FMsgLen + ALen;
-    if Need > Length(FMsg) then
-      SetLength(FMsg, Need + Need shr 1 + 64);
-    MovePayload(P, @FMsg[FMsgLen], ALen);
-    FMsgLen := Need;
+    MovePayload(P, MsgReserve(ALen), ALen);
+    Inc(FMsgLen, ALen);
   end;
+end;
+
+// Room for ALen more assembled bytes (ALen > 0); returns where they go.
+// The caller advances FMsgLen once the chunk is accepted.
+function TWSProtocol.MsgReserve(ALen: NativeInt): PByte;
+var
+  Need: NativeInt;
+begin
+  Need := FMsgLen + ALen;
+  if Need > Length(FMsg) then
+    SetLength(FMsg, Need + Need shr 1 + 64);
+  Result := @FMsg[FMsgLen];
 end;
 
 // Assembly of a masked, uncompressed payload chunk: unmask straight
@@ -610,20 +624,16 @@ end;
 // validate UTF-8 over the unmasked bytes.
 function TWSProtocol.AssembleMaskedChunk(P: PByte; ALen: NativeInt): Boolean;
 var
-  Need: NativeInt;
   Dst: PByte;
 begin
   Result := True;
   if ALen = 0 then Exit;
-  Need := FMsgLen + ALen;
-  if Need > Length(FMsg) then
-    SetLength(FMsg, Need + Need shr 1 + 64);
-  Dst := @FMsg[FMsgLen];
+  Dst := MsgReserve(ALen);
   ApplyMaskCopy(P, Dst, ALen, FStreamKey, FStreamOff);
   if FMsgText then
     if not Utf8Advance(FUtf8, Dst, ALen) then
       Exit(Fail(1007, 'invalid UTF-8'));
-  FMsgLen := Need;
+  Inc(FMsgLen, ALen);
 end;
 
 function TWSProtocol.Ingest(P: PByte; ALen: NativeInt): Boolean;

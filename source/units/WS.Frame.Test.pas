@@ -369,13 +369,22 @@ end;
 
 procedure TFrameMasking.TestZeroLengthIsSafe;
 var
-  B: Byte;
+  B, C: Byte;
 begin
   B := $42;
+  C := $24;
   UnmaskNaive(@B, 0, $FFFFFFFF);
   UnmaskU64(@B, 0, $FFFFFFFF);
   ApplyMask(@B, 0, $FFFFFFFF, 3);
+  UnmaskCopyU64(@B, @C, 0, $FFFFFFFF);
+  ApplyMaskCopy(@B, @C, 0, $FFFFFFFF, 3);
+  MovePayload(@B, @C, 0);
+{$if defined(CPUX86_64) and defined(LINUX)}
+  UnmaskSSE2(@B, 0, $FFFFFFFF);
+  UnmaskCopySSE2(@B, @C, 0, $FFFFFFFF);
+{$endif}
   Expect<Integer>(B).ToBe($42);
+  Expect<Integer>(C).ToBe($24);
 end;
 
 procedure TFrameRFCVectors.SetupTests;
