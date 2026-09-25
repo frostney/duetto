@@ -80,9 +80,11 @@ unmasked twice, no sockets. Median of three, before and after the
 "Before" is main with `wsbench`'s clock fixed. The previous edition's
 2.35 M round trips/s at 64 B was mostly its timer: the loop read
 `SysUtils.Now` every iteration, and on this machine that build read
-3.1 M/s where the fixed clock reads 12.3 M/s. (FPC's `clock_gettime` is
-a raw syscall, so even a precise clock read every iteration costs ~40%
-at 64 B; the loop now reads it once per 256 iterations.)
+3.1 M/s where the fixed clock reads 12.3 M/s. Even a precise clock costs
+when read every iteration, because FPC's `clock_gettime` is a raw
+syscall: back to back on one core, reading it every iteration gave
+7.1 M/s at 64 B and reading it once per 256 iterations (what the loop
+now does) 12.1 M/s — about 40% of each iteration had been the clock.
 
 ## End-to-end echo (uWebSockets `load_test`, 100 connections)
 
@@ -203,9 +205,12 @@ negotiated):
 | Separate cores | 46,340 msg/s | 45,639 |
 | Shared core | 25,252 msg/s | 22,678 |
 
-The Python *client* is the ceiling in both setups, so read this as
-"both servers keep up with a saturated real-world client". The
-server-side deflate ceiling is the component number above.
+These are server throughputs as seen by one Python client, whose own
+capacity was not measured separately. On separate cores the two servers
+land within 2% of each other, which suggests the client limits both; on
+a shared core duetto is 11% ahead, with the client competing for the
+same core. The server-side deflate ceiling is the component number
+above.
 
 ## Correctness, cross-checked
 
