@@ -127,6 +127,10 @@ type
     property Id: NativeUInt read GetId;
   end;
 
+  // P/Len are valid only for the duration of the callback: they may point
+  // into a transport read buffer shared by every connection, overwritten
+  // by the next read on any of them. Copy the bytes to keep them —
+  // including before handing them to Post.
   TWSServerMessage = procedure(AConn: TWSConnection; AText: Boolean;
     P: PByte; Len: NativeInt) of object;
   TWSServerNotify = procedure(AConn: TWSConnection) of object;

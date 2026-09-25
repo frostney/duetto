@@ -129,12 +129,12 @@ end;
 procedure CopyThenMask(ASrc, ADst: PByte; ALen: PtrUInt);
 begin
   MovePayload(ASrc, ADst, ALen);
-  ApplyMask(ADst, ALen, $12345678, 0);
+  ApplyMask(ADst, ALen, BenchMaskKey, 0);
 end;
 
 procedure MaskCopyProc(ASrc, ADst: PByte; ALen: PtrUInt);
 begin
-  ApplyMaskCopy(ASrc, ADst, ALen, $12345678, 0);
+  ApplyMaskCopy(ASrc, ADst, ALen, BenchMaskKey, 0);
 end;
 
 // Repeats AProc over ASize bytes until MaskSecs has passed; GB/s.
