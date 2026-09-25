@@ -68,8 +68,10 @@ Four nets, from innermost to outermost:
    raising hook the same way), a plaintext egress-backpressure probe
    (a stalled reader backs the server's egress up — on Linux forcing the
    epoll gather write short mid-message; eight 1 MiB echoes must still
-   arrive intact and in order), and — on Linux
-   — a `wss://` section
+   arrive intact and in order), a close-handler section (peers that
+   reset while an `OnClientClose` handler sends into them: the handler
+   runs once per connection and the server keeps serving), and — on
+   Linux — a `wss://` section
    against a TLS listener built from a runtime-generated identity
    (handshake, echo, flow-control windows, `close_notify`, handshake
    deadline, inbound pre-handshake budget).
