@@ -141,9 +141,16 @@ type
   // demand. Interlocked fields: handlers run on the server thread, or
   // on the thread calling Destroy.
   TCloseHost = class
+  private
+    FLock: TCriticalSection;
+    FOpen: array of TWSConnection; // connections between OnOpen and OnClientClose
   public
-    Opens, Closes, SendsAccepted: LongInt;
+    Opens, Closes, SendsAccepted, Broadcasts: LongInt;
     RaiseOnClose: Boolean;
+    // "user left": OnClientClose also sends to every other open connection
+    BroadcastOnClose: Boolean;
+    constructor Create;
+    destructor Destroy; override;
     procedure HandleOpen(AConn: TWSConnection);
     procedure HandleClose(AConn: TWSConnection);
   end;
@@ -367,16 +374,58 @@ begin
   end;
 end;
 
+constructor TCloseHost.Create;
+begin
+  inherited Create;
+  FLock := TCriticalSection.Create;
+end;
+
+destructor TCloseHost.Destroy;
+begin
+  FLock.Free;
+  inherited;
+end;
+
 procedure TCloseHost.HandleOpen(AConn: TWSConnection);
 begin
   InterLockedIncrement(Opens);
+  FLock.Acquire;
+  try
+    SetLength(FOpen, Length(FOpen) + 1);
+    FOpen[High(FOpen)] := AConn;
+  finally
+    FLock.Release;
+  end;
 end;
 
 procedure TCloseHost.HandleClose(AConn: TWSConnection);
 const
   Farewell: RawByteString = 'farewell';
+var
+  Others: array of TWSConnection;
+  I: Integer;
 begin
   InterLockedIncrement(Closes);
+  Others := nil;
+  FLock.Acquire;
+  try
+    for I := 0 to High(FOpen) do
+      if FOpen[I] = AConn then
+      begin
+        FOpen[I] := FOpen[High(FOpen)];
+        SetLength(FOpen, Length(FOpen) - 1);
+        Break;
+      end;
+    if BroadcastOnClose then
+      Others := Copy(FOpen);
+  finally
+    FLock.Release;
+  end;
+  for I := 0 to High(Others) do
+    if Others[I].SendText(@Farewell[1], Length(Farewell)) then
+      InterLockedIncrement(SendsAccepted);
+  if BroadcastOnClose then
+    InterLockedIncrement(Broadcasts); // the loop above ran to the end
   if AConn.SendText(@Farewell[1], Length(Farewell)) then
     InterLockedIncrement(SendsAccepted);
   if RaiseOnClose then
@@ -1629,6 +1678,11 @@ const
 // OnClientClose robustness: a raising handler must not leak the socket
 // or the session object, and a server destroyed with connections still
 // open owes each of them its OnClientClose.
+const
+  // Two raw connections and one client before the Destroy check (Darwin
+  // skips the raw ones), then the three held open.
+  CloseSectionOpens = {$ifdef DARWIN} 3 {$else} 6 {$endif};
+
 procedure RunCloseHandlerSection(var AStressPhase: ShortString);
 var
   Host: TCloseHost;
@@ -1653,8 +1707,13 @@ begin
   SrvT.Srv.OnClientClose := Host.HandleClose;
   Port := SrvT.Srv.Port;
   SrvT.Start;
-  Host.RaiseOnClose := True;
 
+  // The two raising-handler checks need the exception to come out of
+  // Run. On Network.framework callbacks run on GCD threads, where an
+  // escaping exception terminates the process (as from any callback),
+  // so they are not run there.
+  {$ifndef DARWIN}
+  Host.RaiseOnClose := True;
   // Server-side drop (a protocol violation) with a raising handler: the
   // socket must still be closed behind the close frame.
   Fd := RawUpgraded(Port);
@@ -1681,8 +1740,11 @@ begin
     'both raising handlers surfaced once each; the server still echoes');
   Cli[0].Close(1000, 'done');
   Cli[0].Free;
+  {$endif}
 
-  // Destroy with three connections still open, one handler raising.
+  // Destroy with three connections still open, every handler raising and
+  // broadcasting to the others: the others' transport objects are gone,
+  // so every send must report the drop and every broadcast must finish.
   for I := 0 to High(Cli) do
   begin
     Cli[I] := TWSClient.Create;
@@ -1690,16 +1752,24 @@ begin
     Cli[I].SendText(HelloProbe);
     Cli[I].ReadMessage(IsText, Data); // OnOpen has run
   end;
+  // A graceful close from the earlier check may still be in flight:
+  // settle the counters before Destroy is judged.
+  Deadline := GetTickCount64 + 5000;
+  while (Host.Closes < Host.Opens - Length(Cli)) and
+    (GetTickCount64 < Deadline) do Sleep(10);
   Host.RaiseOnClose := True;
+  Host.BroadcastOnClose := True;
   AStressPhase := 'close-handler section: destroy';
   SrvT.Terminate;
   SrvT.Srv.Stop;
   SrvT.WaitFor;
   SrvT.Srv.Free;
-  Check((Host.Opens = 6) and (Host.Closes = 6) and (Host.SendsAccepted = 0),
-    Format('Destroy pairs every OnOpen with one OnClientClose, sends in it ' +
-    'report the drop (opens %d, closes %d, sends taken %d)',
-    [Host.Opens, Host.Closes, Host.SendsAccepted]));
+  Check((Host.Opens = CloseSectionOpens) and (Host.Closes = Host.Opens) and
+    (Host.SendsAccepted = 0) and (Host.Broadcasts = Length(Cli)),
+    Format('Destroy pairs every OnOpen with one OnClientClose; sends to any ' +
+    'connection report the drop (opens %d, closes %d, sends taken %d, ' +
+    'broadcasts finished %d)',
+    [Host.Opens, Host.Closes, Host.SendsAccepted, Host.Broadcasts]));
   SrvT.Free;
   for I := 0 to High(Cli) do Cli[I].Free;
   Host.Free;

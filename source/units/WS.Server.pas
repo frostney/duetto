@@ -54,6 +54,9 @@ type
   private
     FServer: TWSServer;
     FTConn: TWSTransportConn;
+    // The transport's id, cached at accept: Id and Post must not reach
+    // through FTConn once the transport may have freed it (Destroy).
+    FId: NativeUInt;
     FState: TWSConnState;
     FProto: TWSProtocol;
     FHsBuf: RawByteString;     // handshake accumulator
@@ -329,11 +332,16 @@ type
     // Fires exactly once for every connection that saw OnOpen: when the
     // peer goes away, when the server drops it, and — for connections
     // still open at the time — from TWSServer.Destroy, on the thread
-    // calling Destroy once the transport is quiesced. Sends inside the
-    // handler report False (the connection is already being torn down).
-    // An exception escaping the handler propagates like one from OnOpen
-    // or OnMessage (out of Run), but only after the connection has been
-    // released; during Destroy it is swallowed so shutdown completes.
+    // calling Destroy once the transport is quiesced (there, sends,
+    // Close and Post on any connection report the drop). Sends inside
+    // the handler report False (the connection is already being torn
+    // down). An exception escaping the handler is treated like one from
+    // OnOpen or OnMessage, but only after the session connection has been
+    // released (and, on a plaintext listener, its socket closed): on the
+    // epoll and IOCP transports it propagates out of Run; on
+    // Network.framework, where callbacks run on GCD threads, an escaping
+    // exception terminates the process, as it does from any callback.
+    // During Destroy it is swallowed so shutdown completes.
     property OnClientClose: TWSServerNotify read FOnClose write FOnClose;
     // Opt-in single-port fallback: fired for a well-formed, body-less
     // HTTP request (GET or HEAD without Content-Length or
@@ -437,7 +445,7 @@ end;
 
 function TWSConnection.GetId: NativeUInt;
 begin
-  Result := FTConn.Id;
+  Result := FId;
 end;
 
 procedure TWSConnection.Reschedule;
@@ -620,7 +628,8 @@ end;
 
 destructor TWSServer.Destroy;
 var
-  Conn: TWSConnection;
+  Open: array of TWSConnection;
+  I: Integer;
 begin
   // Quiesce the transport first: after Shutdown returns, no completion
   // can fire on any thread and every transport connection object is
@@ -645,19 +654,32 @@ begin
     // Connections still open get their OnClientClose here, so every
     // OnOpen is paired and a handler holding references (the Post
     // lifetime contract) learns they are gone. The transport is
-    // quiesced, so this thread is the only one running callbacks.
-    // ReleaseConn takes each out of the registry, so the loop drains it.
-    while FRegistryCount > 0 do
+    // quiesced and has freed its connection objects, so first detach
+    // every session connection from it at once: marked dropping (sends
+    // and Close report False), out of the registry (Post drops), FTConn
+    // cleared. Only then run the handlers — one may reach any other
+    // connection (a "user left" broadcast), not just its own.
+    FLock.Acquire;
+    try
+      Open := Copy(FRegistry, 0, FRegistryCount);
+      FRegistryCount := 0;
+    finally
+      FLock.Release;
+    end;
+    for I := 0 to High(Open) do
     begin
-      Conn := FRegistry[FRegistryCount - 1];
-      Conn.FDropping := True;
+      Open[I].FRegistryIndex := -1;
+      Open[I].FDropping := True;
+      Open[I].FTConn := nil;
+    end;
+    for I := 0 to High(Open) do
       try
-        ReleaseConn(Conn);
+        ReleaseConn(Open[I]);
       except
         // A destructor has to finish: the connection was released by
         // ReleaseConn's finally; the handler's exception is dropped.
+        on Exception do;
       end;
-    end;
     FTransport.Free;
   end;
   FSweepWake.Free;
@@ -695,7 +717,7 @@ begin
       // Same rendezvous PostToConn performs, done inline because the
       // lock is already held: only the transport-neutral id crosses to
       // the connection's context.
-      FTransport.SubmitPost(Conn.FTConn.Id, NewEnvelope(Conn.CheckClock));
+      FTransport.SubmitPost(Conn.FId, NewEnvelope(Conn.CheckClock));
     end;
   finally
     FLock.Release;
@@ -794,7 +816,7 @@ begin
     Idx := AConn.FRegistryIndex;
     Live := (Idx >= 0) and (Idx < FRegistryCount) and (FRegistry[Idx] = AConn);
     if Live then
-      TransportId := AConn.FTConn.Id;
+      TransportId := AConn.FId;
   finally
     FLock.Release;
   end;
@@ -1056,6 +1078,7 @@ begin
   Conn := TWSConnection.Create;
   Conn.FServer := Self;
   Conn.FTConn := ATConn;
+  Conn.FId := ATConn.Id;
   Conn.FState := wcsHandshake;
   Conn.ArmDeadline(FHandshakeTimeoutMs);
   ATConn.UserData := Conn;
