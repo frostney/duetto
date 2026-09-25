@@ -1446,13 +1446,15 @@ end;
 
 const
   // Eight 1 MiB echoes against a 64 KiB client receive buffer: on Linux
-  // more than the 4 MiB autotuned send buffer can absorb, so the epoll
-  // server's gather write is guaranteed to go short mid-message. Other
-  // platforms run the same probe as a plain backpressure check.
+  // with the default net.ipv4.tcp_wmem ceiling (4 MiB) that is more than
+  // the send buffer can absorb, so the epoll server's gather write goes
+  // short mid-message. A host with a larger ceiling, and the other
+  // platforms, run the same probe as a plain backpressure check.
   EgressCount = 8;
   EgressSize = 1024 * 1024;
   EgressRecvBuf = 64 * 1024;
   EgressStallMs = 300;
+  ShutBoth = 2; // SHUT_RDWR / SD_BOTH
 
 type
   // Writes the frames from its own thread, so the probe can stall its
@@ -1791,7 +1793,7 @@ begin
   // A failed read may leave the sender blocked in a full socket: shut it
   // down so WaitFor returns instead of waiting on the watchdog.
   if not Ok then
-    fpShutdown(Fd, 2);
+    fpShutdown(Fd, ShutBoth);
   EgressSender.WaitFor;
   Ok := Ok and EgressSender.Ok;
   EgressSender.Free;

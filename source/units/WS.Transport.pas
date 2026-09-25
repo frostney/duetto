@@ -56,12 +56,14 @@ type
     // -1 when the connection is dead. Short return arms OnSendReady.
     function SubmitSend(P: PByte; ALen: NativeInt): NativeInt; virtual; abstract;
 
-    // Gather send: SubmitSend's contract over P1[0..L1) followed by
-    // P2[0..L2), in one write where the transport can. Only offered by a
-    // transport that writes synchronously and holds neither pointer past
-    // the call (SupportsGather); a completion transport must own the
-    // bytes until completion, so it copies anyway and leaves this off.
-    // The default runs two SubmitSends and is correct everywhere.
+    // Gather send (ADR-0004): SubmitSend's contract over AFirst then
+    // ASecond, in one write where the transport can. A transport opts in
+    // with SupportsGather only where it keeps neither pointer past the
+    // call; epoll does (sendmsg), the completion transports have not yet
+    // (they copy on submit, and could gather into that one copy). The
+    // default below is a contract fallback nothing calls while
+    // SupportsGather is False: two SubmitSends, never offering the
+    // second buffer after a short first.
     function SupportsGather: Boolean; virtual;
     function SubmitSendV(AFirst: PByte; AFirstLen: NativeInt; ASecond: PByte;
       ASecondLen: NativeInt): NativeInt; virtual;

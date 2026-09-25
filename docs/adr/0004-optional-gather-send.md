@@ -16,22 +16,23 @@ assembly copy on the receive side.
 
 A readiness transport writes synchronously: the kernel has taken the
 bytes (or refused them) before the call returns, so the caller's buffer
-can go to the socket as it is. A completion transport cannot: IOCP's
-`WSASend` and Network.framework's `nw_connection_send` complete later,
-and the transport must own the bytes until then — the IOCP transport
-already copies on send for exactly that reason.
+can go to the socket as it is. A completion transport cannot hand the
+caller's buffer to the OS: IOCP's `WSASend` and Network.framework's
+`nw_connection_send` complete later, so the transport must own the
+bytes until then, and both copy on submit for that reason.
 
 ## Decision
 
 The seam gains an optional gather send:
 
 - `SupportsGather` — False by default. A transport returns True only
-  for connections where it writes synchronously and keeps neither
-  pointer past the call.
+  for connections where it keeps neither pointer past the call.
 - `SubmitSendV(P1, L1, P2, L2)` — `SubmitSend`'s contract over two
   buffers. The inherited default is two `SubmitSend` calls that never
   offer the second buffer after a short first, so it is correct on any
   transport, but nothing calls it unless `SupportsGather` is True.
+- A tail the transport did not take is queued and then goes through the
+  session's normal flush, so every per-flush policy sees it.
 
 Framing stays in `WS.Protocol`: `DirectHeader` builds the frame header
 only when a direct send is valid (server role, so unmasked; no
@@ -49,7 +50,10 @@ buffers), IOCP, Network.framework.
 
 - No RFC 6455 rule moves: the transport still moves bytes only.
 - A large echo on epoll skips the out-queue copy whenever the socket
-  can take the frame: +7.6% at 16 KiB and +17% at 256 KiB under
-  `load_test` when this landed, with 20 B and 1 KiB unchanged.
-- A transport that writes synchronously can opt in without
-  session-layer changes; one that completes later must not.
+  can take the frame: +8% at 16 KiB and at 256 KiB under `load_test`
+  (separate cores) when this landed, with 20 B and 1 KiB unchanged.
+- A transport opts in without session-layer changes. For IOCP and
+  Network.framework that would mean gathering header + payload into
+  the one copy they already make on submit, instead of copying the
+  queue — not done here, because it could not be measured on those
+  platforms.

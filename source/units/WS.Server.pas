@@ -300,6 +300,9 @@ uses
 const
   HandshakeMaxBytes = 16 * 1024;
   // Smallest payload worth a gather write over a copy into the queue.
+  // Set from load_test on epoll (separate cores): with no threshold the
+  // two-element sendmsg ran ~2% behind copy + send at 20 B, and the two
+  // were level at 1 KiB.
   DirectSendMin = 1024;
   RegistryGrowth = 64;
 
@@ -367,6 +370,11 @@ begin
   Taken := FTConn.SubmitSendV(@Hdr[0], HLen, P, ALen);
   if Taken < 0 then Exit(FServer.DropConn(Self));
   FProto.DirectSent(Hdr, HLen, P, ALen, Taken);
+  // A tail left queued goes through FlushConn like any other pending
+  // output, so every per-flush policy judges it; only a short write pays
+  // for the extra offer (which the full socket declines).
+  if FProto.OutPending > 0 then
+    Result := FServer.FlushConn(Self);
 end;
 
 function TWSConnection.SendText(P: PByte; ALen: NativeInt): Boolean;
