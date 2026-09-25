@@ -143,7 +143,7 @@ type
   TCloseHost = class
   private
     FLock: TCriticalSection;
-    FOpen: array of TWSConnection; // connections between OnOpen and OnClientClose
+    FOpen: TFPList; // connections between OnOpen and OnClientClose
   public
     Opens, Closes, SendsAccepted, Broadcasts: LongInt;
     RaiseOnClose: Boolean;
@@ -378,10 +378,12 @@ constructor TCloseHost.Create;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
+  FOpen := TFPList.Create;
 end;
 
 destructor TCloseHost.Destroy;
 begin
+  FOpen.Free;
   FLock.Free;
   inherited;
 end;
@@ -391,8 +393,7 @@ begin
   InterLockedIncrement(Opens);
   FLock.Acquire;
   try
-    SetLength(FOpen, Length(FOpen) + 1);
-    FOpen[High(FOpen)] := AConn;
+    FOpen.Add(AConn);
   finally
     FLock.Release;
   end;
@@ -402,28 +403,26 @@ procedure TCloseHost.HandleClose(AConn: TWSConnection);
 const
   Farewell: RawByteString = 'farewell';
 var
-  Others: array of TWSConnection;
+  Others: TFPList;
   I: Integer;
 begin
   InterLockedIncrement(Closes);
-  Others := nil;
-  FLock.Acquire;
+  Others := TFPList.Create;
   try
-    for I := 0 to High(FOpen) do
-      if FOpen[I] = AConn then
-      begin
-        FOpen[I] := FOpen[High(FOpen)];
-        SetLength(FOpen, Length(FOpen) - 1);
-        Break;
-      end;
-    if BroadcastOnClose then
-      Others := Copy(FOpen);
+    FLock.Acquire;
+    try
+      FOpen.Remove(AConn);
+      Others.Assign(FOpen);
+    finally
+      FLock.Release;
+    end;
+    if not BroadcastOnClose then Others.Clear;
+    for I := 0 to Others.Count - 1 do
+      if TWSConnection(Others[I]).SendText(@Farewell[1], Length(Farewell)) then
+        InterLockedIncrement(SendsAccepted);
   finally
-    FLock.Release;
+    Others.Free;
   end;
-  for I := 0 to High(Others) do
-    if Others[I].SendText(@Farewell[1], Length(Farewell)) then
-      InterLockedIncrement(SendsAccepted);
   if BroadcastOnClose then
     InterLockedIncrement(Broadcasts); // the loop above ran to the end
   if AConn.SendText(@Farewell[1], Length(Farewell)) then
