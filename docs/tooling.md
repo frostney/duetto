@@ -76,8 +76,10 @@ one is running.
   permessage-deflate pass driven by `tools/deflbench.py`. Every path is
   an environment override (`LOAD_TEST`, `DUETTO`, `RUST_ECHO`,
   `PYTHON`); missing contenders are reported as skipped, and a run that
-  produced no samples says so instead of scoring 0. `SERVER_CPU` /
-  `CLIENT_CPU` pin the server and the generator with `taskset`: the same
+  produced no samples says so instead of scoring 0. Each score is the
+  best full 4-second `load_test` window after the ramp-up (two per run
+  at the default `DUR=14`). `SERVER_CPU` / `CLIENT_CPU` (Linux) pin the
+  server and the generator with `taskset`: the same
   core for both reproduces the shared-core setup, separate physical
   cores stop the generator competing with the server. Needs GNU
   `stdbuf` and `timeout` (`gstdbuf` / `gtimeout` on macOS); the deflate
