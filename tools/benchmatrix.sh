@@ -13,7 +13,10 @@
 #   RUST_ECHO   tungstenite echo (tools/rust-echo) (default: its release build)
 #   PYTHON      interpreter with `websockets`     (default: python3; the
 #               deflate pass needs websockets >= 14)
-#   DUR         seconds per plain-echo run         (default: 14)
+#   DUR         seconds per plain-echo run         (default: 14). load_test
+#               reports one Msg/sec sample every 4 s and the first covers
+#               the ramp-up, so the score is the best full 4 s window
+#               after it: 14 s gives two, anything under 12 s fewer.
 #   SIZES       plain-echo payload sizes          (default: 20 1024 16384 262144)
 #   SERVER_CPU / CLIENT_CPU
 #               pin server / generator with taskset (Linux). Unset = no
@@ -53,16 +56,23 @@ GEN_PID=
 cleanup() {
   [ -n "$GEN_PID" ] && kill "$GEN_PID" 2>/dev/null
   [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
+  # Reap them, so a re-run right after an interrupt finds the ports free.
+  [ -n "$GEN_PID" ] && wait "$GEN_PID" 2>/dev/null
+  [ -n "$SRV_PID" ] && wait "$SRV_PID" 2>/dev/null
   rm -f "$SRV_LOG" "$GEN_LOG"
 }
 trap cleanup EXIT
-trap 'exit 130' INT TERM
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 STDBUF=$(command -v stdbuf || command -v gstdbuf || true)
 TIMEOUT=$(command -v timeout || command -v gtimeout || true)
 if [ -z "$STDBUF" ] || [ -z "$TIMEOUT" ]; then
   echo "error: GNU stdbuf and timeout are required (coreutils; gstdbuf/gtimeout on macOS)" >&2
   exit 1
+fi
+if [ "$DUR" -lt 12 ]; then
+  echo "warning: DUR=$DUR leaves fewer than two full 4 s windows after the ramp-up" >&2
 fi
 if ! command -v "$LOAD_TEST" >/dev/null 2>&1; then
   echo "error: load_test not found (set LOAD_TEST to uWebSockets' benchmarks/load_test)" >&2
@@ -101,7 +111,9 @@ start_server() { # command... ; sets SRV_PID; fails if it never listens
     kill -0 "$SRV_PID" 2>/dev/null || break
     sleep 0.1
   done
-  echo "  server did not come up: $* ($(tail -1 "$SRV_LOG"))" >&2
+  # The last error-looking line names the cause for both an FPC
+  # backtrace ("Exception: bind ... failed") and a Python traceback.
+  echo "  server did not come up: $* ($(grep -i -E 'error|exception|failed' "$SRV_LOG" | tail -1))" >&2
   stop_server
   return 1
 }
@@ -139,24 +151,24 @@ PY_MAJOR=$(python_websockets_major)
 
 echo "== plain echo, 100 connections, ${DUR}s each," \
   "server cpu ${SERVER_CPU:-any}, generator cpu ${CLIENT_CPU:-any} =="
+[ -x "$DUETTO" ] ||
+  echo "duetto         skipped ($DUETTO missing — lwpt build --mode release)"
+[ -x "$RUST_ECHO" ] ||
+  echo "tungstenite    skipped ($RUST_ECHO missing — cargo build --release in tools/rust-echo)"
+[ -n "$PY_MAJOR" ] ||
+  echo "py-websockets  skipped ($PYTHON has no websockets module)"
 for size in $SIZES; do
   if [ -x "$DUETTO" ]; then
     next_port
     run_one duetto "$size" "$DUETTO" --quiet --no-deflate --port="$PORT"
-  else
-    echo "duetto         skipped ($DUETTO missing — lwpt build --mode release)"
   fi
   if [ -x "$RUST_ECHO" ]; then
     next_port
     run_one tungstenite "$size" "$RUST_ECHO" "$PORT"
-  else
-    echo "tungstenite    skipped ($RUST_ECHO missing — cargo build --release in tools/rust-echo)"
   fi
   if [ -n "$PY_MAJOR" ]; then
     next_port
     run_one py-websockets "$size" "$PYTHON" "$ROOT/tools/pyecho.py" "$PORT"
-  else
-    echo "py-websockets  skipped ($PYTHON has no websockets module)"
   fi
   echo
 done
@@ -177,13 +189,12 @@ deflate_one() { # name command... (call next_port first)
     printf '%-14s server failed to start\n' "$name"
     return
   fi
-  printf '%-14s ' "$name"
   if run_generator "$TIMEOUT" $((DEFLATE_SECS + 30)) ${GEN_PIN[@]+"${GEN_PIN[@]}"} \
     "$PYTHON" "$ROOT/tools/deflbench.py" "ws://127.0.0.1:$PORT/" \
     "$DEFLATE_CONNS" "$DEFLATE_SECS"; then
-    cat "$GEN_LOG"
+    printf '%-14s %s\n' "$name" "$(cat "$GEN_LOG")"
   else
-    echo "failed (exit $?)"
+    printf '%-14s failed (exit %s)\n' "$name" "$?"
   fi
   stop_server
 }

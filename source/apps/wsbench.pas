@@ -29,6 +29,11 @@ uses
 
 const
   MaskSecs = 0.5;
+  MicrosPerSec = 1000000;
+  // Clock reads per timed loop are capped at one per ClockEvery
+  // iterations: FPC's clock_gettime is a raw syscall (~60 ns here), which
+  // at 64 B was ~40% of a protocol round trip when read every iteration.
+  ClockEvery = 256;
   BenchMaskKey = $12345678;
 
 var
@@ -45,14 +50,14 @@ var
   Ts: TTimeSpec;
 begin
   clock_gettime(CLOCK_MONOTONIC, @Ts);
-  Result := Int64(Ts.tv_sec) * 1000000 + Ts.tv_nsec div 1000;
+  Result := Int64(Ts.tv_sec) * MicrosPerSec + Ts.tv_nsec div 1000;
 end;
 {$elseif defined(UNIX)}
 var
   Tv: TTimeVal;
 begin
   fpgettimeofday(@Tv, nil);
-  Result := Int64(Tv.tv_sec) * 1000000 + Tv.tv_usec;
+  Result := Int64(Tv.tv_sec) * MicrosPerSec + Tv.tv_usec;
 end;
 {$else}
 var
@@ -60,7 +65,7 @@ var
 begin
   QueryPerformanceCounter(Count);
   QueryPerformanceFrequency(Freq);
-  Result := Round(Count / Freq * 1e6);
+  Result := Round(Count / Freq * MicrosPerSec);
 end;
 {$endif}
 
@@ -75,12 +80,12 @@ var
 begin
   Reps := 0;
   T := Now64;
-  Deadline := T + Round(MaskSecs * 1e6);
+  Deadline := T + Round(MaskSecs * MicrosPerSec);
   repeat
     AProc(ABuf, ASize, BenchMaskKey);
     Inc(Reps);
   until Now64 >= Deadline;
-  Result := ASize / (1024.0 * 1024 * 1024) * Reps / ((Now64 - T) / 1e6);
+  Result := ASize / (1024.0 * 1024 * 1024) * Reps / ((Now64 - T) / MicrosPerSec);
 end;
 
 procedure BenchMasking;
@@ -141,8 +146,12 @@ begin
   WriteLn('-- frame header parse (mixed 7/16-bit lengths) --');
   Parsed := 0;
   T := Now64;
-  for R := 1 to ROUNDS do
+  // Whole passes over the stream until MaskSecs has passed: a fixed
+  // ROUNDS finished in ~30 ms and read anywhere from 83 to 170 M/s.
+  R := 0;
+  while (R < ROUNDS) or (Now64 - T < Round(MaskSecs * MicrosPerSec)) do
   begin
+    Inc(R);
     Pos := 0;
     while Pos < Length(Stream) do
     begin
@@ -152,7 +161,7 @@ begin
       Inc(Parsed);
     end;
   end;
-  Secs := (Now64 - T) / 1e6;
+  Secs := (Now64 - T) / MicrosPerSec;
   WriteLn(Format('parse   : %8.1f M frames/s', [Parsed / 1e6 / Secs]));
 end;
 
@@ -185,17 +194,17 @@ begin
   if not Utf8Advance(St, PByte(Ascii), SIZE) then Halt(9);
   T := Now64;
   for R := 1 to REPS do begin St := 0; Utf8Advance(St, PByte(Ascii), SIZE); end;
-  Secs := (Now64 - T) / 1e6;
+  Secs := (Now64 - T) / MicrosPerSec;
   WriteLn(Format('ascii fast-path : %8.2f GB/s', [SIZE / 1073741824.0 * REPS / Secs]));
 
   T := Now64;
   for R := 1 to REPS do begin St := 0; Utf8AdvanceDFA(St, PByte(Ascii), SIZE); end;
-  Secs := (Now64 - T) / 1e6;
+  Secs := (Now64 - T) / MicrosPerSec;
   WriteLn(Format('ascii pure DFA  : %8.2f GB/s', [SIZE / 1073741824.0 * REPS / Secs]));
 
   T := Now64;
   for R := 1 to REPS do begin St := 0; Utf8Advance(St, PByte(Multi), SIZE); end;
-  Secs := (Now64 - T) / 1e6;
+  Secs := (Now64 - T) / MicrosPerSec;
   WriteLn(Format('mixed cjk/ascii : %8.2f GB/s', [SIZE / 1073741824.0 * REPS / Secs]));
 end;
 
@@ -218,7 +227,7 @@ begin
     ServerParseRequest(Req, True, HS);
     Resp := ServerBuildResponse(HS);
   end;
-  Secs := (Now64 - T) / 1e6;
+  Secs := (Now64 - T) / MicrosPerSec;
   WriteLn(Format('parse+respond   : %8.0f k handshakes/s  (%.1f us each)',
     [N / 1e3 / Secs, Secs * 1e6 / N]));
 end;
@@ -248,7 +257,7 @@ begin
     T := Now64;
     for I := 1 to REPS do
       Defl.CompressMessage(@Msg[1], Length(Msg), Z);
-    Secs := (Now64 - T) / 1e6;
+    Secs := (Now64 - T) / MicrosPerSec;
     WriteLn(Format('compress: %8.1f MB/s in  (ratio %.1f%%)',
       [Length(Msg) / 1048576.0 * REPS / Secs, 100.0 * Length(Z) / Length(Msg)]));
 
@@ -259,7 +268,7 @@ begin
       if not Infl.Feed(PByte(Z), Length(Z)) then Halt(9);
       if not Infl.Finish then Halt(9);
     end;
-    Secs := (Now64 - T) / 1e6;
+    Secs := (Now64 - T) / MicrosPerSec;
     WriteLn(Format('inflate : %8.1f MB/s out', [Length(Msg) / 1048576.0 * REPS / Secs]));
   finally
     Infl.Free;
@@ -328,7 +337,7 @@ begin
 
   N := 0;
   T := Now64;
-  Deadline := T + Round(ASecs * 1e6);
+  Deadline := T + Round(ASecs * MicrosPerSec);
   repeat
     // client -> server
     C.SendBinary(@Payload[0], ASize);
@@ -337,8 +346,8 @@ begin
     S.SendBinary(@Payload[0], ASize);
     Pump(S, C, Scratch);
     Inc(N);
-  until Now64 >= Deadline;
-  Secs := (Now64 - T) / 1e6;
+  until ((N and (ClockEvery - 1)) = 0) and (Now64 >= Deadline);
+  Secs := (Now64 - T) / MicrosPerSec;
 
   if (CSink.Hits <> N) or (SSink.Hits <> N) then Halt(9);
   WriteLn(Format('%7d B : %9.0f round-trips/s  %8.1f MB/s full-duplex',
@@ -363,5 +372,5 @@ begin
   BenchProtocol(16 * 1024, 1.0);
   BenchProtocol(256 * 1024, 1.0);
   WriteLn;
-  WriteLn(Format('total %.1f s', [(Now64 - T0) / 1e6]));
+  WriteLn(Format('total %.1f s', [(Now64 - T0) / MicrosPerSec]));
 end.
