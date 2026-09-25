@@ -5,8 +5,11 @@
   direction, fail-fast UTF-8 (a bad byte in fragment one must kill the
   connection before FIN arrives), close-code policing on the wire, the
   message-size guillotine, and byte-by-byte ingest to exercise every
-  carry-buffer path. Wire close codes are asserted by parsing the actual
-  queued close frame, not by trusting the property. }
+  carry-buffer path. The delivery suite pins both payload paths: a whole
+  frame is handed over from the ingested buffer itself, a frame split
+  across reads is assembled, and either way the bytes are the payload.
+  Wire close codes are asserted by parsing the actual queued close frame,
+  not by trusting the property. }
 
 program WS.Protocol.Test;
 
@@ -26,6 +29,8 @@ type
     MsgCount: Integer;
     LastText: Boolean;
     LastMsg: TBytes;
+    LastPtr: PByte;             // where the protocol pointed, for in-place checks
+    History: array of TBytes;   // every message, in delivery order
     Pings, Pongs: Integer;
     LastPing: TBytes;
     CloseFired: Boolean;
@@ -79,6 +84,17 @@ type
     procedure TestOversizeMessage;
   end;
 
+  TProtoDelivery = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestWholeFrameInPlace;
+    procedure TestPipelinedFrames;
+    procedure TestSplitAtEveryCut;
+    procedure TestSplitTextAtEveryCut;
+    procedure TestBadUtf8WholeFrame;
+    procedure TestFragmentsAssembled;
+  end;
+
   TProtoDeflate = class(TTestSuite)
   public
     procedure SetupTests; override;
@@ -100,8 +116,11 @@ procedure TSink.OnMsg(AText: Boolean; P: PByte; ALen: NativeInt);
 begin
   Inc(MsgCount);
   LastText := AText;
+  LastPtr := P;
   SetLength(LastMsg, ALen);
   if ALen > 0 then Move(P^, LastMsg[0], ALen);
+  SetLength(History, Length(History) + 1);
+  History[High(History)] := System.Copy(LastMsg, 0, ALen);
 end;
 
 procedure TSink.OnPing(P: PByte; ALen: NativeInt);
@@ -870,6 +889,185 @@ begin
   Test('message over cap -> 1009',             TestOversizeMessage);
 end;
 
+{ ───────── payload delivery paths ───────── }
+
+function Pattern(ALen: Integer; ASeed: Byte): TBytes;
+var
+  I: Integer;
+begin
+  SetLength(Result, ALen);
+  for I := 0 to ALen - 1 do Result[I] := Byte(I * 31 + ASeed);
+end;
+
+procedure TProtoDelivery.TestWholeFrameInPlace;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Payload, Frame: TBytes;
+begin
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    Payload := Pattern(1000, 7);
+    Frame := BuildFrame(WS_OP_BINARY, True, False, False, True, Payload,
+      $A1B2C3D4);
+    Expect<Boolean>(S.Ingest(@Frame[0], Length(Frame))).ToBe(True);
+    Expect<Integer>(SS.MsgCount).ToBe(1);
+    Expect<Boolean>(SameBytes(SS.LastMsg, Payload)).ToBe(True);
+    // Handed over from the ingested buffer, not from a protocol copy.
+    Expect<Boolean>((SS.LastPtr >= PByte(@Frame[0])) and
+      (SS.LastPtr < PByte(@Frame[0]) + Length(Frame))).ToBe(True);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
+procedure TProtoDelivery.TestPipelinedFrames;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  A, B, C, Wire_: TBytes;
+begin
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    A := Bytes('first');
+    B := Pattern(70000, 3);   // 64-bit length encoding
+    C := Bytes('third, and last');
+    Wire_ := Concat(
+      BuildFrame(WS_OP_TEXT, True, False, False, True, A, $11223344),
+      BuildFrame(WS_OP_BINARY, True, False, False, True, B, $55667788),
+      BuildFrame(WS_OP_TEXT, True, False, False, True, C, $99AABBCC));
+    Expect<Boolean>(S.Ingest(@Wire_[0], Length(Wire_))).ToBe(True);
+    Expect<Integer>(Length(SS.History)).ToBe(3);
+    Expect<Boolean>(SameBytes(SS.History[0], A)).ToBe(True);
+    Expect<Boolean>(SameBytes(SS.History[1], B)).ToBe(True);
+    Expect<Boolean>(SameBytes(SS.History[2], C)).ToBe(True);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
+// One masked frame cut into two reads at every offset, header included:
+// whatever the cut, the delivered bytes are the payload.
+procedure TProtoDelivery.TestSplitAtEveryCut;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Payload, Frame, Part1, Part2: TBytes;
+  Cut, Bad: Integer;
+begin
+  Payload := Pattern(300, 11);
+  Frame := BuildFrame(WS_OP_BINARY, True, False, False, True, Payload,
+    $0F1E2D3C);
+  Bad := 0;
+  for Cut := 1 to Length(Frame) - 1 do
+  begin
+    SS := TSink.Create;
+    S := NewServer(SS);
+    try
+      Part1 := System.Copy(Frame, 0, Cut);
+      Part2 := System.Copy(Frame, Cut, Length(Frame) - Cut);
+      if not S.Ingest(@Part1[0], Length(Part1)) then Inc(Bad);
+      if not S.Ingest(@Part2[0], Length(Part2)) then Inc(Bad);
+      if (SS.MsgCount <> 1) or (not SameBytes(SS.LastMsg, Payload)) then
+        Inc(Bad);
+    finally
+      S.Free; SS.Free;
+    end;
+  end;
+  Expect<Integer>(Bad).ToBe(0);
+end;
+
+// Same sweep over a text frame of multibyte code points, so every cut
+// also splits UTF-8 validation at a different byte.
+procedure TProtoDelivery.TestSplitTextAtEveryCut;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Payload, Frame, Part1, Part2: TBytes;
+  Cut, Bad: Integer;
+begin
+  Payload := Bytes('Größe · 大きさ · размер · ' + 'ε' + ' 🎈 done');
+  Frame := BuildFrame(WS_OP_TEXT, True, False, False, True, Payload,
+    $C0FFEE11);
+  Bad := 0;
+  for Cut := 1 to Length(Frame) - 1 do
+  begin
+    SS := TSink.Create;
+    S := NewServer(SS);
+    try
+      Part1 := System.Copy(Frame, 0, Cut);
+      Part2 := System.Copy(Frame, Cut, Length(Frame) - Cut);
+      if not S.Ingest(@Part1[0], Length(Part1)) then Inc(Bad);
+      if not S.Ingest(@Part2[0], Length(Part2)) then Inc(Bad);
+      if (SS.MsgCount <> 1) or (not SS.LastText) or
+         (not SameBytes(SS.LastMsg, Payload)) then
+        Inc(Bad);
+    finally
+      S.Free; SS.Free;
+    end;
+  end;
+  Expect<Integer>(Bad).ToBe(0);
+end;
+
+procedure TProtoDelivery.TestBadUtf8WholeFrame;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Bad: TBytes;
+begin
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    Bad := Bytes('ok so far ');
+    SetLength(Bad, Length(Bad) + 2);
+    Bad[High(Bad) - 1] := $E2; Bad[High(Bad)] := $28; // broken sequence
+    Expect<Boolean>(IngestAll(S, [
+      BuildFrame(WS_OP_TEXT, True, False, False, True, Bad, $01020304)
+    ])).ToBe(False);
+    Expect<Integer>(SS.MsgCount).ToBe(0);
+    Expect<Integer>(Integer(WireCloseCode(S))).ToBe(1007);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
+// A fragmented message never takes the in-place path: each fragment is
+// complete in the buffer, but the message is not.
+procedure TProtoDelivery.TestFragmentsAssembled;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  P1, P2, Whole, Wire_: TBytes;
+begin
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    P1 := Pattern(500, 1);
+    P2 := Pattern(700, 2);
+    Whole := Concat(P1, P2);
+    Wire_ := Concat(
+      BuildFrame(WS_OP_BINARY, False, False, False, True, P1, $0A0B0C0D),
+      BuildFrame(WS_OP_CONT, True, False, False, True, P2, $1A2B3C4D));
+    Expect<Boolean>(S.Ingest(@Wire_[0], Length(Wire_))).ToBe(True);
+    Expect<Integer>(SS.MsgCount).ToBe(1);
+    Expect<Boolean>(SameBytes(SS.LastMsg, Whole)).ToBe(True);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
+procedure TProtoDelivery.SetupTests;
+begin
+  Test('whole frame delivered from the ingested buffer', TestWholeFrameInPlace);
+  Test('pipelined frames in one read, in order',   TestPipelinedFrames);
+  Test('binary frame split at every cut',          TestSplitAtEveryCut);
+  Test('multibyte text frame split at every cut',  TestSplitTextAtEveryCut);
+  Test('bad UTF-8 in a whole frame closes 1007',   TestBadUtf8WholeFrame);
+  Test('fragmented message is assembled',          TestFragmentsAssembled);
+end;
+
 procedure TProtoDeflate.SetupTests;
 begin
   Test('negotiated round trip both ways',      TestNegotiatedRoundTrip);
@@ -884,6 +1082,7 @@ begin
   TestRunnerProgram.AddSuite(TProtoFraming.Create('Protocol: framing rules'));
   TestRunnerProgram.AddSuite(TProtoUtf8.Create('Protocol: UTF-8 policing'));
   TestRunnerProgram.AddSuite(TProtoClose.Create('Protocol: close handshake'));
+  TestRunnerProgram.AddSuite(TProtoDelivery.Create('Protocol: payload delivery'));
   TestRunnerProgram.AddSuite(TProtoDeflate.Create('Protocol: permessage-deflate'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;

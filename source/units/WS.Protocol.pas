@@ -33,8 +33,9 @@ uses
 type
   TWSRole = (wsrServer, wsrClient);
 
-  // P/Len point into protocol-owned buffers, valid only for the duration
-  // of the callback. Copy if you need to keep the bytes.
+  // P/Len point into protocol-owned buffers or into the buffer handed to
+  // Ingest, valid only for the duration of the callback. Copy if you need
+  // to keep the bytes.
   TWSMessageEvent = procedure(AText: Boolean; P: PByte; Len: NativeInt) of object;
   TWSControlEvent = procedure(P: PByte; Len: NativeInt) of object;
   TWSCloseEvent   = procedure(ACode: Word; const AReason: string) of object;
@@ -92,7 +93,7 @@ type
     function HandleControl(const H: TWSFrameHeader; P: PByte): Boolean;
     function BeginDataFrame(const H: TWSFrameHeader): Boolean;
     function DataChunk(P: PByte; ALen: NativeInt): Boolean;
-    function FinishMessage: Boolean;
+    function FinishMessage(ADirect: PByte = nil; ADirectLen: NativeInt = 0): Boolean;
   public
     constructor Create(ARole: TWSRole; const ADeflate: TWSDeflateParams;
       AMaxMessage: NativeInt = 16 * 1024 * 1024);
@@ -423,7 +424,7 @@ begin
   end;
 end;
 
-function TWSProtocol.FinishMessage: Boolean;
+function TWSProtocol.FinishMessage(ADirect: PByte; ADirectLen: NativeInt): Boolean;
 var
   P: PByte;
   N, Prev: NativeInt;
@@ -454,8 +455,16 @@ begin
   begin
     if FMsgText and (FUtf8 <> UTF8_ACCEPT) then
       Exit(Fail(1007, 'truncated UTF-8 at message end'));
-    N := FMsgLen;
-    if N > 0 then P := @FMsg[0] else P := nil;
+    if ADirect <> nil then
+    begin
+      P := ADirect;
+      N := ADirectLen;
+    end
+    else
+    begin
+      N := FMsgLen;
+      if N > 0 then P := @FMsg[0] else P := nil;
+    end;
   end;
   FInMessage := False;
   FMsgLen := 0;
@@ -586,6 +595,19 @@ begin
       if FStreamMasked then
         ApplyMask(Work + Off, Take, FStreamKey, FStreamOff);
       Inc(FStreamOff, Take);
+      // Whole final frame of an uncompressed message with nothing
+      // assembled before it: validate and deliver from the buffer it
+      // already sits in instead of copying it into FMsg.
+      if FStreamFin and (not FMsgCompressed) and (FMsgLen = 0) and
+         (UInt64(Take) = FStreamRemaining) then
+      begin
+        FStreamRemaining := 0;
+        if FMsgText and (not Utf8Advance(FUtf8, Work + Off, Take)) then
+          Exit(Fail(1007, 'invalid UTF-8'));
+        Inc(Off, Take);
+        if not FinishMessage(Work + Off - Take, Take) then Exit(False);
+        Continue;
+      end;
       Dec(FStreamRemaining, Take);
       if not DataChunk(Work + Off, Take) then Exit(False);
       Inc(Off, Take);
