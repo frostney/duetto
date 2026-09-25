@@ -217,7 +217,7 @@ jobs:
       - name: lwpt build (all programs)
         run: lwpt build
 
-      - name: lwpt test (seven co-located unit suites)
+      - name: lwpt test (eight co-located unit suites)
         run: lwpt test
 
       - name: wsinterop (live-socket battery, own client vs own server)

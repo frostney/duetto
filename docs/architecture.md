@@ -45,7 +45,7 @@ Units higher in the table never depend on units lower down. The programs in
 
 Four nets, from innermost to outermost:
 
-1. **Co-located unit suites** (`lwpt test`, seven of them): RFC §5.7 frame
+1. **Co-located unit suites** (`lwpt test`, eight of them): RFC §5.7 frame
    vectors and strictness, an exhaustive 16.8M-case UTF-8 differential,
    handshake acceptance/rejection matrices, deflate round-trips with
    takeover and bomb-cap checks, a 26-test protocol conformance suite
