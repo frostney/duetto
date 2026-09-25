@@ -1500,46 +1500,29 @@ begin
   end;
 end;
 
-// Read EgressCount unmasked binary frames and compare each with
-// EgressPayload(i), in order. False on EOF / timeout, an unexpected
-// frame, or a byte mismatch.
+// Read exactly the EgressCount unmasked binary frames the server must
+// send back and compare them byte for byte (headers, payloads, order).
+// False on EOF / timeout or any mismatch.
 function RawReadEgressEchoes(AFd: Tsocket; const ALeftover: TBytes): Boolean;
 var
-  Buf: TBytes;
-  Len, Off, Got: NativeInt;
-  H: TWSFrameHeader;
-  Seen: Integer;
   Want: RawByteString;
+  Buf: TBytes;
+  Len, Got: NativeInt;
+  I: Integer;
 begin
-  Result := False;
+  Want := '';
+  for I := 0 to EgressCount - 1 do
+    Want := Want + BuildFrameBytes(WS_OP_BINARY, EgressPayload(I), False);
   Buf := Copy(ALeftover);
   Len := Length(Buf);
-  Off := 0;
-  Seen := 0;
-  while Seen < EgressCount do
+  SetLength(Buf, Length(Want));
+  while Len < Length(Want) do
   begin
-    // Pointer arithmetic, not @Buf[Off]: Off = Len is the normal
-    // "need more" state and would trip the range check.
-    if (ParseFrameHeader(PByte(Buf) + Off, Len - Off, H) = wprOK) and
-       (Len - Off - H.HeaderLen >= NativeInt(H.PayloadLen)) then
-    begin
-      if (H.Opcode <> WS_OP_BINARY) or H.Masked or
-         (NativeInt(H.PayloadLen) <> EgressSize) then
-        Exit;
-      Want := EgressPayload(Seen);
-      if not CompareMem(PByte(Buf) + Off + H.HeaderLen, @Want[1], EgressSize) then
-        Exit;
-      Inc(Off, H.HeaderLen + NativeInt(H.PayloadLen));
-      Inc(Seen);
-      Continue;
-    end;
-    if Length(Buf) - Len < 65536 then
-      SetLength(Buf, Len + 256 * 1024);
-    Got := fpRecv(AFd, @Buf[Len], Length(Buf) - Len, 0);
-    if Got <= 0 then Exit;
+    Got := fpRecv(AFd, @Buf[Len], Length(Want) - Len, 0);
+    if Got <= 0 then Exit(False);
     Inc(Len, Got);
   end;
-  Result := True;
+  Result := CompareMem(@Buf[0], @Want[1], Length(Want));
 end;
 
 // ---------------------------------------------------------------------------
