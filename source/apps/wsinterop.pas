@@ -1527,6 +1527,40 @@ begin
   Result := CompareMem(@Buf[0], @Want[1], Length(Want));
 end;
 
+// The epoll gather-write probe, as its own section.
+procedure RunEgressSection(APort: Word; var AStressPhase: ShortString);
+var
+  Fd: Tsocket;
+  Left: TBytes;
+  Ok: Boolean;
+  EgressSender: TEgressSender;
+begin
+  // --- server egress backpressure (plaintext) ----------------------------
+  // A reader with a small receive buffer holds off while EgressCount
+  // large frames go out: the server's echo overflows the socket, so (on
+  // Linux, deterministically) its write goes short and the rest of that
+  // frame — and every echo behind it — waits in the out queue for
+  // OnSendReady. Everything must arrive intact and in order.
+  AStressPhase := 'egress backpressure';
+  Fd := RawConnectEx(APort, True, EgressRecvBuf);
+  Left := RawHandshake(Fd);
+  EgressSender := TEgressSender.Create(True);
+  EgressSender.Fd := Fd;
+  EgressSender.Start;
+  Sleep(EgressStallMs);
+  Ok := RawReadEgressEchoes(Fd, Left);
+  // A failed read may leave the sender blocked in a full socket: shut it
+  // down so WaitFor returns instead of waiting on the watchdog.
+  if not Ok then
+    fpShutdown(Fd, ShutBoth);
+  EgressSender.WaitFor;
+  Ok := Ok and EgressSender.Ok;
+  EgressSender.Free;
+  CloseSocket(Fd);
+  Check(Ok, Format('%d x %d KiB echoed through a stalled reader, in order',
+    [EgressCount, EgressSize div 1024]));
+end;
+
 // ---------------------------------------------------------------------------
 
 const
@@ -1560,7 +1594,6 @@ var
   Deadline: QWord;
   LiveEcho: LongInt;
   Watchdog: TStressWatchdog;
-  EgressSender: TEgressSender;
   StressDone: Boolean;
   StressPhase: ShortString;
   TotalCycles, TotalPushes, TotalDrops, TotalTransient: Integer;
@@ -1776,30 +1809,7 @@ begin
   CloseSocket(Fd);
   Check(Code = 1007, 'invalid UTF-8 text -> close 1007');
 
-  // --- server egress backpressure (plaintext) ----------------------------
-  // A reader with a small receive buffer holds off while EgressCount
-  // large frames go out: the server's echo overflows the socket, so (on
-  // Linux, deterministically) its write goes short and the rest of that
-  // frame — and every echo behind it — waits in the out queue for
-  // OnSendReady. Everything must arrive intact and in order.
-  StressPhase := 'egress backpressure';
-  Fd := RawConnectEx(Port, True, EgressRecvBuf);
-  Left := RawHandshake(Fd);
-  EgressSender := TEgressSender.Create(True);
-  EgressSender.Fd := Fd;
-  EgressSender.Start;
-  Sleep(EgressStallMs);
-  Ok := RawReadEgressEchoes(Fd, Left);
-  // A failed read may leave the sender blocked in a full socket: shut it
-  // down so WaitFor returns instead of waiting on the watchdog.
-  if not Ok then
-    fpShutdown(Fd, ShutBoth);
-  EgressSender.WaitFor;
-  Ok := Ok and EgressSender.Ok;
-  EgressSender.Free;
-  CloseSocket(Fd);
-  Check(Ok, Format('%d x %d KiB echoed through a stalled reader, in order',
-    [EgressCount, EgressSize div 1024]));
+  RunEgressSection(Port, StressPhase);
 
   // --- plain HTTP on the WebSocket port (OnPlainRequest) ------------------
   // A second, short-lived server carries the hook: the fallback is
