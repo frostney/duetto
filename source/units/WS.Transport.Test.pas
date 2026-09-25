@@ -54,6 +54,7 @@ type
     procedure TestShortFirstStops;
     procedure TestShortSecond;
     procedure TestDead;
+    procedure TestEmptySecond;
   end;
 
 function TFakeConn.SubmitSend(P: PByte; ALen: NativeInt): NativeInt;
@@ -162,6 +163,20 @@ begin
   end;
 end;
 
+procedure TGatherDefault.TestEmptySecond;
+var
+  C: TFakeConn;
+begin
+  C := NewFake([100, 100]);
+  try
+    // Nothing to gather: the second buffer is never offered.
+    Expect<Integer>(Integer(C.SubmitSendV(@HdrBytes[0], 2, nil, 0))).ToBe(2);
+    Expect<Integer>(C.Calls).ToBe(1);
+  finally
+    C.Free;
+  end;
+end;
+
 procedure TGatherDefault.SetupTests;
 begin
   Test('gather send is off unless a transport opts in', TestOffByDefault);
@@ -169,6 +184,7 @@ begin
   Test('short first write never offers the second', TestShortFirstStops);
   Test('short second write reports the total',   TestShortSecond);
   Test('dead connection reports -1',             TestDead);
+  Test('empty second buffer is never offered',   TestEmptySecond);
 end;
 
 function HexOf(const A: TWSBindAddress; ACount: Integer): string;

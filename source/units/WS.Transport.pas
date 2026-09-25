@@ -63,8 +63,8 @@ type
     // bytes until completion, so it copies anyway and leaves this off.
     // The default runs two SubmitSends and is correct everywhere.
     function SupportsGather: Boolean; virtual;
-    function SubmitSendV(AP1: PByte; AL1: NativeInt; AP2: PByte;
-      AL2: NativeInt): NativeInt; virtual;
+    function SubmitSendV(AFirst: PByte; AFirstLen: NativeInt; ASecond: PByte;
+      ASecondLen: NativeInt): NativeInt; virtual;
 
     // Teardown. The caller must drop every reference before calling and
     // receives no further completions; OnClosed does not fire. The
@@ -302,14 +302,14 @@ begin
   Result := False;
 end;
 
-function TWSTransportConn.SubmitSendV(AP1: PByte; AL1: NativeInt; AP2: PByte;
-  AL2: NativeInt): NativeInt;
+function TWSTransportConn.SubmitSendV(AFirst: PByte; AFirstLen: NativeInt; ASecond: PByte;
+  ASecondLen: NativeInt): NativeInt;
 var
   W: NativeInt;
 begin
-  Result := SubmitSend(AP1, AL1);
-  if (Result < AL1) or (AL2 <= 0) then Exit;
-  W := SubmitSend(AP2, AL2);
+  Result := SubmitSend(AFirst, AFirstLen);
+  if (Result < AFirstLen) or (ASecondLen <= 0) then Exit;
+  W := SubmitSend(ASecond, ASecondLen);
   if W < 0 then Exit(-1);
   Inc(Result, W);
 end;

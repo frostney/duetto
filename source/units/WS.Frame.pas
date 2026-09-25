@@ -68,10 +68,10 @@ procedure ApplyMaskCopy(ASrc, ADst: PByte; ALen: PtrUInt; AKey: UInt32;
 // slower than libc memcpy from 1 KiB up (wsbench "payload copy"), so on
 // Unix this is memcpy; elsewhere it stays Move. Overlapping ranges must
 // use Move.
-procedure MovePayload(ASrc, ADst: PByte; ALen: PtrUInt); inline;
+procedure MovePayload(ASrc, ADst: PByte; ALen: PtrUInt);
 
-// Individual implementations, exported so wsbench can race them and the
-// tests can assert equivalence.
+// Individual implementations, exported so the tests can assert
+// equivalence (and wsbench can race the in-place ones).
 procedure UnmaskNaive(P: PByte; ALen: PtrUInt; ARotKey: UInt32);
 procedure UnmaskU64(P: PByte; ALen: PtrUInt; ARotKey: UInt32);
 procedure UnmaskCopyU64(ASrc, ADst: PByte; ALen: PtrUInt; ARotKey: UInt32);
@@ -222,6 +222,7 @@ function C_memcpy(ADst, ASrc: Pointer; ALen: PtrUInt): Pointer; cdecl;
 
 procedure MovePayload(ASrc, ADst: PByte; ALen: PtrUInt);
 begin
+  if ALen = 0 then Exit; // memcpy with a nil pointer is undefined even at 0
 {$ifdef UNIX}
   C_memcpy(ADst, ASrc, ALen);
 {$else}

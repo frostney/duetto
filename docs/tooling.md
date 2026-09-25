@@ -75,11 +75,13 @@ one is running.
   and the Python `websockets` echo in `tools/pyecho.py`, then a
   permessage-deflate pass driven by `tools/deflbench.py`. Every path is
   an environment override (`LOAD_TEST`, `DUETTO`, `RUST_ECHO`,
-  `PYTHON`); missing contenders are reported as skipped. `SERVER_CPU` /
+  `PYTHON`); missing contenders are reported as skipped, and a run that
+  produced no samples says so instead of scoring 0. `SERVER_CPU` /
   `CLIENT_CPU` pin the server and the generator with `taskset`: the same
   core for both reproduces the shared-core setup, separate physical
   cores stop the generator competing with the server. Needs GNU
-  `stdbuf` (`gstdbuf` on macOS) to read `load_test`'s output.
+  `stdbuf` and `timeout` (`gstdbuf` / `gtimeout` on macOS); the deflate
+  pass needs Python `websockets` 14 or newer.
 
 ```bash
 LOAD_TEST=~/src/uWebSockets/benchmarks/load_test \

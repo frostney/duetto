@@ -58,15 +58,17 @@ Four nets, from innermost to outermost:
    `WS.Transport` suite pinning the bind-address literal parser (strict
    dotted-quad, RFC 4291 IPv6 forms, and a rejection matrix that names
    the offending input) and the default gather send every transport
-   inherits.
+   inherits, plus a protocol direct-send suite (when a frame may bypass
+   the out queue, and that exactly the untaken tail is queued).
 2. **`wsinterop`**: own client ↔ own server over real TCP, plus raw-socket
    violations (unmasked frame → 1002, invalid close code → 1002, fragmented
    ping → 1002, invalid UTF-8 → 1007), an upgrade-hook section (a server
    bound to `127.0.0.1` explicitly whose `OnUpgradeRequest` refuses one
    `Origin` with a 403 — no `OnOpen`, no `OnClientClose` — and treats a
    raising hook the same way), a plaintext egress-backpressure probe
-   (a stalled reader forces the server's send short mid-message; eight
-   1 MiB echoes must still arrive intact and in order), and — on Linux
+   (a stalled reader backs the server's egress up — on Linux forcing the
+   epoll gather write short mid-message; eight 1 MiB echoes must still
+   arrive intact and in order), and — on Linux
    — a `wss://` section
    against a TLS listener built from a runtime-generated identity
    (handshake, echo, flow-control windows, `close_notify`, handshake
