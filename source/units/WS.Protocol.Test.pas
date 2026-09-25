@@ -1149,7 +1149,7 @@ procedure TProtoDirect.TestHeaderOnlyWhenEligible;
 var
   S, C, SD, CD: TWSProtocol;
   SS: TSink;
-  Hdr: array[0..WS_MAX_HEADER - 1] of Byte;
+  Hdr: TWSFrameHeaderBuf;
 begin
   SS := TSink.Create;
   S := NewServer(SS);
@@ -1157,21 +1157,21 @@ begin
   NegotiatedPair(CD, SD);
   try
     // Server, nothing queued, no deflate: eligible.
-    Expect<Integer>(S.DirectHeader(False, 100, @Hdr[0])).ToBe(2);
-    Expect<Integer>(S.DirectHeader(True, 70000, @Hdr[0])).ToBe(10);
+    Expect<Integer>(S.DirectHeader(False, 100, Hdr)).ToBe(2);
+    Expect<Integer>(S.DirectHeader(True, 70000, Hdr)).ToBe(10);
     // Client frames are masked into our own copy: never direct.
-    Expect<Integer>(C.DirectHeader(False, 100, @Hdr[0])).ToBe(0);
+    Expect<Integer>(C.DirectHeader(False, 100, Hdr)).ToBe(0);
     // Deflate rewrites the payload: never direct.
-    Expect<Integer>(SD.DirectHeader(False, 100, @Hdr[0])).ToBe(0);
+    Expect<Integer>(SD.DirectHeader(False, 100, Hdr)).ToBe(0);
     // Something already queued: a direct write would overtake it.
     S.SendPing(nil, 0);
-    Expect<Integer>(S.DirectHeader(False, 100, @Hdr[0])).ToBe(0);
+    Expect<Integer>(S.DirectHeader(False, 100, Hdr)).ToBe(0);
     S.OutConsume(S.OutPending);
-    Expect<Integer>(S.DirectHeader(False, 100, @Hdr[0])).ToBe(2);
+    Expect<Integer>(S.DirectHeader(False, 100, Hdr)).ToBe(2);
     // Close sent: data must be dropped, as SendBinary would.
     S.SendClose(1000, '');
     S.OutConsume(S.OutPending);
-    Expect<Integer>(S.DirectHeader(False, 100, @Hdr[0])).ToBe(0);
+    Expect<Integer>(S.DirectHeader(False, 100, Hdr)).ToBe(0);
   finally
     S.Free; C.Free; SD.Free; CD.Free; SS.Free;
   end;
@@ -1183,7 +1183,7 @@ procedure TProtoDirect.TestHeaderMatchesQueuedFrame;
 var
   S: TWSProtocol;
   SS: TSink;
-  Hdr: array[0..WS_MAX_HEADER - 1] of Byte;
+  Hdr: TWSFrameHeaderBuf;
   Payload, Queued, Direct: TBytes;
   HLen, I, Bad: Integer;
   Sizes: array[0..4] of Integer = (0, 125, 126, 65535, 65536);
@@ -1198,7 +1198,7 @@ begin
       S.SendBinary(PByte(Payload), Length(Payload));
       Queued := QueuedBytes(S);
       S.OutConsume(S.OutPending);
-      HLen := S.DirectHeader(False, Length(Payload), @Hdr[0]);
+      HLen := S.DirectHeader(False, Length(Payload), Hdr);
       SetLength(Direct, HLen);
       Move(Hdr[0], Direct[0], HLen);
       Direct := Concat(Direct, Payload);
@@ -1207,7 +1207,7 @@ begin
     S.SendText('text opcode');
     Queued := QueuedBytes(S);
     S.OutConsume(S.OutPending);
-    HLen := S.DirectHeader(True, 11, @Hdr[0]);
+    HLen := S.DirectHeader(True, 11, Hdr);
     if (HLen <> 2) or (Hdr[0] <> Queued[0]) or (Hdr[1] <> Queued[1]) then
       Inc(Bad);
   finally
@@ -1222,7 +1222,7 @@ procedure TProtoDirect.TestRemainderForEveryTakenCount;
 var
   S: TWSProtocol;
   SS: TSink;
-  Hdr: array[0..WS_MAX_HEADER - 1] of Byte;
+  Hdr: TWSFrameHeaderBuf;
   Payload, Whole, Tail: TBytes;
   HLen, Taken, Bad: Integer;
 begin
@@ -1231,13 +1231,13 @@ begin
   SS := TSink.Create;
   S := NewServer(SS);
   try
-    HLen := S.DirectHeader(False, Length(Payload), @Hdr[0]);
+    HLen := S.DirectHeader(False, Length(Payload), Hdr);
     SetLength(Whole, HLen);
     Move(Hdr[0], Whole[0], HLen);
     Whole := Concat(Whole, Payload);
     for Taken := 0 to Length(Whole) do
     begin
-      S.DirectSent(@Hdr[0], HLen, PByte(Payload), Length(Payload), Taken);
+      S.DirectSent(Hdr, HLen, PByte(Payload), Length(Payload), Taken);
       Tail := System.Copy(Whole, Taken, Length(Whole) - Taken);
       if not SameBytes(QueuedBytes(S), Tail) then Inc(Bad);
       S.OutConsume(S.OutPending);

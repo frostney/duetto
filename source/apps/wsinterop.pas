@@ -1445,9 +1445,10 @@ end;
 // ---------------------------------------------------------------------------
 
 const
-  // Eight 1 MiB echoes against a 64 KiB client receive buffer: more than
-  // Linux's 4 MiB autotuned send buffer can absorb, so the server's
-  // write is guaranteed to go short mid-message.
+  // Eight 1 MiB echoes against a 64 KiB client receive buffer: on Linux
+  // more than the 4 MiB autotuned send buffer can absorb, so the epoll
+  // server's gather write is guaranteed to go short mid-message. Other
+  // platforms run the same probe as a plain backpressure check.
   EgressCount = 8;
   EgressSize = 1024 * 1024;
   EgressRecvBuf = 64 * 1024;
@@ -1473,13 +1474,30 @@ begin
     Result[I] := AnsiChar((I * 13 + AIndex * 71) and $FF);
 end;
 
+// Blocking send of every byte (a 1 MiB frame need not go in one call);
+// stops at the first failure, e.g. the socket shut down under it.
 procedure TEgressSender.Execute;
 var
   I: Integer;
+  Wire: RawByteString;
+  Off, Sent: NativeInt;
 begin
   Ok := True;
   for I := 0 to EgressCount - 1 do
-    Ok := RawSendFrame(Fd, WS_OP_BINARY, EgressPayload(I), True) and Ok;
+  begin
+    Wire := BuildFrameBytes(WS_OP_BINARY, EgressPayload(I), True);
+    Off := 0;
+    while Off < Length(Wire) do
+    begin
+      Sent := fpSend(Fd, @Wire[Off + 1], Length(Wire) - Off, 0);
+      if Sent <= 0 then
+      begin
+        Ok := False;
+        Exit;
+      end;
+      Inc(Off, Sent);
+    end;
+  end;
 end;
 
 // Read EgressCount unmasked binary frames and compare each with
@@ -1775,10 +1793,10 @@ begin
 
   // --- server egress backpressure (plaintext) ----------------------------
   // A reader with a small receive buffer holds off while EgressCount
-  // large frames go out: the server's echo overflows the socket, so its
-  // write goes short and the rest of that frame — and every echo behind
-  // it — waits in the out queue for OnSendReady. Everything must arrive
-  // intact and in order.
+  // large frames go out: the server's echo overflows the socket, so (on
+  // Linux, deterministically) its write goes short and the rest of that
+  // frame — and every echo behind it — waits in the out queue for
+  // OnSendReady. Everything must arrive intact and in order.
   StressPhase := 'egress backpressure';
   Fd := RawConnectEx(Port, True, EgressRecvBuf);
   Left := RawHandshake(Fd);
@@ -1787,6 +1805,10 @@ begin
   EgressSender.Start;
   Sleep(EgressStallMs);
   Ok := RawReadEgressEchoes(Fd, Left);
+  // A failed read may leave the sender blocked in a full socket: shut it
+  // down so WaitFor returns instead of waiting on the watchdog.
+  if not Ok then
+    fpShutdown(Fd, 2);
   EgressSender.WaitFor;
   Ok := Ok and EgressSender.Ok;
   EgressSender.Free;

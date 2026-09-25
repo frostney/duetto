@@ -34,7 +34,6 @@ uses
   syncobjs,
   SysUtils,
 
-  WS.Frame,
   WS.Handshake,
   WS.Protocol,
   WS.Transport;
@@ -72,12 +71,11 @@ type
     FRegistryIndex: Integer;
     procedure ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
     function GetId: NativeUInt;
-    // Gather-write fast path for SendText/SendBinary: header + the
-    // caller's payload go to the transport in one write, and only what
-    // it did not take is queued — no copy into the protocol's out queue
-    // on the common path. ADone = False: not eligible, use the queue.
-    function SendDirect(AText: Boolean; P: PByte; ALen: NativeInt;
-      out ADone: Boolean): Boolean;
+    // SendText/SendBinary. Where the transport can gather and the
+    // protocol allows it, header + the caller's payload go out in one
+    // write and only what the transport did not take is queued — no copy
+    // into the protocol's out queue on the common path.
+    function SendData(AText: Boolean; P: PByte; ALen: NativeInt): Boolean;
   public
     UserData: Pointer;
     constructor Create;
@@ -345,50 +343,40 @@ begin
     FServer.FOnMessage(Self, AText, P, ALen);
 end;
 
-function TWSConnection.SendDirect(AText: Boolean; P: PByte;
-  ALen: NativeInt; out ADone: Boolean): Boolean;
+function TWSConnection.SendData(AText: Boolean; P: PByte;
+  ALen: NativeInt): Boolean;
 var
-  Hdr: array[0..WS_MAX_HEADER - 1] of Byte;
+  Hdr: TWSFrameHeaderBuf;
   HLen: Integer;
-  W: NativeInt;
+  Taken: NativeInt;
 begin
   Result := True;
-  ADone := False;
-  if (ALen < DirectSendMin) or (not FTConn.SupportsGather) then Exit;
-  HLen := FProto.DirectHeader(AText, ALen, @Hdr[0]);
-  if HLen = 0 then Exit;
-  ADone := True;
-  W := FTConn.SubmitSendV(@Hdr[0], HLen, P, ALen);
-  if W < 0 then Exit(FServer.DropConn(Self));
-  FProto.DirectSent(@Hdr[0], HLen, P, ALen, W);
+  if FState <> wcsOpen then Exit;
+  HLen := 0;
+  if (ALen >= DirectSendMin) and FTConn.SupportsGather then
+    HLen := FProto.DirectHeader(AText, ALen, Hdr);
+  if HLen = 0 then
+  begin
+    if AText then
+      FProto.SendText(P, ALen)
+    else
+      FProto.SendBinary(P, ALen);
+    Exit(FServer.FlushConn(Self));
+  end;
+  // Same drop contract as FlushConn: -1 = dead, dropped here.
+  Taken := FTConn.SubmitSendV(@Hdr[0], HLen, P, ALen);
+  if Taken < 0 then Exit(FServer.DropConn(Self));
+  FProto.DirectSent(Hdr, HLen, P, ALen, Taken);
 end;
 
 function TWSConnection.SendText(P: PByte; ALen: NativeInt): Boolean;
-var
-  Done: Boolean;
 begin
-  Result := True;
-  if FState = wcsOpen then
-  begin
-    Result := SendDirect(True, P, ALen, Done);
-    if Done then Exit;
-    FProto.SendText(P, ALen);
-    Result := FServer.FlushConn(Self);
-  end;
+  Result := SendData(True, P, ALen);
 end;
 
 function TWSConnection.SendBinary(P: PByte; ALen: NativeInt): Boolean;
-var
-  Done: Boolean;
 begin
-  Result := True;
-  if FState = wcsOpen then
-  begin
-    Result := SendDirect(False, P, ALen, Done);
-    if Done then Exit;
-    FProto.SendBinary(P, ALen);
-    Result := FServer.FlushConn(Self);
-  end;
+  Result := SendData(False, P, ALen);
 end;
 
 procedure TWSConnection.Post(AProc: TWSConnProc);
