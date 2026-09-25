@@ -90,10 +90,7 @@ type
     // in freed memory). True = the connection is still alive,
     // including the no-op cases (not yet open, already closing). This
     // matches the pre-seam reactor's drop semantics; ignoring the
-    // result is legal Pascal and keeps old callers valid. Inside
-    // OnClientClose the connection is already being torn down: a send
-    // reports False and does nothing else — no second OnClientClose —
-    // and the reference stays valid until the handler returns.
+    // result is legal Pascal and keeps old callers valid.
     //
     // True is a liveness signal, NOT a delivery or queueing one: it is
     // also what you get when the call did nothing at all (state is not
@@ -844,11 +841,6 @@ begin
   Conn := TWSConnection(ATConn.UserData);
   if Conn = nil then Exit;
   ATConn.UserData := nil;
-  // Teardown is already running: an OnClientClose handler that sends
-  // into the dead connection reaches DropConn through the failed flush,
-  // and must find it dropping — a second ReleaseConn would fire
-  // OnClientClose again and free Conn (and SubmitClose ATConn) twice.
-  Conn.FDropping := True;
   ReleaseConn(Conn);
   // The transport frees ATConn after this callback returns.
 end;

@@ -218,8 +218,7 @@ server-side deflate ceiling is the component number above.
   queue.
 - `wsinterop` over real TCP, including raw-socket violations (unmasked
   frame → 1002, invalid close code → 1002, fragmented ping → 1002,
-  invalid UTF-8 → 1007), an egress-backpressure probe and a
-  close-handler section.
+  invalid UTF-8 → 1007) and an egress-backpressure probe.
 - Bidirectional cross-check vs Python `websockets` 16.0
   (`tools/crosscheck.py`): text, multibyte, 512 KiB binary,
   fragmentation reassembly, ping, clean close, deflate, plus raw

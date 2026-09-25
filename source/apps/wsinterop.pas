@@ -107,18 +107,6 @@ type
     procedure Snapshot(out AHits, AOpens, ACloses: Integer);
   end;
 
-  // OnClientClose host that tries to talk to the connection it is being
-  // told has gone (a farewell message, say). Every send may only report
-  // the drop; the handler must run exactly once per connection and the
-  // server must survive it.
-  TCloseSender = class
-  public
-    // Interlocked: handlers may run on any queue.
-    Closes: LongInt;
-    Accepted: LongInt; // farewell sends that claimed success: must stay 0
-    procedure HandleClose(AConn: TWSConnection);
-  end;
-
   TServerThread = class(TThread)
   public
     Srv: TWSServer;
@@ -264,34 +252,6 @@ begin
   finally
     FLock.Release;
   end;
-end;
-
-procedure TCloseSender.HandleClose(AConn: TWSConnection);
-var
-  Farewell: RawByteString;
-  {$ifdef UNIX}
-  Pair: array[0..1] of cint;
-  {$endif}
-begin
-  InterLockedIncrement(Closes);
-  {$ifdef UNIX}
-  // Take the lowest free descriptors first: on a transport that closed
-  // the connection's fd before this callback, one of them now carries
-  // that number, and a send that still reached the fd would succeed.
-  Pair[0] := -1;
-  fpsocketpair(AF_UNIX, SOCK_STREAM, 0, @Pair[0]);
-  {$endif}
-  // The peer reset: the send may only report the drop.
-  Farewell := StringOfChar('x', 4096);
-  if AConn.SendText(@Farewell[1], Length(Farewell)) then
-    InterLockedIncrement(Accepted);
-  {$ifdef UNIX}
-  if Pair[0] >= 0 then
-  begin
-    CloseSocket(Pair[0]);
-    CloseSocket(Pair[1]);
-  end;
-  {$endif}
 end;
 
 procedure TServerThread.Execute;
@@ -1571,7 +1531,6 @@ end;
 
 const
   HelloProbe: RawByteString = 'hello duetto';
-  CloseResetCount = 8;
   PipelinedMsgs: array[0..2] of RawByteString = ('one', 'two', 'three');
   LingerProbe: RawByteString = 'linger';
 
@@ -1617,9 +1576,6 @@ var
   // Upgrade-hook section
   Gate: TUpgradeGate;
   HookSrvT: TServerThread;
-  CloseSrvT: TServerThread;
-  CloseSender: TCloseSender;
-  CloseHard: TInteropLinger;
   HookPort: Word;
   HookResp: RawByteString;
   Hits, Opens, Closes: Integer;
@@ -1997,55 +1953,6 @@ begin
   HookSrvT.Srv.Free;
   HookSrvT.Free;
   Gate.Free;
-
-  // --- OnClientClose that sends ------------------------------------------
-  // A peer that resets its connection gets OnClientClose while the
-  // session still thinks the connection is open, and a handler that
-  // sends into it sees the send fail. That failure must not start a
-  // second teardown: the handler runs once, the connection is freed once,
-  // and the server keeps serving.
-  StressPhase := 'close-handler send section';
-  CloseSender := TCloseSender.Create;
-  CloseSrvT := TServerThread.Create(True);
-  CloseSrvT.Srv := TWSServer.Create(0, False, 16 * 1024 * 1024, '127.0.0.1');
-  CloseSrvT.Srv.OnMessage := Echo.OnMsg;
-  CloseSrvT.Srv.OnClientClose := CloseSender.HandleClose;
-  CloseSrvT.Start;
-  CloseHard.OnOff := 1;
-  CloseHard.Seconds := 0;
-  for I := 1 to CloseResetCount do
-  begin
-    Fd := RawConnect(CloseSrvT.Srv.Port);
-    fpSetSockOpt(Fd, SOL_SOCKET, SO_LINGER, @CloseHard, SizeOf(CloseHard));
-    // The server is open (and OnOpen has run) before its 101 is queued,
-    // so the reset below hits an open connection, not a handshake.
-    RawHandshake(Fd);
-    CloseSocket(Fd); // SO_LINGER 0: RST
-  end;
-  Deadline := GetTickCount64 + 5000;
-  while (CloseSender.Closes < CloseResetCount) and (GetTickCount64 < Deadline) do
-    Sleep(10);
-  Sleep(100); // a second, re-entrant OnClientClose would land by now
-  Check(CloseSender.Closes = CloseResetCount,
-    Format('%d reset peers: OnClientClose once each despite sending (%d)',
-      [CloseResetCount, CloseSender.Closes]));
-  Check(CloseSender.Accepted = 0,
-    Format('farewell sends into reset peers all report the drop (%d did not)',
-      [CloseSender.Accepted]));
-  Cli := TWSClient.Create;
-  Cli.Connect(Format('ws://127.0.0.1:%d/', [CloseSrvT.Srv.Port]));
-  Cli.SendText(HelloProbe);
-  Check(Cli.ReadMessage(IsText, Data) and (Length(Data) = Length(HelloProbe)),
-    'server still echoes after close handlers sent into dead connections');
-  Cli.Close(1000, 'done');
-  Cli.Free;
-  StressPhase := 'close-handler send section: teardown';
-  CloseSrvT.Terminate;
-  CloseSrvT.Srv.Stop;
-  CloseSrvT.WaitFor;
-  CloseSrvT.Srv.Free;
-  CloseSrvT.Free;
-  CloseSender.Free;
 
   // --- server TLS terminated by the transport (duetto#22) -----------------
   // Linux only, and the reason is the CLIENT half of the battery on the

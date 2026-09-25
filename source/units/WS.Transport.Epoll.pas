@@ -899,13 +899,6 @@ end;
 // then the transport reclaims the connection.
 procedure TWSEpollTransport.RemoteClosed(AConn: TWSEpollConn);
 begin
-  // Dead before the fd is closed: an OnClosed handler may still reach
-  // SubmitSend (the session's OnClientClose sending a farewell), and the
-  // fd number is free for reuse the moment Untrack closes it — the send
-  // must report -1, never write into whatever now owns that number. The
-  // IOCP and Network.framework transports mark the connection the same
-  // way before OnClosed.
-  AConn.FDead := True;
   Untrack(AConn);
   if Assigned(OnClosed) then OnClosed(AConn);
   AConn.Free;
