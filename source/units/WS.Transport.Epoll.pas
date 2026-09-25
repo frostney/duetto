@@ -246,12 +246,15 @@ begin
   while Result < ALen do
   begin
     Sent := fpSend(FFd, P + Result, ALen - Result, MSG_NOSIGNAL);
+    // A signal before anything was sent: nothing happened, send again.
+    if (Sent < 0) and (fpgeterrno = ESysEINTR) then Continue;
     if Sent < 0 then Exit(SendFailed(Result));
     Result := Result + Sent;
   end;
 end;
 
-// A send syscall just failed, ATaken bytes into the offer. EAGAIN arms
+// A send syscall just failed (not EINTR — the callers retry that), ATaken
+// bytes into the offer. EAGAIN arms
 // EPOLLOUT and reports what was taken; anything else kills the
 // connection. Shared by RawSend and SubmitSendV so the two cannot drift.
 function TWSEpollConn.SendFailed(ATaken: NativeInt): NativeInt;
@@ -343,6 +346,8 @@ begin
     end;
     Sent := Do_SysCall(syscall_nr_sendmsg, TSysParam(FFd), TSysParam(@Msg),
       TSysParam(MSG_NOSIGNAL));
+    // Interrupted before sending anything (as for RawSend): send again.
+    if (Sent < 0) and (fpgeterrno = ESysEINTR) then Continue;
     if Sent < 0 then Exit(SendFailed(Result));
     Result := Result + Sent;
   end;
