@@ -136,6 +136,8 @@ type
     // hand header + its own payload to the wire in one gather write and
     // report the bytes taken to DirectSent, which queues the rest.
     // Returns 0 when the message must go through SendText/SendBinary.
+    // Keep its eligibility rules in step with SendDataMessage: any
+    // transformation added there must refuse the direct path here.
     function DirectHeader(AText: Boolean; ALen: NativeInt;
       out AHdr: TWSFrameHeaderBuf): Integer;
     procedure DirectSent(const AHdr: TWSFrameHeaderBuf; AHLen: Integer; P: PByte;
@@ -342,6 +344,8 @@ begin
   end;
 end;
 
+// Any payload transformation added here must also make DirectHeader
+// refuse, or the direct (gather-write) path would skip it.
 procedure TWSProtocol.SendDataMessage(AOpcode: Byte; P: PByte; ALen: NativeInt);
 var
   Z: TBytes;

@@ -90,7 +90,7 @@ type
     procedure ApplyInterest;
     procedure SetTimed(AValue: Boolean);
     function RawSend(P: PByte; ALen: NativeInt): NativeInt;
-    function SendBlocked(ATaken: NativeInt): NativeInt;
+    function SendFailed(ATaken: NativeInt): NativeInt;
     procedure SendDrained;
     // TWSTlsServerSession callbacks.
     function TlsPlaintext(P: PByte; ALen: NativeInt): Boolean;
@@ -245,8 +245,8 @@ begin
 end;
 
 // Socket write, shared by the plaintext send path and the TLS
-// ciphertext egress. Bytes taken, 0 on EAGAIN (EPOLLOUT armed), -1 when
-// the connection is dead.
+// ciphertext egress. Bytes taken (fewer than ALen on EAGAIN, with
+// EPOLLOUT armed), -1 when the connection is dead.
 function TWSEpollConn.RawSend(P: PByte; ALen: NativeInt): NativeInt;
 var
   Sent: NativeInt;
@@ -260,7 +260,7 @@ begin
   while Result < ALen do
   begin
     Sent := fpSend(FFd, P + Result, ALen - Result, MSG_NOSIGNAL);
-    if Sent < 0 then Exit(SendBlocked(Result));
+    if Sent < 0 then Exit(SendFailed(Result));
     Result := Result + Sent;
   end;
 end;
@@ -268,7 +268,7 @@ end;
 // A send syscall just failed, ATaken bytes into the offer. EAGAIN arms
 // EPOLLOUT and reports what was taken; anything else kills the
 // connection. Shared by RawSend and SubmitSendV so the two cannot drift.
-function TWSEpollConn.SendBlocked(ATaken: NativeInt): NativeInt;
+function TWSEpollConn.SendFailed(ATaken: NativeInt): NativeInt;
 begin
   if fpgeterrno <> ESysEAGAIN then
   begin
@@ -309,9 +309,9 @@ type
 {$endif}
 
 // Plaintext only: a TLS connection encrypts into its own buffers, so
-// there is nothing to gather. Targets whose FPC RTL has no sendmsg
-// syscall number (i386, powerpc, m68k: they multiplex socketcall) never
-// opt in.
+// there is nothing to gather. Targets whose FPC RTL declares no sendmsg
+// syscall number (those that multiplex socketcall, e.g. i386) never opt
+// in; x86_64 and aarch64 do.
 function TWSEpollConn.SupportsGather: Boolean;
 begin
 {$if declared(syscall_nr_sendmsg)}
@@ -357,7 +357,7 @@ begin
     end;
     Sent := Do_SysCall(syscall_nr_sendmsg, TSysParam(FFd), TSysParam(@Msg),
       TSysParam(MSG_NOSIGNAL));
-    if Sent < 0 then Exit(SendBlocked(Result));
+    if Sent < 0 then Exit(SendFailed(Result));
     Result := Result + Sent;
   end;
   SendDrained;
