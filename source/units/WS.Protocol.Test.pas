@@ -96,6 +96,8 @@ type
     procedure TestSplitTextAtEveryCut;
     procedure TestBadUtf8WholeFrame;
     procedure TestFragmentsAssembled;
+    procedure TestClientWholeFrameInPlace;
+    procedure TestEmptyFirstFragment;
   end;
 
   TProtoDirect = class(TTestSuite)
@@ -910,24 +912,37 @@ begin
   for I := 0 to ALen - 1 do Result[I] := Byte(I * 31 + ASeed);
 end;
 
+// Ingest AFrame whole and count what is off: not exactly one message,
+// wrong bytes, or a pointer outside the ingested buffer (i.e. handed over
+// from a protocol copy rather than in place).
+function InPlaceFailures(P: TWSProtocol; ASink: TSink;
+  const AFrame, APayload: TBytes): Integer;
+var
+  Wire_: TBytes;
+begin
+  Result := 0;
+  Wire_ := System.Copy(AFrame, 0, Length(AFrame));
+  if not P.Ingest(@Wire_[0], Length(Wire_)) then Inc(Result);
+  if ASink.MsgCount <> 1 then Inc(Result);
+  if not SameBytes(ASink.LastMsg, APayload) then Inc(Result);
+  if (ASink.LastPtr < PByte(@Wire_[0])) or
+     (ASink.LastPtr >= PByte(@Wire_[0]) + Length(Wire_)) then
+    Inc(Result);
+end;
+
 procedure TProtoDelivery.TestWholeFrameInPlace;
 var
   S: TWSProtocol;
   SS: TSink;
-  Payload, Frame: TBytes;
+  Payload: TBytes;
 begin
   SS := TSink.Create;
   S := NewServer(SS);
   try
     Payload := Pattern(1000, 7);
-    Frame := BuildFrame(WS_OP_BINARY, True, False, False, True, Payload,
-      $A1B2C3D4);
-    Expect<Boolean>(S.Ingest(@Frame[0], Length(Frame))).ToBe(True);
-    Expect<Integer>(SS.MsgCount).ToBe(1);
-    Expect<Boolean>(SameBytes(SS.LastMsg, Payload)).ToBe(True);
-    // Handed over from the ingested buffer, not from a protocol copy.
-    Expect<Boolean>((SS.LastPtr >= PByte(@Frame[0])) and
-      (SS.LastPtr < PByte(@Frame[0]) + Length(Frame))).ToBe(True);
+    Expect<Integer>(InPlaceFailures(S, SS,
+      BuildFrame(WS_OP_BINARY, True, False, False, True, Payload, $A1B2C3D4),
+      Payload)).ToBe(0);
   finally
     S.Free; SS.Free;
   end;
@@ -1058,6 +1073,50 @@ begin
   end;
 end;
 
+// Client role: server frames are unmasked, and a whole one is handed over
+// from the ingested buffer just the same.
+procedure TProtoDelivery.TestClientWholeFrameInPlace;
+var
+  C: TWSProtocol;
+  CS: TSink;
+  Payload: TBytes;
+begin
+  CS := TSink.Create;
+  C := Hook(TWSProtocol.Create(wsrClient, NoDeflate), CS);
+  try
+    Payload := Pattern(2000, 4);
+    Expect<Integer>(InPlaceFailures(C, CS,
+      BuildFrame(WS_OP_BINARY, True, False, False, False, Payload, 0),
+      Payload)).ToBe(0);
+  finally
+    C.Free; CS.Free;
+  end;
+end;
+
+// An empty non-final fragment assembles nothing, so its final
+// continuation is the whole message and may be delivered in place.
+procedure TProtoDelivery.TestEmptyFirstFragment;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Tail, Wire_: TBytes;
+begin
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    Tail := Bytes('all of it is in the continuation');
+    Wire_ := Concat(
+      BuildFrame(WS_OP_TEXT, False, False, False, True, nil, $01020304),
+      BuildFrame(WS_OP_CONT, True, False, False, True, Tail, $05060708));
+    Expect<Boolean>(S.Ingest(@Wire_[0], Length(Wire_))).ToBe(True);
+    Expect<Integer>(SS.MsgCount).ToBe(1);
+    Expect<Boolean>(SS.LastText).ToBe(True);
+    Expect<Boolean>(SameBytes(SS.LastMsg, Tail)).ToBe(True);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
 procedure TProtoDelivery.SetupTests;
 begin
   Test('whole frame delivered from the ingested buffer', TestWholeFrameInPlace);
@@ -1066,6 +1125,8 @@ begin
   Test('multibyte text frame split at every cut',  TestSplitTextAtEveryCut);
   Test('bad UTF-8 in a whole frame closes 1007',   TestBadUtf8WholeFrame);
   Test('fragmented message is assembled',          TestFragmentsAssembled);
+  Test('client role: whole frame delivered in place', TestClientWholeFrameInPlace);
+  Test('empty first fragment, final continuation',  TestEmptyFirstFragment);
 end;
 
 procedure TProtoDeflate.SetupTests;

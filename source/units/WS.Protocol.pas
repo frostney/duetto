@@ -55,9 +55,10 @@ type
     FMsgCompressed: Boolean;
     FUtf8: UInt32;
 
-    // data-frame payload being streamed (header already consumed). Data
-    // payloads never enter the carry buffer: each chunk is unmasked in
-    // the caller's buffer and routed straight to assembly/inflater.
+    // data-frame payload being streamed (header already consumed). A
+    // whole final frame is unmasked where it lies and delivered from
+    // there; any other chunk is unmasked while being copied into the
+    // assembly buffer, or unmasked in place and fed to the inflater.
     FStreamRemaining: UInt64;
     FStreamFin: Boolean;
     FStreamMasked: Boolean;
@@ -94,8 +95,10 @@ type
     function HandleControl(const H: TWSFrameHeader; P: PByte): Boolean;
     function BeginDataFrame(const H: TWSFrameHeader): Boolean;
     function DataChunk(P: PByte; ALen: NativeInt): Boolean;
-    function DataChunkMasked(P: PByte; ALen: NativeInt): Boolean;
-    function FinishMessage(ADirect: PByte = nil; ADirectLen: NativeInt = 0): Boolean;
+    function AssembleMaskedChunk(P: PByte; ALen: NativeInt): Boolean;
+    function FinishMessage: Boolean;
+    function FinishInPlace(P: PByte; ALen: NativeInt): Boolean;
+    function DeliverMessage(P: PByte; ALen: NativeInt): Boolean;
   public
     constructor Create(ARole: TWSRole; const ADeflate: TWSDeflateParams;
       AMaxMessage: NativeInt = 16 * 1024 * 1024);
@@ -279,11 +282,12 @@ begin
 end;
 
 // Claims ALen bytes at the tail of the out queue and returns where they
-// start; the caller fills them.
+// start; the caller fills them. Nothing to claim: nil, queue untouched.
 function TWSProtocol.OutReserve(ALen: NativeInt): PByte;
 var
   Need: NativeInt;
 begin
+  if ALen <= 0 then Exit(nil);
   // Compact first if the dead prefix dominates the buffer.
   if (FOutOff > 0) and (FOutOff * 2 > FOutLen) then
   begin
@@ -465,7 +469,26 @@ begin
   end;
 end;
 
-function TWSProtocol.FinishMessage(ADirect: PByte; ADirectLen: NativeInt): Boolean;
+// The one place a complete message leaves the machine.
+function TWSProtocol.DeliverMessage(P: PByte; ALen: NativeInt): Boolean;
+begin
+  Result := True;
+  FInMessage := False;
+  FMsgLen := 0;
+  if Assigned(FOnMessage) then FOnMessage(FMsgText, P, ALen);
+end;
+
+// An uncompressed message whose whole payload is one final frame sitting
+// in the Ingest buffer (already unmasked and UTF-8 checked chunk-wise):
+// deliver it from there.
+function TWSProtocol.FinishInPlace(P: PByte; ALen: NativeInt): Boolean;
+begin
+  if FMsgText and (FUtf8 <> UTF8_ACCEPT) then
+    Exit(Fail(1007, 'truncated UTF-8 at message end'));
+  Result := DeliverMessage(P, ALen);
+end;
+
+function TWSProtocol.FinishMessage: Boolean;
 var
   P: PByte;
   N, Prev: NativeInt;
@@ -496,20 +519,10 @@ begin
   begin
     if FMsgText and (FUtf8 <> UTF8_ACCEPT) then
       Exit(Fail(1007, 'truncated UTF-8 at message end'));
-    if ADirect <> nil then
-    begin
-      P := ADirect;
-      N := ADirectLen;
-    end
-    else
-    begin
-      N := FMsgLen;
-      if N > 0 then P := @FMsg[0] else P := nil;
-    end;
+    N := FMsgLen;
+    if N > 0 then P := @FMsg[0] else P := nil;
   end;
-  FInMessage := False;
-  FMsgLen := 0;
-  if Assigned(FOnMessage) then FOnMessage(FMsgText, P, N);
+  Result := DeliverMessage(P, N);
 end;
 
 function TWSProtocol.BeginDataFrame(const H: TWSFrameHeader): Boolean;
@@ -578,15 +591,16 @@ begin
   end;
 end;
 
-// DataChunk for a masked, uncompressed payload chunk: unmask straight
+// Assembly of a masked, uncompressed payload chunk: unmask straight
 // into the assembly buffer (one pass instead of unmask-then-copy), then
 // validate UTF-8 over the unmasked bytes.
-function TWSProtocol.DataChunkMasked(P: PByte; ALen: NativeInt): Boolean;
+function TWSProtocol.AssembleMaskedChunk(P: PByte; ALen: NativeInt): Boolean;
 var
   Need: NativeInt;
   Dst: PByte;
 begin
   Result := True;
+  if ALen = 0 then Exit;
   Need := FMsgLen + ALen;
   if Need > Length(FMsg) then
     SetLength(FMsg, Need + Need shr 1 + 64);
@@ -624,8 +638,10 @@ begin
 
   if FCarryLen > 0 then
   begin
-    // Splice: partial header / control frame + new bytes. Data payloads
-    // never sit in the carry, so this stays small (header + 125 max).
+    // Splice: the leftover (at most a partial header or a split control
+    // frame, header + 125) plus the whole new read, so the carry can be
+    // as large as one read — and a data frame completed inside it is
+    // delivered from here in place.
     if FCarryLen + ALen > Length(FCarry) then
       SetLength(FCarry, FCarryLen + ALen);
     MovePayload(P, @FCarry[FCarryLen], ALen);
@@ -644,9 +660,9 @@ begin
   Off := 0;
   while True do
   begin
-    // A data frame mid-payload: stream chunks straight through, unmasking
-    // in place with the mask phase carried across Ingest calls. No copy
-    // into carry, no header reparse.
+    // A data frame mid-payload: stream chunks straight through with the
+    // mask phase carried across Ingest calls — no copy into the carry, no
+    // header reparse.
     if FStreamRemaining > 0 then
     begin
       Take := WLen - Off;
@@ -665,12 +681,12 @@ begin
         if FMsgText and (not Utf8Advance(FUtf8, Work + Off, Take)) then
           Exit(Fail(1007, 'invalid UTF-8'));
         Inc(Off, Take);
-        if not FinishMessage(Work + Off - Take, Take) then Exit(False);
+        if not FinishInPlace(Work + Off - Take, Take) then Exit(False);
         Continue;
       end;
       if FStreamMasked and (not FMsgCompressed) then
       begin
-        if not DataChunkMasked(Work + Off, Take) then Exit(False);
+        if not AssembleMaskedChunk(Work + Off, Take) then Exit(False);
       end
       else
       begin

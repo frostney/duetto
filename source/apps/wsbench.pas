@@ -14,31 +14,42 @@ program wsbench;
 //                  parsing, validating and unmasking on both sides.
 //                  This is the network-free ceiling of the library.
 //
-// Methodology: warm-up pass, then a timed loop of well over the clock's
-// resolution per subject (the masking loops repeat until MaskSecs has
-// passed); medians not needed at these durations (variance < 2%
-// observed). Numbers are only meaningful from a release build
+// Methodology: each subject runs for tens of milliseconds or more on a
+// microsecond clock (the masking loops repeat until MaskSecs has passed);
+// single runs, no medians — run it more than once on a quiet machine and
+// compare. Numbers are only meaningful from a release build
 // (`lwpt build --mode release`): a dev build keeps range and overflow
 // checks on, and the banner says which one is running.
 
 {$I Shared.inc}
 
 uses
+  {$ifdef LINUX} Linux, {$endif}
   {$ifdef UNIX} BaseUnix, Unix, {$endif}
   {$ifdef WINDOWS} Windows, {$endif}
   SysUtils, WS.Frame, WS.Utf8, WS.Handshake, WS.Deflate, WS.Protocol;
 
 const
   MaskSecs = 0.5;
+  BenchMaskKey = $12345678;
 
 var
   T0: Int64;
 
 // Microseconds. SysUtils.Now ticks in whole milliseconds, which turned a
-// ~10 ms masking pass into a reading quantised to 100 / 90.9 / 83.3 GB/s;
-// these clocks resolve to a microsecond or better.
+// 10-19 ms masking pass into a reading quantised to whole-millisecond
+// steps (100 / 90.9 / 55.6 GB/s); these clocks resolve to a microsecond
+// or better. Monotonic on Linux and Windows; macOS falls back to
+// gettimeofday.
 function Now64: Int64;
-{$ifdef UNIX}
+{$if defined(LINUX)}
+var
+  Ts: TTimeSpec;
+begin
+  clock_gettime(CLOCK_MONOTONIC, @Ts);
+  Result := Int64(Ts.tv_sec) * 1000000 + Ts.tv_nsec div 1000;
+end;
+{$elseif defined(UNIX)}
 var
   Tv: TTimeVal;
 begin
@@ -68,7 +79,7 @@ begin
   T := Now64;
   Deadline := T + Round(MaskSecs * 1e6);
   repeat
-    AProc(ABuf, ASize, $12345678);
+    AProc(ABuf, ASize, BenchMaskKey);
     Inc(Reps);
   until Now64 >= Deadline;
   Result := ASize / (1024.0 * 1024 * 1024) * Reps / ((Now64 - T) / 1e6);
@@ -87,7 +98,7 @@ begin
   WriteLn(Format('-- masking (%d MiB, repeated for %.1f s each) --',
     [SIZE div (1024 * 1024), MaskSecs]));
 
-  UnmaskNaive(PByte(Buf), SIZE, $12345678); // warm
+  UnmaskNaive(PByte(Buf), SIZE, BenchMaskKey); // warm
   WriteLn(Format('naive   : %8.2f GB/s', [TimeMask(UnmaskNaive, PByte(Buf), SIZE)]));
   WriteLn(Format('uint64  : %8.2f GB/s', [TimeMask(UnmaskU64, PByte(Buf), SIZE)]));
   // UnmaskSSE2 only exists where WS.Frame compiles it (x86_64 Linux).
@@ -118,12 +129,12 @@ end;
 procedure CopyThenMask(ASrc, ADst: PByte; ALen: PtrUInt);
 begin
   MovePayload(ASrc, ADst, ALen);
-  ApplyMask(ADst, ALen, $12345678, 0);
+  ApplyMask(ADst, ALen, BenchMaskKey, 0);
 end;
 
 procedure MaskCopyProc(ASrc, ADst: PByte; ALen: PtrUInt);
 begin
-  ApplyMaskCopy(ASrc, ADst, ALen, $12345678, 0);
+  ApplyMaskCopy(ASrc, ADst, ALen, BenchMaskKey, 0);
 end;
 
 // Repeats AProc over ASize bytes until MaskSecs has passed; GB/s.

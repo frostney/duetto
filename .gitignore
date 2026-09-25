@@ -37,3 +37,8 @@ Thumbs.db
 # Autobahn reports from the native macOS merge job (and local runs of
 # its recipe) — generated, like tests/autobahn/reports/.
 reports-macos/
+
+# tools/rust-echo cargo output (tools/benchmatrix.sh's default RUST_ECHO
+# path builds here).
+tools/rust-echo/target/
+tools/rust-echo/Cargo.lock

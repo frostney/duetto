@@ -434,7 +434,7 @@ const
   Guard = $5A;
 var
   Src, Orig, Want, Dst: array[0..149] of Byte;
-  Len, Off, I, Mismatch: Integer;
+  Len, Off, SrcAt, I, Mismatch: Integer;
   Key, RotKey: UInt32;
 
   procedure Check;
@@ -455,28 +455,31 @@ begin
   Mismatch := 0;
   for I := 0 to High(Src) do Src[I] := Byte(Random(256));
   Move(Src, Orig, SizeOf(Src));
-  for Len := 0 to 130 do
-    for Off := 0 to 3 do
-    begin
-      if Off = 0 then
-        RotKey := Key
-      else
-        RotKey := (Key shr (Off * 8)) or (Key shl (32 - Off * 8));
-      Move(Src, Want, SizeOf(Src));
-      ApplyMask(@Want[0], Len, Key, Off);
+  // Source alignments 0..3 x destination at +4: the two pointers are
+  // misaligned relative to each other in every combination.
+  for SrcAt := 0 to 3 do
+    for Len := 0 to 130 do
+      for Off := 0 to 3 do
+      begin
+        if Off = 0 then
+          RotKey := Key
+        else
+          RotKey := (Key shr (Off * 8)) or (Key shl (32 - Off * 8));
+        Move(Src[SrcAt], Want, Len);
+        ApplyMask(@Want[0], Len, Key, Off);
 
-      FillChar(Dst, SizeOf(Dst), Guard);
-      ApplyMaskCopy(@Src[0], @Dst[4], Len, Key, Off);
-      Check;
-      FillChar(Dst, SizeOf(Dst), Guard);
-      UnmaskCopyU64(@Src[0], @Dst[4], Len, RotKey);
-      Check;
+        FillChar(Dst, SizeOf(Dst), Guard);
+        ApplyMaskCopy(@Src[SrcAt], @Dst[4], Len, Key, Off);
+        Check;
+        FillChar(Dst, SizeOf(Dst), Guard);
+        UnmaskCopyU64(@Src[SrcAt], @Dst[4], Len, RotKey);
+        Check;
 {$if defined(CPUX86_64) and defined(LINUX)}
-      FillChar(Dst, SizeOf(Dst), Guard);
-      UnmaskCopySSE2(@Src[0], @Dst[4], Len, RotKey);
-      Check;
+        FillChar(Dst, SizeOf(Dst), Guard);
+        UnmaskCopySSE2(@Src[SrcAt], @Dst[4], Len, RotKey);
+        Check;
 {$endif}
-    end;
+      end;
   Expect<Integer>(Mismatch).ToBe(0);
 end;
 
@@ -489,7 +492,8 @@ begin
   Test('RFC mask key vector',                     TestRFCMaskVector);
   Test('zero length is safe in every impl',       TestZeroLengthIsSafe);
   Test('MovePayload copies exactly len 0..260',   TestMovePayload);
-  Test('mask-copy = copy + mask, len 0..130 x off 0..3', TestMaskCopyAgrees);
+  Test('mask-copy = copy + mask, len 0..130 x off 0..3 x src align 0..3',
+                                                  TestMaskCopyAgrees);
 end;
 
 begin
