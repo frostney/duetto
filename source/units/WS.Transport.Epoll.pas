@@ -6,9 +6,12 @@ unit WS.Transport.Epoll;
 // level-triggered readiness, EPOLLOUT armed only while a connection has
 // backlog. Readiness adapts to the completion contract per ADR-0001:
 // SubmitSend writes what the socket takes and arms EPOLLOUT for the
-// remainder; EPOLLIN drains into ONE shared 256 KB buffer delivered via
+// remainder; EPOLLIN reads into ONE shared 256 KB buffer delivered via
 // OnData, so by the next readiness event the buffer is free again. Zero
-// steady-state allocation on the hot echo path.
+// steady-state allocation on the hot echo path. A readiness event reads
+// until a short read (the queue is drained) or MaxFullReadsPerEvent full
+// ones, never to EAGAIN: that last recv is a wasted syscall per message,
+// and a peer that keeps its queue full would hold the loop forever.
 //
 // Server TLS (duetto#22) rides WS.Transport.TlsServer, which wraps
 // lwpt's memory-BIO accept API. The reactor stays a byte mover: it owns
@@ -160,6 +163,12 @@ const
   // epoll_wait that would otherwise park, and only while at least one
   // connection carries a deadline — a plaintext listener never sees it.
   TlsDeadlinePollMs = 100;
+  // Full-length reads one readiness event may take before the reactor
+  // moves on to the rest of the batch (4 x 256 KB plaintext, 4 x the
+  // encrypted-input watermark under TLS). Level-triggered EPOLLIN
+  // re-reports whatever is left on the next epoll_wait, so this bounds
+  // how long one peer holds the loop without dropping any of its bytes.
+  MaxFullReadsPerEvent = 4;
   ShutdownWrite = 1; // shutdown(): SHUT_WR
 
 // The RTL's Linux unit predates eventfd on some targets; bind libc
@@ -866,10 +875,11 @@ end;
 
 procedure TWSEpollTransport.HandleReadable(AConn: TWSEpollConn);
 var
-  Fd, Got: Integer;
+  Fd, Got, FullReads: Integer;
   Gen: NativeUInt;
 begin
   Fd := AConn.FFd;
+  FullReads := 0;
   // Identity for the mid-dispatch re-check below is the generation, not
   // the pointer: AConn may be freed memory by the time we look, so the
   // Id is captured here, while it is still ours to read.
@@ -892,6 +902,14 @@ begin
     // generation compare cannot.
     if (Fd >= Length(FConns)) or (FConns[Fd] = nil) or
       (FConns[Fd].Id <> Gen) then Exit;
+    // A short read drained the receive queue: the next recv would only
+    // report EAGAIN, and anything landing meanwhile is re-reported by
+    // level-triggered EPOLLIN. A full buffer may have more behind it, but
+    // only up to MaxFullReadsPerEvent, so one flooding peer cannot starve
+    // the rest of the batch.
+    if Got < Length(FRecv) then Exit;
+    Inc(FullReads);
+    if FullReads >= MaxFullReadsPerEvent then Exit;
   until False;
 end;
 
@@ -902,12 +920,13 @@ end;
 // the moment lwpt reports encrypted-input backpressure.
 procedure TWSEpollTransport.HandleReadableTls(AConn: TWSEpollConn);
 var
-  Fd, Got: Integer;
+  Fd, Got, FullReads: Integer;
   Gen: NativeUInt;
   Res: TWSTlsIngestResult;
 begin
   Fd := AConn.FFd;
   Gen := AConn.Id;
+  FullReads := 0;
   repeat
     if AConn.FPaused then Exit;
     Got := fpRecv(Fd, @FRecv[0], FTlsReadLen, 0);
@@ -932,6 +951,11 @@ begin
       RemoteClosed(AConn);
       Exit;
     end;
+    // Same bound as HandleReadable: backpressure alone does not stop a
+    // peer whose ciphertext the session keeps up with.
+    if Got < FTlsReadLen then Exit;
+    Inc(FullReads);
+    if FullReads >= MaxFullReadsPerEvent then Exit;
   until False;
 end;
 
