@@ -161,7 +161,8 @@ type
   TCatchingServerThread = class(TThread)
   public
     Srv: TWSServer;
-    Raised: LongInt;
+    Raised: LongInt;     // the section's own raises
+    Unexpected: LongInt; // anything else out of Run: must stay 0
     procedure Execute; override;
   end;
 
@@ -410,29 +411,35 @@ var
   Others: TFPList;
   I: Integer;
 begin
-  InterLockedIncrement(Closes);
-  Others := TFPList.Create;
+  // Counted when the handler has finished (the finally also runs after the
+  // intentional raise): the section waits on Closes before it flips the
+  // flags below, and a handler still running would read the new values.
   try
-    FLock.Acquire;
+    Others := TFPList.Create;
     try
-      FOpen.Remove(AConn);
-      Others.Assign(FOpen);
+      FLock.Acquire;
+      try
+        FOpen.Remove(AConn);
+        Others.Assign(FOpen);
+      finally
+        FLock.Release;
+      end;
+      if not BroadcastOnClose then Others.Clear;
+      for I := 0 to Others.Count - 1 do
+        if TWSConnection(Others[I]).SendText(@Farewell[1], Length(Farewell)) then
+          InterLockedIncrement(SendsAccepted);
     finally
-      FLock.Release;
+      Others.Free;
     end;
-    if not BroadcastOnClose then Others.Clear;
-    for I := 0 to Others.Count - 1 do
-      if TWSConnection(Others[I]).SendText(@Farewell[1], Length(Farewell)) then
-        InterLockedIncrement(SendsAccepted);
+    if BroadcastOnClose then
+      InterLockedIncrement(Broadcasts); // the loop above ran to the end
+    if AConn.SendText(@Farewell[1], Length(Farewell)) then
+      InterLockedIncrement(SendsAccepted);
+    if RaiseOnClose then
+      raise Exception.Create(CloseRaiseText);
   finally
-    Others.Free;
+    InterLockedIncrement(Closes);
   end;
-  if BroadcastOnClose then
-    InterLockedIncrement(Broadcasts); // the loop above ran to the end
-  if AConn.SendText(@Farewell[1], Length(Farewell)) then
-    InterLockedIncrement(SendsAccepted);
-  if RaiseOnClose then
-    raise Exception.Create(CloseRaiseText);
 end;
 
 procedure TCatchingServerThread.Execute;
@@ -442,14 +449,17 @@ begin
       Srv.Run(50);
     except
       on E: Exception do
-      begin
-        InterLockedIncrement(Raised);
         // Only the section's own raise is expected; anything else is a
-        // real fault and must not pass silently.
-        if E.Message <> CloseRaiseText then
+        // real fault, counted apart so a later expected raise cannot mask
+        // it.
+        if E.Message = CloseRaiseText then
+          InterLockedIncrement(Raised)
+        else
+        begin
+          InterLockedIncrement(Unexpected);
           WriteLn('       unexpected server exception: ', E.ClassName,
             ': ', E.Message);
-      end;
+        end;
     end;
 end;
 
@@ -1789,11 +1799,12 @@ begin
   SrvT.Srv.Free;
   Check((Host.Opens = CloseSectionOpens) and (Host.Closes = Host.Opens) and
     (Host.SendsAccepted = 0) and (Host.Broadcasts = CloseSectionBroadcasts) and
-    (SrvT.Raised = CloseSectionRaised),
+    (SrvT.Raised = CloseSectionRaised) and (SrvT.Unexpected = 0),
     Format('Destroy pairs every OnOpen with one OnClientClose; sends to any ' +
     'connection report the drop (opens %d, closes %d, sends taken %d, ' +
-    'broadcasts finished %d, raised out of Run %d)',
-    [Host.Opens, Host.Closes, Host.SendsAccepted, Host.Broadcasts, SrvT.Raised]));
+    'broadcasts finished %d, raised out of Run %d, unexpected %d)',
+    [Host.Opens, Host.Closes, Host.SendsAccepted, Host.Broadcasts, SrvT.Raised,
+    SrvT.Unexpected]));
   SrvT.Free;
   for I := 0 to High(Cli) do Cli[I].Free;
   Host.Free;
