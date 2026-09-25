@@ -85,6 +85,7 @@ type
     FOnClose: TWSCloseEvent;
 
     function NextMaskKey: UInt32;
+    function OutReserve(ALen: NativeInt): PByte;
     procedure OutAppend(P: PByte; ALen: NativeInt);
     procedure SendFrame(AOpcode: Byte; ARsv1: Boolean; P: PByte; ALen: NativeInt);
     procedure SendDataMessage(AOpcode: Byte; P: PByte; ALen: NativeInt);
@@ -93,6 +94,7 @@ type
     function HandleControl(const H: TWSFrameHeader; P: PByte): Boolean;
     function BeginDataFrame(const H: TWSFrameHeader): Boolean;
     function DataChunk(P: PByte; ALen: NativeInt): Boolean;
+    function DataChunkMasked(P: PByte; ALen: NativeInt): Boolean;
     function FinishMessage(ADirect: PByte = nil; ADirectLen: NativeInt = 0): Boolean;
   public
     constructor Create(ARole: TWSRole; const ADeflate: TWSDeflateParams;
@@ -242,11 +244,12 @@ begin
   OutAppend(P, ALen);
 end;
 
-procedure TWSProtocol.OutAppend(P: PByte; ALen: NativeInt);
+// Claims ALen bytes at the tail of the out queue and returns where they
+// start; the caller fills them.
+function TWSProtocol.OutReserve(ALen: NativeInt): PByte;
 var
   Need: NativeInt;
 begin
-  if ALen <= 0 then Exit;
   // Compact first if the dead prefix dominates the buffer.
   if (FOutOff > 0) and (FOutOff * 2 > FOutLen) then
   begin
@@ -257,8 +260,14 @@ begin
   Need := FOutLen + ALen;
   if Need > Length(FOut) then
     SetLength(FOut, Need + Need shr 1 + 256);
-  MovePayload(P, @FOut[FOutLen], ALen);
-  Inc(FOutLen, ALen);
+  Result := @FOut[FOutLen];
+  FOutLen := Need;
+end;
+
+procedure TWSProtocol.OutAppend(P: PByte; ALen: NativeInt);
+begin
+  if ALen <= 0 then Exit;
+  MovePayload(P, OutReserve(ALen), ALen);
 end;
 
 procedure TWSProtocol.SendFrame(AOpcode: Byte; ARsv1: Boolean;
@@ -267,17 +276,15 @@ var
   Hdr: array[0..WS_MAX_HEADER - 1] of Byte;
   HLen: Integer;
   Key: UInt32;
-  PayloadAt: NativeInt;
 begin
   if FRole = wsrClient then
   begin
     Key := NextMaskKey;
     HLen := WriteFrameHeader(@Hdr[0], True, ARsv1, AOpcode, True, Key, ALen);
     OutAppend(@Hdr[0], HLen);
-    PayloadAt := FOutLen;
-    OutAppend(P, ALen);
-    // Mask the copy that now lives in our out buffer — never the caller's.
-    ApplyMask(@FOut[PayloadAt], ALen, Key, 0);
+    // Mask while copying into our out buffer — never the caller's.
+    if ALen > 0 then
+      ApplyMaskCopy(P, OutReserve(ALen), ALen, Key, 0);
   end
   else
   begin
@@ -537,6 +544,26 @@ begin
   end;
 end;
 
+// DataChunk for a masked, uncompressed payload chunk: unmask straight
+// into the assembly buffer (one pass instead of unmask-then-copy), then
+// validate UTF-8 over the unmasked bytes.
+function TWSProtocol.DataChunkMasked(P: PByte; ALen: NativeInt): Boolean;
+var
+  Need: NativeInt;
+  Dst: PByte;
+begin
+  Result := True;
+  Need := FMsgLen + ALen;
+  if Need > Length(FMsg) then
+    SetLength(FMsg, Need + Need shr 1 + 64);
+  Dst := @FMsg[FMsgLen];
+  ApplyMaskCopy(P, Dst, ALen, FStreamKey, FStreamOff);
+  if FMsgText then
+    if not Utf8Advance(FUtf8, Dst, ALen) then
+      Exit(Fail(1007, 'invalid UTF-8'));
+  FMsgLen := Need;
+end;
+
 function TWSProtocol.Ingest(P: PByte; ALen: NativeInt): Boolean;
 var
   Work: PByte;
@@ -592,15 +619,14 @@ begin
       if Take <= 0 then Break;
       if UInt64(Take) > FStreamRemaining then
         Take := NativeInt(FStreamRemaining);
-      if FStreamMasked then
-        ApplyMask(Work + Off, Take, FStreamKey, FStreamOff);
-      Inc(FStreamOff, Take);
       // Whole final frame of an uncompressed message with nothing
-      // assembled before it: validate and deliver from the buffer it
-      // already sits in instead of copying it into FMsg.
+      // assembled before it: unmask in place, validate and deliver from
+      // the buffer it already sits in instead of copying it into FMsg.
       if FStreamFin and (not FMsgCompressed) and (FMsgLen = 0) and
          (UInt64(Take) = FStreamRemaining) then
       begin
+        if FStreamMasked then
+          ApplyMask(Work + Off, Take, FStreamKey, FStreamOff);
         FStreamRemaining := 0;
         if FMsgText and (not Utf8Advance(FUtf8, Work + Off, Take)) then
           Exit(Fail(1007, 'invalid UTF-8'));
@@ -608,8 +634,19 @@ begin
         if not FinishMessage(Work + Off - Take, Take) then Exit(False);
         Continue;
       end;
+      if FStreamMasked and (not FMsgCompressed) then
+      begin
+        if not DataChunkMasked(Work + Off, Take) then Exit(False);
+      end
+      else
+      begin
+        // The inflater reads the chunk where it lies: unmask in place.
+        if FStreamMasked then
+          ApplyMask(Work + Off, Take, FStreamKey, FStreamOff);
+        if not DataChunk(Work + Off, Take) then Exit(False);
+      end;
+      Inc(FStreamOff, Take);
       Dec(FStreamRemaining, Take);
-      if not DataChunk(Work + Off, Take) then Exit(False);
       Inc(Off, Take);
       if (FStreamRemaining = 0) and FStreamFin then
         if not FinishMessage then Exit(False);

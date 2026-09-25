@@ -3,7 +3,8 @@ program wsbench;
 // Component benchmarks for every duetto layer, bottom-up:
 //
 //   masking      — naive byte loop vs UInt64 XOR vs SSE2 (GB/s)
-//   payload copy — RTL Move vs MovePayload at 1 KiB / 16 KiB / 256 KiB
+//   payload copy — RTL Move vs MovePayload at 1 KiB / 16 KiB / 256 KiB,
+//                  and copy-then-unmask vs the fused ApplyMaskCopy
 //   frame parse  — ParseFrameHeader over a packed stream (frames/s)
 //   utf-8        — fast-path Utf8Advance vs pure-DFA, ASCII + multibyte
 //   handshake    — ServerParseRequest + ServerBuildResponse (ops/s)
@@ -113,6 +114,18 @@ begin
   MovePayload(ASrc, ADst, ALen);
 end;
 
+// The two ways to land a masked chunk in the assembly buffer.
+procedure CopyThenMask(ASrc, ADst: PByte; ALen: PtrUInt);
+begin
+  MovePayload(ASrc, ADst, ALen);
+  ApplyMask(ADst, ALen, $12345678, 0);
+end;
+
+procedure MaskCopyProc(ASrc, ADst: PByte; ALen: PtrUInt);
+begin
+  ApplyMaskCopy(ASrc, ADst, ALen, $12345678, 0);
+end;
+
 // Repeats AProc over ASize bytes until MaskSecs has passed; GB/s.
 function TimeCopy(AProc: TCopyProc; ASrc, ADst: PByte; ASize: PtrUInt): Double;
 var
@@ -144,6 +157,10 @@ begin
     WriteLn(Format('%7d B : RTL Move %6.1f GB/s   MovePayload %6.1f GB/s',
       [Sizes[I], TimeCopy(RtlMove, PByte(Src), PByte(Dst), Sizes[I]),
        TimeCopy(MovePayloadProc, PByte(Src), PByte(Dst), Sizes[I])]));
+  for I := 0 to High(Sizes) do
+    WriteLn(Format('%7d B : copy+unmask %6.1f GB/s   ApplyMaskCopy %6.1f GB/s',
+      [Sizes[I], TimeCopy(CopyThenMask, PByte(Src), PByte(Dst), Sizes[I]),
+       TimeCopy(MaskCopyProc, PByte(Src), PByte(Dst), Sizes[I])]));
 end;
 
 procedure BenchFrameParse;
