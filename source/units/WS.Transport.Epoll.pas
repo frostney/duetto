@@ -11,11 +11,14 @@ unit WS.Transport.Epoll;
 // remainder; EPOLLIN reads into ONE shared 256 KB buffer delivered via
 // OnData, so by the next readiness event the buffer is free again. Zero
 // steady-state allocation on the hot echo path. A readiness event reads
-// until a short read (nothing more was readable at that instant) or
-// MaxFullReadsPerEvent full ones, never to EAGAIN: that last recv is a
-// wasted syscall per message, and a peer that keeps its queue full would
-// hold the loop forever. Readiness is level-triggered, so whatever is
-// left is re-reported on the next epoll_wait.
+// until a short read or MaxFullReadsPerEvent full ones, never to EAGAIN
+// (see ReadBudgetSpent): that last recv is a wasted syscall per message,
+// and a peer that keeps its queue full would hold the loop forever.
+// Readiness is level-triggered, so whatever is left is re-reported on the
+// next epoll_wait. The cost: with server and peers sharing one core, the
+// old loop stayed on one hot connection while the co-scheduled peer
+// refilled it; this one walks the batch, which is slower for large
+// payloads in that shape only (see docs/comparison.md).
 //
 // Server TLS (duetto#22) rides WS.Transport.TlsServer, which wraps
 // lwpt's memory-BIO accept API. The reactor stays a byte mover: it owns
@@ -189,6 +192,20 @@ function C_eventfd(ACount: Cardinal; AFlags: Integer): Integer; cdecl;
 // transport binds its own for the same reason.
 function C_shutdown(AFd: Integer; AHow: Integer): Integer; cdecl;
   external name 'shutdown';
+
+// The per-event read bound shared by both read loops. A short read means
+// nothing more was readable when it ran: the next recv would almost
+// always report EAGAIN, and anything that arrives later (the peer running
+// meanwhile, or packets queued while the socket was locked) is
+// re-reported by level-triggered EPOLLIN. A full read may have more
+// behind it, but only up to MaxFullReadsPerEvent, so one flooding peer
+// cannot starve the rest of the batch.
+function ReadBudgetSpent(AGot, AReadLen: Integer; var AFullReads: Integer): Boolean; inline;
+begin
+  if AGot < AReadLen then Exit(True);
+  Inc(AFullReads);
+  Result := AFullReads >= MaxFullReadsPerEvent;
+end;
 
 procedure SetNonBlocking(AFd: Integer);
 var
@@ -912,7 +929,7 @@ begin
       RemoteClosed(AConn);
       Exit;
     end;
-    if Got < 0 then Exit; // EAGAIN
+    if Got < 0 then Exit; // EAGAIN; an error surfaces as EPOLLERR next round
     if Assigned(OnData) then OnData(AConn, @FRecv[0], Got);
     // Invariant: the fd is still ours only while the table occupant is
     // the same CONNECTION GENERATION we entered with. The session may
@@ -923,15 +940,7 @@ begin
     // generation compare cannot.
     if (Fd >= Length(FConns)) or (FConns[Fd] = nil) or
       (FConns[Fd].Id <> Gen) then Exit;
-    // A short read means nothing more was readable at that instant: the
-    // next recv would almost always report EAGAIN, and anything that is
-    // or becomes readable is re-reported by level-triggered EPOLLIN. A
-    // full buffer may have more behind it, but only up to
-    // MaxFullReadsPerEvent, so one flooding peer cannot starve the rest
-    // of the batch.
-    if Got < Length(FRecv) then Exit;
-    Inc(FullReads);
-    if FullReads >= MaxFullReadsPerEvent then Exit;
+    if ReadBudgetSpent(Got, Length(FRecv), FullReads) then Exit;
   until False;
 end;
 
@@ -957,7 +966,7 @@ begin
       RemoteClosed(AConn);
       Exit;
     end;
-    if Got < 0 then Exit; // EAGAIN
+    if Got < 0 then Exit; // EAGAIN; an error surfaces as EPOLLERR next round
     Res := AConn.TlsIngest(@FRecv[0], Got);
     if AConn.FFreeDeferred then
     begin
@@ -975,9 +984,7 @@ begin
     end;
     // Same bound as HandleReadable: backpressure alone does not stop a
     // peer whose ciphertext the session keeps up with.
-    if Got < FTlsReadLen then Exit;
-    Inc(FullReads);
-    if FullReads >= MaxFullReadsPerEvent then Exit;
+    if ReadBudgetSpent(Got, FTlsReadLen, FullReads) then Exit;
   until False;
 end;
 
