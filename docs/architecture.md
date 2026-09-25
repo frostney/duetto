@@ -63,7 +63,10 @@ Four nets, from innermost to outermost:
    ping → 1002, invalid UTF-8 → 1007), an upgrade-hook section (a server
    bound to `127.0.0.1` explicitly whose `OnUpgradeRequest` refuses one
    `Origin` with a 403 — no `OnOpen`, no `OnClientClose` — and treats a
-   raising hook the same way), and — on Linux — a `wss://` section
+   raising hook the same way), a close-handler section (peers that
+   reset while an `OnClientClose` handler sends into them: the handler
+   runs once per connection and the server keeps serving), and — on
+   Linux — a `wss://` section
    against a TLS listener built from a runtime-generated identity
    (handshake, echo, flow-control windows, `close_notify`, handshake
    deadline, inbound pre-handshake budget).

@@ -806,6 +806,11 @@ begin
   Conn := TWSConnection(ATConn.UserData);
   if Conn = nil then Exit;
   ATConn.UserData := nil;
+  // Teardown is already running: an OnClientClose handler that sends
+  // into the dead connection reaches DropConn through the failed flush,
+  // and must find it dropping — a second ReleaseConn would fire
+  // OnClientClose again and free Conn (and SubmitClose ATConn) twice.
+  Conn.FDropping := True;
   ReleaseConn(Conn);
   // The transport frees ATConn after this callback returns.
 end;

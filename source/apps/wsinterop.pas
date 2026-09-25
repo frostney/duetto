@@ -107,6 +107,21 @@ type
     procedure Snapshot(out AHits, AOpens, ACloses: Integer);
   end;
 
+  // OnClientClose host that tries to talk to the connection it is being
+  // told has gone (a farewell message, say). Every send may only report
+  // the drop; the handler must run exactly once per connection and the
+  // server must survive it.
+  TCloseSender = class
+  private
+    FLock: TCriticalSection;
+    FCloses: Integer;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure HandleClose(AConn: TWSConnection);
+    function Closes: Integer;
+  end;
+
   TServerThread = class(TThread)
   public
     Srv: TWSServer;
@@ -249,6 +264,45 @@ begin
   try
     AHits := FHits;
     ALastRaw := FLastRaw;
+  finally
+    FLock.Release;
+  end;
+end;
+
+constructor TCloseSender.Create;
+begin
+  inherited Create;
+  FLock := TCriticalSection.Create;
+end;
+
+destructor TCloseSender.Destroy;
+begin
+  FLock.Free;
+  inherited;
+end;
+
+procedure TCloseSender.HandleClose(AConn: TWSConnection);
+var
+  Farewell: RawByteString;
+  I: Integer;
+begin
+  FLock.Acquire;
+  try
+    Inc(FCloses);
+  finally
+    FLock.Release;
+  end;
+  Farewell := StringOfChar('x', 4096);
+  // False = dropped: the reference is dead, stop touching it.
+  for I := 1 to 4 do
+    if not AConn.SendText(@Farewell[1], Length(Farewell)) then Exit;
+end;
+
+function TCloseSender.Closes: Integer;
+begin
+  FLock.Acquire;
+  try
+    Result := FCloses;
   finally
     FLock.Release;
   end;
@@ -472,6 +526,28 @@ begin
   if AMasked then
     ApplyMask(PByte(Body), Length(Body), Key, 0);
   Move(Body[0], Result[HLen + 1], Length(Body));
+end;
+
+// Read (and discard) one complete frame after ALeftover; False on EOF or
+// timeout. Used where a round trip only has to prove the peer is live.
+function RawReadEchoOnce(AFd: Tsocket; const ALeftover: TBytes): Boolean;
+var
+  Buf: TBytes;
+  Len, Got: NativeInt;
+  H: TWSFrameHeader;
+begin
+  Buf := Copy(ALeftover);
+  Len := Length(Buf);
+  repeat
+    if (ParseFrameHeader(PByte(Buf), Len, H) = wprOK) and
+       (Len - H.HeaderLen >= NativeInt(H.PayloadLen)) then
+      Exit(True);
+    SetLength(Buf, Len + 4096);
+    Got := fpRecv(AFd, @Buf[Len], 4096, 0);
+    if Got <= 0 then Exit(False);
+    Inc(Len, Got);
+    SetLength(Buf, Len);
+  until False;
 end;
 
 // False = the peer is already gone (the send failed or went short). Only
@@ -1444,6 +1520,7 @@ end;
 
 const
   HelloProbe: RawByteString = 'hello duetto';
+  CloseResetCount = 8;
   PipelinedMsgs: array[0..2] of RawByteString = ('one', 'two', 'three');
   LingerProbe: RawByteString = 'linger';
 
@@ -1488,6 +1565,9 @@ var
   // Upgrade-hook section
   Gate: TUpgradeGate;
   HookSrvT: TServerThread;
+  CloseSrvT: TServerThread;
+  CloseSender: TCloseSender;
+  CloseHard: TInteropLinger;
   HookPort: Word;
   HookResp: RawByteString;
   Hits, Opens, Closes: Integer;
@@ -1840,6 +1920,54 @@ begin
   HookSrvT.Srv.Free;
   HookSrvT.Free;
   Gate.Free;
+
+  // --- OnClientClose that sends ------------------------------------------
+  // A peer that resets its connection gets OnClientClose while the
+  // session still thinks the connection is open, and a handler that
+  // sends into it sees the send fail. That failure must not start a
+  // second teardown: the handler runs once, the connection is freed once,
+  // and the server keeps serving.
+  StressPhase := 'close-handler send section';
+  CloseSender := TCloseSender.Create;
+  CloseSrvT := TServerThread.Create(True);
+  CloseSrvT.Srv := TWSServer.Create(0, False, 16 * 1024 * 1024, '127.0.0.1');
+  CloseSrvT.Srv.OnMessage := Echo.OnMsg;
+  CloseSrvT.Srv.OnClientClose := CloseSender.HandleClose;
+  CloseSrvT.Start;
+  CloseHard.OnOff := 1;
+  CloseHard.Seconds := 0;
+  for I := 1 to CloseResetCount do
+  begin
+    Fd := RawConnect(CloseSrvT.Srv.Port);
+    fpSetSockOpt(Fd, SOL_SOCKET, SO_LINGER, @CloseHard, SizeOf(CloseHard));
+    Left := RawHandshake(Fd);
+    // One echo round proves OnOpen ran, so the reset hits an open
+    // connection rather than a handshake.
+    RawSendFrame(Fd, WS_OP_TEXT, 'open', True);
+    RawReadEchoOnce(Fd, Left);
+    CloseSocket(Fd); // SO_LINGER 0: RST
+  end;
+  Deadline := GetTickCount64 + 5000;
+  while (CloseSender.Closes < CloseResetCount) and (GetTickCount64 < Deadline) do
+    Sleep(10);
+  Sleep(100); // a second, re-entrant OnClientClose would land by now
+  Check(CloseSender.Closes = CloseResetCount,
+    Format('%d reset peers: OnClientClose once each despite sending (%d)',
+      [CloseResetCount, CloseSender.Closes]));
+  Cli := TWSClient.Create;
+  Cli.Connect(Format('ws://127.0.0.1:%d/', [CloseSrvT.Srv.Port]));
+  Cli.SendText(HelloProbe);
+  Check(Cli.ReadMessage(IsText, Data) and (Length(Data) = Length(HelloProbe)),
+    'server still echoes after close handlers sent into dead connections');
+  Cli.Close(1000, 'done');
+  Cli.Free;
+  StressPhase := 'close-handler send section: teardown';
+  CloseSrvT.Terminate;
+  CloseSrvT.Srv.Stop;
+  CloseSrvT.WaitFor;
+  CloseSrvT.Srv.Free;
+  CloseSrvT.Free;
+  CloseSender.Free;
 
   // --- server TLS terminated by the transport (duetto#22) -----------------
   // Linux only, and the reason is the CLIENT half of the battery on the
