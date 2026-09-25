@@ -166,9 +166,9 @@ const
   // connection, 4 x the encrypted-input watermark under TLS. Level-
   // triggered EPOLLIN re-reports whatever is left on the next
   // epoll_wait, so this bounds how long one peer holds the loop without
-  // dropping any of its bytes. 4 keeps a bulk transfer at ~1 MB per turn
-  // (few enough epoll_wait round trips that throughput is unchanged)
-  // while capping one peer's turn at a few hundred microseconds of copy.
+  // dropping any of its bytes. 4 lets a bulk sender move ~1 MB per turn,
+  // so epoll_wait round trips stay rare, and caps what any one peer can
+  // take per turn at that same ~1 MB.
   MaxFullReadsPerEvent = 4;
   ShutdownWrite = 1; // shutdown(): SHUT_WR
 
