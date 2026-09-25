@@ -138,8 +138,9 @@ type
 
   // Close-handler lifecycle section: counts OnOpen / OnClientClose,
   // tries a send inside every OnClientClose, and raises from it on
-  // demand. Interlocked fields: handlers run on the server thread, or
-  // on the thread calling Destroy.
+  // demand. Counters are interlocked (handlers run on the server
+  // thread, on the thread calling Destroy, or on Network.framework's
+  // connection queues); the two flags are set only between checks.
   TCloseHost = class
   private
     FLock: TCriticalSection;
@@ -374,6 +375,9 @@ begin
   end;
 end;
 
+const
+  CloseRaiseText = 'OnClientClose raised on purpose';
+
 constructor TCloseHost.Create;
 begin
   inherited Create;
@@ -428,7 +432,7 @@ begin
   if AConn.SendText(@Farewell[1], Length(Farewell)) then
     InterLockedIncrement(SendsAccepted);
   if RaiseOnClose then
-    raise Exception.Create('OnClientClose raised on purpose');
+    raise Exception.Create(CloseRaiseText);
 end;
 
 procedure TCatchingServerThread.Execute;
@@ -437,7 +441,15 @@ begin
     try
       Srv.Run(50);
     except
-      InterLockedIncrement(Raised);
+      on E: Exception do
+      begin
+        InterLockedIncrement(Raised);
+        // Only the section's own raise is expected; anything else is a
+        // real fault and must not pass silently.
+        if E.Message <> CloseRaiseText then
+          WriteLn('       unexpected server exception: ', E.ClassName,
+            ': ', E.Message);
+      end;
     end;
 end;
 
@@ -1365,11 +1377,12 @@ begin
   end;
 end;
 
-// TWSServer.Destroy tears the registry down directly and never fires
-// OnClientClose, so entries the tracker still holds would dangle past
-// the server's free. Nothing reads them afterwards today (the pusher is
-// long joined), but a tracker outliving the server must not be left
-// pointing at freed connections.
+// TWSServer.Destroy fires OnClientClose for connections still open,
+// which takes them out of the tracker — but on Network.framework those
+// arrive from the connection queues during Shutdown. Clearing first as
+// well means a tracker that outlives the server never holds a freed
+// pointer, whatever the transport's shutdown order; HandleClose
+// tolerates the empty table.
 procedure TStressTracker.Clear;
 begin
   FLock.Acquire;
@@ -1681,6 +1694,10 @@ const
   // Two raw connections and one client before the Destroy check (Darwin
   // skips the raw ones), then the three held open.
   CloseSectionOpens = {$ifdef DARWIN} 3 {$else} 6 {$endif};
+  CloseSectionBroadcasts = {$ifdef DARWIN} 0 {$else} 3 {$endif};
+  // Exceptions out of Run: the two raising checks (none on Darwin);
+  // Destroy-time raises are swallowed by Destroy.
+  CloseSectionRaised = {$ifdef DARWIN} 0 {$else} 2 {$endif};
 
 procedure RunCloseHandlerSection(var AStressPhase: ShortString);
 var
@@ -1741,9 +1758,14 @@ begin
   Cli[0].Free;
   {$endif}
 
-  // Destroy with three connections still open, every handler raising and
-  // broadcasting to the others: the others' transport objects are gone,
-  // so every send must report the drop and every broadcast must finish.
+  // Destroy with three connections still open. Every OnOpen must get its
+  // OnClientClose. Off Darwin these run on this thread after Shutdown,
+  // so every handler also raises and broadcasts to the others: their
+  // transport objects are gone, every send must report the drop and
+  // every broadcast must finish. On Network.framework, Shutdown's cancel
+  // delivers them as ordinary remote closes on the connection queues
+  // instead, where a raise would terminate the battery and a broadcast
+  // may still reach a sibling that is not yet closed.
   for I := 0 to High(Cli) do
   begin
     Cli[I] := TWSClient.Create;
@@ -1756,19 +1778,22 @@ begin
   Deadline := GetTickCount64 + 5000;
   while (Host.Closes < Host.Opens - Length(Cli)) and
     (GetTickCount64 < Deadline) do Sleep(10);
+  {$ifndef DARWIN}
   Host.RaiseOnClose := True;
   Host.BroadcastOnClose := True;
+  {$endif}
   AStressPhase := 'close-handler section: destroy';
   SrvT.Terminate;
   SrvT.Srv.Stop;
   SrvT.WaitFor;
   SrvT.Srv.Free;
   Check((Host.Opens = CloseSectionOpens) and (Host.Closes = Host.Opens) and
-    (Host.SendsAccepted = 0) and (Host.Broadcasts = Length(Cli)),
+    (Host.SendsAccepted = 0) and (Host.Broadcasts = CloseSectionBroadcasts) and
+    (SrvT.Raised = CloseSectionRaised),
     Format('Destroy pairs every OnOpen with one OnClientClose; sends to any ' +
     'connection report the drop (opens %d, closes %d, sends taken %d, ' +
-    'broadcasts finished %d)',
-    [Host.Opens, Host.Closes, Host.SendsAccepted, Host.Broadcasts]));
+    'broadcasts finished %d, raised out of Run %d)',
+    [Host.Opens, Host.Closes, Host.SendsAccepted, Host.Broadcasts, SrvT.Raised]));
   SrvT.Free;
   for I := 0 to High(Cli) do Cli[I].Free;
   Host.Free;
@@ -2948,9 +2973,8 @@ begin
     WriteLn('       server thread died: ',
       Exception(SrvT.FatalException).Message);
   Check(SrvT.FatalException = nil, 'stress: server thread survived the storm');
-  // TWSServer.Destroy tears its registry down without firing
-  // OnClientClose, so the tracker would keep pointers to connections the
-  // free below reclaims. Drop them while they are still valid.
+  // Drop the tracker's pointers while they are still valid (see
+  // TStressTracker.Clear).
   Tracker.Clear;
   StressPhase := 'teardown: server free (shutdown drain)';
   SrvT.Srv.Free; // Shutdown quiesces and drains with the linger conns open

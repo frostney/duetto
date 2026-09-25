@@ -332,16 +332,19 @@ type
     // Fires exactly once for every connection that saw OnOpen: when the
     // peer goes away, when the server drops it, and — for connections
     // still open at the time — from TWSServer.Destroy, on the thread
-    // calling Destroy once the transport is quiesced (there, sends,
-    // Close and Post on any connection report the drop). Sends inside
-    // the handler report False (the connection is already being torn
-    // down). An exception escaping the handler is treated like one from
-    // OnOpen or OnMessage, but only after the session connection has been
-    // released (and, on a plaintext listener, its socket closed): on the
-    // epoll and IOCP transports it propagates out of Run; on
-    // Network.framework, where callbacks run on GCD threads, an escaping
-    // exception terminates the process, as it does from any callback.
-    // During Destroy it is swallowed so shutdown completes.
+    // calling Destroy once the transport is quiesced (there, sends and
+    // Close on any connection report False and Post is discarded). On
+    // Network.framework the transport's Shutdown cancels the connections
+    // and they arrive earlier, as ordinary remote closes on their own
+    // queues. Sends inside the handler report False (the connection is
+    // already being torn down). An exception escaping the handler is
+    // treated like one from OnOpen or OnMessage, but only after the
+    // session connection has been released (and, on a plaintext
+    // listener, its socket closed — or, on IOCP with a send in flight,
+    // its FIN sent): on the epoll and IOCP transports it propagates out
+    // of Run; on Network.framework, where callbacks run on GCD threads,
+    // an escaping exception terminates the process, as it does from any
+    // callback. During Destroy it is swallowed so shutdown completes.
     property OnClientClose: TWSServerNotify read FOnClose write FOnClose;
     // Opt-in single-port fallback: fired for a well-formed, body-less
     // HTTP request (GET or HEAD without Content-Length or
