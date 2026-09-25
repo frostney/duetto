@@ -581,17 +581,22 @@ procedure TWSNwConn.RemoteClosed;
 begin
   if FClosedNotified or FDead then Exit;
   FClosedNotified := True;
-  if Assigned(FTransport.OnClosed) then FTransport.OnClosed(Self);
-  // The session has dropped its references; tear the nw side down. The
-  // cancelled state is the final callback and frees this object.
-  // A send still in flight performs the cancel from its completion
-  // instead (no need to abort the final bytes; cancel is idempotent) —
-  // within the drain budget.
-  FDead := True;
-  if FInFlight then
-    ArmDrainDeadline
-  else
-    Nw_connection_cancel(FNw);
+  // The nw side is torn down even if OnClosed raises: without the
+  // cancel, the cancelled state (which frees this object) never comes.
+  try
+    if Assigned(FTransport.OnClosed) then FTransport.OnClosed(Self);
+  finally
+    // The session has dropped its references; tear the nw side down.
+    // The cancelled state is the final callback and frees this object.
+    // A send still in flight performs the cancel from its completion
+    // instead (no need to abort the final bytes; cancel is idempotent)
+    // — within the drain budget.
+    FDead := True;
+    if FInFlight then
+      ArmDrainDeadline
+    else
+      Nw_connection_cancel(FNw);
+  end;
 end;
 
 function TWSNwConn.SubmitSend(P: PByte; ALen: NativeInt): NativeInt;

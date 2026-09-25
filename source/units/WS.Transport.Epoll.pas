@@ -870,9 +870,18 @@ end;
 // then the transport reclaims the connection.
 procedure TWSEpollTransport.RemoteClosed(AConn: TWSEpollConn);
 begin
+  // Dead before the fd is closed: the number is free for reuse the
+  // moment Untrack closes it, so any SubmitSend reached from OnClosed
+  // must report -1 rather than write into whatever now owns it — as the
+  // IOCP and Network.framework transports already do.
+  AConn.FDead := True;
   Untrack(AConn);
-  if Assigned(OnClosed) then OnClosed(AConn);
-  AConn.Free;
+  // Freed even if OnClosed raises (the exception carries on out of Run).
+  try
+    if Assigned(OnClosed) then OnClosed(AConn);
+  finally
+    AConn.Free;
+  end;
 end;
 
 procedure TWSEpollTransport.HandleReadable(AConn: TWSEpollConn);

@@ -326,6 +326,10 @@ type
 
     property OnMessage: TWSServerMessage read FOnMessage write FOnMessage;
     property OnOpen: TWSServerNotify read FOnOpen write FOnOpen;
+    // Sends inside the handler report False (the connection is already
+    // being torn down). An exception escaping the handler propagates
+    // like one from OnOpen or OnMessage (out of Run), but only after the
+    // connection and its socket have been released.
     property OnClientClose: TWSServerNotify read FOnClose write FOnClose;
     // Opt-in single-port fallback: fired for a well-formed, body-less
     // HTTP request (GET or HEAD without Content-Length or
@@ -722,9 +726,14 @@ end;
 procedure TWSServer.ReleaseConn(AConn: TWSConnection);
 begin
   RegistryRemove(AConn);
-  if (AConn.FState <> wcsHandshake) and Assigned(FOnClose) then
-    FOnClose(AConn);
-  AConn.Free;
+  // A raising OnClientClose still releases the connection; the
+  // exception carries on to the caller.
+  try
+    if (AConn.FState <> wcsHandshake) and Assigned(FOnClose) then
+      FOnClose(AConn);
+  finally
+    AConn.Free;
+  end;
 end;
 
 procedure TWSServer.PostToConn(AConn: TWSConnection; AProc: TWSConnProc);
@@ -798,8 +807,13 @@ begin
   AConn.FDropping := True;
   TConn := AConn.FTConn;
   TConn.UserData := nil;
-  ReleaseConn(AConn);
-  TConn.SubmitClose;
+  // The transport side is closed even if OnClientClose raises: the
+  // socket must not outlive the session object that owned it.
+  try
+    ReleaseConn(AConn);
+  finally
+    TConn.SubmitClose;
+  end;
 end;
 
 function TWSServer.FlushConn(AConn: TWSConnection): Boolean;

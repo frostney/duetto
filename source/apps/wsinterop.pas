@@ -136,6 +136,27 @@ type
     procedure Execute; override;
   end;
 
+  // Close-handler lifecycle section: counts OnOpen / OnClientClose,
+  // tries a send inside every OnClientClose, and raises from it on
+  // demand. Interlocked fields: handlers run on the server thread, or
+  // on the thread calling Destroy.
+  TCloseHost = class
+  public
+    Opens, Closes, SendsAccepted: LongInt;
+    RaiseOnClose: Boolean;
+    procedure HandleOpen(AConn: TWSConnection);
+    procedure HandleClose(AConn: TWSConnection);
+  end;
+
+  // A server thread that survives exceptions escaping Run (a raising
+  // OnClientClose) and counts them, so the section can keep going.
+  TCatchingServerThread = class(TThread)
+  public
+    Srv: TWSServer;
+    Raised: LongInt;
+    procedure Execute; override;
+  end;
+
 procedure TEcho.OnMsg(AConn: TWSConnection; AText: Boolean; P: PByte; Len: NativeInt);
 begin
   if AText then AConn.SendText(P, Len) else AConn.SendBinary(P, Len);
@@ -344,6 +365,32 @@ begin
   finally
     FLock.Release;
   end;
+end;
+
+procedure TCloseHost.HandleOpen(AConn: TWSConnection);
+begin
+  InterLockedIncrement(Opens);
+end;
+
+procedure TCloseHost.HandleClose(AConn: TWSConnection);
+const
+  Farewell: RawByteString = 'farewell';
+begin
+  InterLockedIncrement(Closes);
+  if AConn.SendText(@Farewell[1], Length(Farewell)) then
+    InterLockedIncrement(SendsAccepted);
+  if RaiseOnClose then
+    raise Exception.Create('OnClientClose raised on purpose');
+end;
+
+procedure TCatchingServerThread.Execute;
+begin
+  while not Terminated do
+    try
+      Srv.Run(50);
+    except
+      InterLockedIncrement(Raised);
+    end;
 end;
 
 procedure TServerThread.Execute;
@@ -1579,6 +1626,70 @@ const
 // battery: a peer that stalls, goes mute, idles, stops reading or arrives
 // one too many must each be shed within its budget, and a live peer that
 // merely says nothing must be kept by the keepalive.
+// OnClientClose robustness: a raising handler must not leak the socket
+// or the session object.
+procedure RunCloseHandlerSection(var AStressPhase: ShortString);
+var
+  Host: TCloseHost;
+  EchoHost: TEcho;
+  SrvT: TCatchingServerThread;
+  Port: Word;
+  Fd: Tsocket;
+  Hard: TInteropLinger;
+  Cli: array[0..2] of TWSClient;
+  I: Integer;
+  Eof, IsText: Boolean;
+  Data: TBytes;
+  Deadline: QWord;
+begin
+  AStressPhase := 'close-handler section';
+  Host := TCloseHost.Create;
+  EchoHost := TEcho.Create;
+  SrvT := TCatchingServerThread.Create(True);
+  SrvT.Srv := TWSServer.Create(0, False, 16 * 1024 * 1024, '127.0.0.1');
+  SrvT.Srv.OnMessage := EchoHost.OnMsg;
+  SrvT.Srv.OnOpen := Host.HandleOpen;
+  SrvT.Srv.OnClientClose := Host.HandleClose;
+  Port := SrvT.Srv.Port;
+  SrvT.Start;
+  Host.RaiseOnClose := True;
+
+  // Server-side drop (a protocol violation) with a raising handler: the
+  // socket must still be closed behind the close frame.
+  Fd := RawUpgraded(Port);
+  RawSendFrame(Fd, WS_OP_TEXT, 'unmasked', False);
+  Check(RawReadCloseCode(Fd, nil) = 1002, 'violation -> 1002 (raising close handler)');
+  RawReadToEof(Fd, Eof);
+  CloseSocket(Fd);
+  Check(Eof, 'raising OnClientClose on a server drop: socket still closed');
+
+  // Peer reset with a raising handler: the server keeps serving.
+  Hard.OnOff := 1;
+  Hard.Seconds := 0;
+  Fd := RawUpgraded(Port);
+  fpSetSockOpt(Fd, SOL_SOCKET, SO_LINGER, @Hard, SizeOf(Hard));
+  CloseSocket(Fd);
+  Deadline := GetTickCount64 + 5000;
+  while (SrvT.Raised < 2) and (GetTickCount64 < Deadline) do Sleep(10);
+  Host.RaiseOnClose := False;
+  Cli[0] := TWSClient.Create;
+  Cli[0].Connect(Format('ws://127.0.0.1:%d/', [Port]));
+  Cli[0].SendText(HelloProbe);
+  Check((SrvT.Raised = 2) and Cli[0].ReadMessage(IsText, Data) and
+    (Length(Data) = Length(HelloProbe)),
+    'both raising handlers surfaced once each; the server still echoes');
+  Cli[0].Close(1000, 'done');
+  Cli[0].Free;
+
+  SrvT.Terminate;
+  SrvT.Srv.Stop;
+  SrvT.WaitFor;
+  SrvT.Srv.Free;
+  SrvT.Free;
+  Host.Free;
+  EchoHost.Free;
+end;
+
 procedure RunLimitsSection(var AStressPhase: ShortString);
 var
   Limits: TLimitsHost;
@@ -2173,6 +2284,7 @@ begin
   Gate.Free;
 
   RunLimitsSection(StressPhase);
+  RunCloseHandlerSection(StressPhase);
 
   // --- server TLS terminated by the transport (duetto#22) -----------------
   // Linux only, and the reason is the CLIENT half of the battery on the
