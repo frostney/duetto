@@ -959,67 +959,56 @@ begin
   end;
 end;
 
-// One masked frame cut into two reads at every offset, header included:
-// whatever the cut, the delivered bytes are the payload.
-procedure TProtoDelivery.TestSplitAtEveryCut;
+// Cut AFrame into two reads at every offset, header included, feeding a
+// fresh server each time; count the cuts where the delivered message is
+// not exactly APayload (with the right text flag).
+function SplitSweepFailures(const AFrame, APayload: TBytes;
+  AText: Boolean): Integer;
 var
   S: TWSProtocol;
   SS: TSink;
-  Payload, Frame, Part1, Part2: TBytes;
-  Cut, Bad: Integer;
+  Part1, Part2: TBytes;
+  Cut: Integer;
 begin
-  Payload := Pattern(300, 11);
-  Frame := BuildFrame(WS_OP_BINARY, True, False, False, True, Payload,
-    $0F1E2D3C);
-  Bad := 0;
-  for Cut := 1 to Length(Frame) - 1 do
+  Result := 0;
+  for Cut := 1 to Length(AFrame) - 1 do
   begin
     SS := TSink.Create;
     S := NewServer(SS);
     try
-      Part1 := System.Copy(Frame, 0, Cut);
-      Part2 := System.Copy(Frame, Cut, Length(Frame) - Cut);
-      if not S.Ingest(@Part1[0], Length(Part1)) then Inc(Bad);
-      if not S.Ingest(@Part2[0], Length(Part2)) then Inc(Bad);
-      if (SS.MsgCount <> 1) or (not SameBytes(SS.LastMsg, Payload)) then
-        Inc(Bad);
+      Part1 := System.Copy(AFrame, 0, Cut);
+      Part2 := System.Copy(AFrame, Cut, Length(AFrame) - Cut);
+      if not S.Ingest(@Part1[0], Length(Part1)) then Inc(Result);
+      if not S.Ingest(@Part2[0], Length(Part2)) then Inc(Result);
+      if (SS.MsgCount <> 1) or (SS.LastText <> AText) or
+         (not SameBytes(SS.LastMsg, APayload)) then
+        Inc(Result);
     finally
       S.Free; SS.Free;
     end;
   end;
-  Expect<Integer>(Bad).ToBe(0);
 end;
 
-// Same sweep over a text frame of multibyte code points, so every cut
-// also splits UTF-8 validation at a different byte.
+procedure TProtoDelivery.TestSplitAtEveryCut;
+var
+  Payload: TBytes;
+begin
+  Payload := Pattern(300, 11);
+  Expect<Integer>(SplitSweepFailures(
+    BuildFrame(WS_OP_BINARY, True, False, False, True, Payload, $0F1E2D3C),
+    Payload, False)).ToBe(0);
+end;
+
+// Multibyte code points, so every cut also splits UTF-8 validation at a
+// different byte.
 procedure TProtoDelivery.TestSplitTextAtEveryCut;
 var
-  S: TWSProtocol;
-  SS: TSink;
-  Payload, Frame, Part1, Part2: TBytes;
-  Cut, Bad: Integer;
+  Payload: TBytes;
 begin
   Payload := Bytes('Größe · 大きさ · размер · ' + 'ε' + ' 🎈 done');
-  Frame := BuildFrame(WS_OP_TEXT, True, False, False, True, Payload,
-    $C0FFEE11);
-  Bad := 0;
-  for Cut := 1 to Length(Frame) - 1 do
-  begin
-    SS := TSink.Create;
-    S := NewServer(SS);
-    try
-      Part1 := System.Copy(Frame, 0, Cut);
-      Part2 := System.Copy(Frame, Cut, Length(Frame) - Cut);
-      if not S.Ingest(@Part1[0], Length(Part1)) then Inc(Bad);
-      if not S.Ingest(@Part2[0], Length(Part2)) then Inc(Bad);
-      if (SS.MsgCount <> 1) or (not SS.LastText) or
-         (not SameBytes(SS.LastMsg, Payload)) then
-        Inc(Bad);
-    finally
-      S.Free; SS.Free;
-    end;
-  end;
-  Expect<Integer>(Bad).ToBe(0);
+  Expect<Integer>(SplitSweepFailures(
+    BuildFrame(WS_OP_TEXT, True, False, False, True, Payload, $C0FFEE11),
+    Payload, True)).ToBe(0);
 end;
 
 procedure TProtoDelivery.TestBadUtf8WholeFrame;
