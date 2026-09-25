@@ -326,10 +326,14 @@ type
 
     property OnMessage: TWSServerMessage read FOnMessage write FOnMessage;
     property OnOpen: TWSServerNotify read FOnOpen write FOnOpen;
-    // Sends inside the handler report False (the connection is already
-    // being torn down). An exception escaping the handler propagates
-    // like one from OnOpen or OnMessage (out of Run), but only after the
-    // connection and its socket have been released.
+    // Fires exactly once for every connection that saw OnOpen: when the
+    // peer goes away, when the server drops it, and — for connections
+    // still open at the time — from TWSServer.Destroy, on the thread
+    // calling Destroy once the transport is quiesced. Sends inside the
+    // handler report False (the connection is already being torn down).
+    // An exception escaping the handler propagates like one from OnOpen
+    // or OnMessage (out of Run), but only after the connection has been
+    // released; during Destroy it is swallowed so shutdown completes.
     property OnClientClose: TWSServerNotify read FOnClose write FOnClose;
     // Opt-in single-port fallback: fired for a well-formed, body-less
     // HTTP request (GET or HEAD without Content-Length or
@@ -616,7 +620,7 @@ end;
 
 destructor TWSServer.Destroy;
 var
-  I: Integer;
+  Conn: TWSConnection;
 begin
   // Quiesce the transport first: after Shutdown returns, no completion
   // can fire on any thread and every transport connection object is
@@ -638,8 +642,22 @@ begin
   if FTransport <> nil then
   begin
     FTransport.Shutdown;
-    for I := 0 to FRegistryCount - 1 do
-      FRegistry[I].Free;
+    // Connections still open get their OnClientClose here, so every
+    // OnOpen is paired and a handler holding references (the Post
+    // lifetime contract) learns they are gone. The transport is
+    // quiesced, so this thread is the only one running callbacks.
+    // ReleaseConn takes each out of the registry, so the loop drains it.
+    while FRegistryCount > 0 do
+    begin
+      Conn := FRegistry[FRegistryCount - 1];
+      Conn.FDropping := True;
+      try
+        ReleaseConn(Conn);
+      except
+        // A destructor has to finish: the connection was released by
+        // ReleaseConn's finally; the handler's exception is dropped.
+      end;
+    end;
     FTransport.Free;
   end;
   FSweepWake.Free;

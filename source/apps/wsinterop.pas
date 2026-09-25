@@ -1627,7 +1627,8 @@ const
 // one too many must each be shed within its budget, and a live peer that
 // merely says nothing must be kept by the keepalive.
 // OnClientClose robustness: a raising handler must not leak the socket
-// or the session object.
+// or the session object, and a server destroyed with connections still
+// open owes each of them its OnClientClose.
 procedure RunCloseHandlerSection(var AStressPhase: ShortString);
 var
   Host: TCloseHost;
@@ -1681,11 +1682,26 @@ begin
   Cli[0].Close(1000, 'done');
   Cli[0].Free;
 
+  // Destroy with three connections still open, one handler raising.
+  for I := 0 to High(Cli) do
+  begin
+    Cli[I] := TWSClient.Create;
+    Cli[I].Connect(Format('ws://127.0.0.1:%d/', [Port]));
+    Cli[I].SendText(HelloProbe);
+    Cli[I].ReadMessage(IsText, Data); // OnOpen has run
+  end;
+  Host.RaiseOnClose := True;
+  AStressPhase := 'close-handler section: destroy';
   SrvT.Terminate;
   SrvT.Srv.Stop;
   SrvT.WaitFor;
   SrvT.Srv.Free;
+  Check((Host.Opens = 6) and (Host.Closes = 6) and (Host.SendsAccepted = 0),
+    Format('Destroy pairs every OnOpen with one OnClientClose, sends in it ' +
+    'report the drop (opens %d, closes %d, sends taken %d)',
+    [Host.Opens, Host.Closes, Host.SendsAccepted]));
   SrvT.Free;
+  for I := 0 to High(Cli) do Cli[I].Free;
   Host.Free;
   EchoHost.Free;
 end;
