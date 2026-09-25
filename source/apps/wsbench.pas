@@ -150,12 +150,12 @@ var
 begin
   Reps := 0;
   T := Now64;
-  Deadline := T + Round(MaskSecs * 1e6);
+  Deadline := T + Round(MaskSecs * MicrosPerSec);
   repeat
     for I := 1 to 64 do AProc(ASrc, ADst, ASize);
     Inc(Reps, 64);
   until Now64 >= Deadline;
-  Result := ASize / (1024.0 * 1024 * 1024) * Reps / ((Now64 - T) / 1e6);
+  Result := ASize / (1024.0 * 1024 * 1024) * Reps / ((Now64 - T) / MicrosPerSec);
 end;
 
 procedure BenchCopy;
