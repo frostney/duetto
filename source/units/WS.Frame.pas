@@ -243,23 +243,34 @@ begin
   end;
 end;
 
+// The main loops of UnmaskU64 / UnmaskCopyU64 run 64 bytes per pass up
+// to an end pointer. The earlier 32-byte form that counted a length down
+// ran anywhere from 36 to 53 GB/s on Zen 5 depending only on where the
+// linker happened to place it (identical code, different address); this
+// shape measured 52-57 GB/s at every placement tried (wsbench, and a
+// harness shifting the loop through eight 8-byte offsets). The tails keep
+// the key phase: every step is a multiple of 4 bytes.
 procedure UnmaskU64(P: PByte; ALen: PtrUInt; ARotKey: UInt32);
 var
   K64: UInt64;
-  P64: PUInt64;
+  P64, PEnd: PUInt64;
 begin
   K64 := UInt64(ARotKey) or (UInt64(ARotKey) shl 32);
   P64 := PUInt64(P);
-  // 32 bytes per iteration: four independent XORs keep the single port busy.
-  while ALen >= 32 do
+  PEnd := PUInt64(P + (ALen and not PtrUInt(63)));
+  while P64 < PEnd do
   begin
     P64[0] := P64[0] xor K64;
     P64[1] := P64[1] xor K64;
     P64[2] := P64[2] xor K64;
     P64[3] := P64[3] xor K64;
-    Inc(P64, 4);
-    Dec(ALen, 32);
+    P64[4] := P64[4] xor K64;
+    P64[5] := P64[5] xor K64;
+    P64[6] := P64[6] xor K64;
+    P64[7] := P64[7] xor K64;
+    Inc(P64, 8);
   end;
+  ALen := ALen and 63;
   while ALen >= 8 do
   begin
     P64^ := P64^ xor K64;
@@ -273,21 +284,26 @@ end;
 procedure UnmaskCopyU64(ASrc, ADst: PByte; ALen: PtrUInt; ARotKey: UInt32);
 var
   K64: UInt64;
-  S, D: PUInt64;
+  S, D, SEnd: PUInt64;
 begin
   K64 := UInt64(ARotKey) or (UInt64(ARotKey) shl 32);
   S := PUInt64(ASrc);
   D := PUInt64(ADst);
-  while ALen >= 32 do
+  SEnd := PUInt64(ASrc + (ALen and not PtrUInt(63)));
+  while S < SEnd do
   begin
     D[0] := S[0] xor K64;
     D[1] := S[1] xor K64;
     D[2] := S[2] xor K64;
     D[3] := S[3] xor K64;
-    Inc(S, 4);
-    Inc(D, 4);
-    Dec(ALen, 32);
+    D[4] := S[4] xor K64;
+    D[5] := S[5] xor K64;
+    D[6] := S[6] xor K64;
+    D[7] := S[7] xor K64;
+    Inc(S, 8);
+    Inc(D, 8);
   end;
+  ALen := ALen and 63;
   while ALen >= 8 do
   begin
     D^ := S^ xor K64;
