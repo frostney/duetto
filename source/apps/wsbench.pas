@@ -12,57 +12,85 @@ program wsbench;
 //                  parsing, validating and unmasking on both sides.
 //                  This is the network-free ceiling of the library.
 //
-// Methodology: warm-up pass, then timed loop sized for >= ~1 s per
-// subject; medians not needed at these durations (variance < 2% observed).
+// Methodology: warm-up pass, then a timed loop of well over the clock's
+// resolution per subject (the masking loops repeat until MaskSecs has
+// passed); medians not needed at these durations (variance < 2%
+// observed). Numbers are only meaningful from a release build
+// (`lwpt build --mode release`): a dev build keeps range and overflow
+// checks on, and the banner says which one is running.
 
 {$I Shared.inc}
 
 uses
+  {$ifdef UNIX} BaseUnix, Unix, {$endif}
+  {$ifdef WINDOWS} Windows, {$endif}
   SysUtils, WS.Frame, WS.Utf8, WS.Handshake, WS.Deflate, WS.Protocol;
 
-var
-  T0: TDateTime;
+const
+  MaskSecs = 0.5;
 
-function Now64: Int64; // microseconds, monotonic enough for our purpose
+var
+  T0: Int64;
+
+// Microseconds. SysUtils.Now ticks in whole milliseconds, which turned a
+// ~10 ms masking pass into a reading quantised to 100 / 90.9 / 83.3 GB/s;
+// these clocks resolve to a microsecond or better.
+function Now64: Int64;
+{$ifdef UNIX}
+var
+  Tv: TTimeVal;
 begin
-  Result := Round(Now * 24.0 * 3600.0 * 1e6);
+  fpgettimeofday(@Tv, nil);
+  Result := Int64(Tv.tv_sec) * 1000000 + Tv.tv_usec;
+end;
+{$else}
+var
+  Count, Freq: Int64;
+begin
+  QueryPerformanceCounter(Count);
+  QueryPerformanceFrequency(Freq);
+  Result := Round(Count / Freq * 1e6);
+end;
+{$endif}
+
+type
+  TMaskProc = procedure(P: PByte; ALen: PtrUInt; ARotKey: UInt32);
+
+// Repeats AProc over the whole buffer until MaskSecs has passed; GB/s.
+function TimeMask(AProc: TMaskProc; ABuf: PByte; ASize: PtrUInt): Double;
+var
+  T, Deadline: Int64;
+  Reps: Int64;
+begin
+  Reps := 0;
+  T := Now64;
+  Deadline := T + Round(MaskSecs * 1e6);
+  repeat
+    AProc(ABuf, ASize, $12345678);
+    Inc(Reps);
+  until Now64 >= Deadline;
+  Result := ASize / (1024.0 * 1024 * 1024) * Reps / ((Now64 - T) / 1e6);
 end;
 
 procedure BenchMasking;
 const
   SIZE = 16 * 1024 * 1024;
-  REPS = 64;
 var
   Buf: TBytes;
-  I, R: Integer;
-  T: Int64;
-  Secs, GBs: Double;
+  I: Integer;
   Sum: Byte;
 begin
   SetLength(Buf, SIZE);
   for I := 0 to SIZE - 1 do Buf[I] := Byte(I);
-  WriteLn('-- masking (', SIZE div (1024 * 1024), ' MiB x ', REPS, ') --');
+  WriteLn(Format('-- masking (%d MiB, repeated for %.1f s each) --',
+    [SIZE div (1024 * 1024), MaskSecs]));
 
   UnmaskNaive(PByte(Buf), SIZE, $12345678); // warm
-  T := Now64;
-  for R := 1 to REPS do UnmaskNaive(PByte(Buf), SIZE, $12345678);
-  Secs := (Now64 - T) / 1e6;
-  GBs := SIZE / (1024.0 * 1024 * 1024) * REPS / Secs;
-  WriteLn(Format('naive   : %8.2f GB/s', [GBs]));
-
-  T := Now64;
-  for R := 1 to REPS do UnmaskU64(PByte(Buf), SIZE, $12345678);
-  Secs := (Now64 - T) / 1e6;
-  GBs := SIZE / (1024.0 * 1024 * 1024) * REPS / Secs;
-  WriteLn(Format('uint64  : %8.2f GB/s', [GBs]));
-
+  WriteLn(Format('naive   : %8.2f GB/s', [TimeMask(UnmaskNaive, PByte(Buf), SIZE)]));
+  WriteLn(Format('uint64  : %8.2f GB/s', [TimeMask(UnmaskU64, PByte(Buf), SIZE)]));
   // UnmaskSSE2 only exists where WS.Frame compiles it (x86_64 Linux).
   {$if defined(CPUX86_64) and defined(LINUX)}
-  T := Now64;
-  for R := 1 to REPS do UnmaskSSE2(PByte(Buf), SIZE, $12345678);
-  Secs := (Now64 - T) / 1e6;
-  GBs := SIZE / (1024.0 * 1024 * 1024) * REPS / Secs;
-  WriteLn(Format('sse2    : %8.2f GB/s', [GBs]));
+  WriteLn(Format('sse2    : %8.2f GB/s', [TimeMask(UnmaskSSE2, PByte(Buf), SIZE)]));
   {$endif}
 
   // keep the work observable
@@ -308,8 +336,10 @@ begin
 end;
 
 begin
-  T0 := Now;
-  WriteLn('duetto component bench  (FPC ', {$I %FPCVERSION%}, ', -O2, x86_64)');
+  T0 := Now64;
+  WriteLn('duetto component bench  (FPC ', {$I %FPCVERSION%}, ', ',
+    {$I %FPCTARGETCPU%}, '-', {$I %FPCTARGETOS%}, ', ',
+    {$ifdef PRODUCTION} 'release build' {$else} 'DEV BUILD, checks on: numbers are not representative' {$endif}, ')');
   WriteLn;
   BenchMasking; WriteLn;
   BenchFrameParse; WriteLn;
@@ -322,5 +352,5 @@ begin
   BenchProtocol(16 * 1024, 1.0);
   BenchProtocol(256 * 1024, 1.0);
   WriteLn;
-  WriteLn(Format('total %.1f s', [(Now - T0) * 24 * 3600]));
+  WriteLn(Format('total %.1f s', [(Now64 - T0) / 1e6]));
 end.
