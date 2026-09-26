@@ -1659,6 +1659,127 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Egress backpressure probe (plaintext)
+// ---------------------------------------------------------------------------
+
+const
+  // Eight 1 MiB echoes against a 64 KiB client receive buffer: on Linux
+  // with the default net.ipv4.tcp_wmem ceiling (4 MiB) that is more than
+  // the send buffer can absorb, so the epoll server's gather write goes
+  // short mid-message. A host with a larger ceiling, and the other
+  // platforms, run the same probe as a plain backpressure check.
+  EgressCount = 8;
+  EgressSize = 1024 * 1024;
+  EgressRecvBuf = 64 * 1024;
+  EgressStallMs = 300;
+  ShutBoth = 2; // SHUT_RDWR / SD_BOTH
+
+type
+  // Writes the frames from its own thread, so the probe can stall its
+  // reader without deadlocking against a transport that stops reading
+  // while its output is backed up.
+  TEgressSender = class(TThread)
+  public
+    Fd: Tsocket;
+    Ok: Boolean;
+    procedure Execute; override;
+  end;
+
+function EgressPayload(AIndex: Integer): RawByteString;
+var
+  I: Integer;
+begin
+  SetLength(Result, EgressSize);
+  for I := 1 to EgressSize do
+    Result[I] := AnsiChar((I * 13 + AIndex * 71) and $FF);
+end;
+
+// Blocking send of every byte (a 1 MiB frame need not go in one call);
+// stops at the first failure, e.g. the socket shut down under it.
+procedure TEgressSender.Execute;
+var
+  I: Integer;
+  Wire: RawByteString;
+  Off, Sent: NativeInt;
+begin
+  Ok := True;
+  for I := 0 to EgressCount - 1 do
+  begin
+    Wire := BuildFrameBytes(WS_OP_BINARY, EgressPayload(I), True);
+    Off := 0;
+    while Off < Length(Wire) do
+    begin
+      Sent := fpSend(Fd, @Wire[Off + 1], Length(Wire) - Off, 0);
+      if Sent <= 0 then
+      begin
+        Ok := False;
+        Exit;
+      end;
+      Inc(Off, Sent);
+    end;
+  end;
+end;
+
+// Read exactly the EgressCount unmasked binary frames the server must
+// send back and compare them byte for byte (headers, payloads, order).
+// False on EOF / timeout or any mismatch.
+function RawReadEgressEchoes(AFd: Tsocket; const ALeftover: TBytes): Boolean;
+var
+  Want: RawByteString;
+  Buf: TBytes;
+  Len, Got: NativeInt;
+  I: Integer;
+begin
+  Want := '';
+  for I := 0 to EgressCount - 1 do
+    Want := Want + BuildFrameBytes(WS_OP_BINARY, EgressPayload(I), False);
+  Buf := Copy(ALeftover);
+  Len := Length(Buf);
+  SetLength(Buf, Length(Want));
+  while Len < Length(Want) do
+  begin
+    Got := fpRecv(AFd, @Buf[Len], Length(Want) - Len, 0);
+    if Got <= 0 then Exit(False);
+    Inc(Len, Got);
+  end;
+  Result := CompareMem(@Buf[0], @Want[1], Length(Want));
+end;
+
+// The epoll gather-write probe, as its own section.
+procedure RunEgressSection(APort: Word; var AStressPhase: ShortString);
+var
+  Fd: Tsocket;
+  Left: TBytes;
+  Ok: Boolean;
+  EgressSender: TEgressSender;
+begin
+  // --- server egress backpressure (plaintext) ----------------------------
+  // A reader with a small receive buffer holds off while EgressCount
+  // large frames go out: the server's echo overflows the socket, so (on
+  // Linux, deterministically) its write goes short and the rest of that
+  // frame — and every echo behind it — waits in the out queue for
+  // OnSendReady. Everything must arrive intact and in order.
+  AStressPhase := 'egress backpressure';
+  Fd := RawConnectEx(APort, True, EgressRecvBuf);
+  Left := RawHandshake(Fd);
+  EgressSender := TEgressSender.Create(True);
+  EgressSender.Fd := Fd;
+  EgressSender.Start;
+  Sleep(EgressStallMs);
+  Ok := RawReadEgressEchoes(Fd, Left);
+  // A failed read may leave the sender blocked in a full socket: shut it
+  // down so WaitFor returns instead of waiting on the watchdog.
+  if not Ok then
+    fpShutdown(Fd, ShutBoth);
+  EgressSender.WaitFor;
+  Ok := Ok and EgressSender.Ok;
+  EgressSender.Free;
+  CloseSocket(Fd);
+  Check(Ok, Format('%d x %d KiB echoed through a stalled reader, in order',
+    [EgressCount, EgressSize div 1024]));
+end;
+
+// ---------------------------------------------------------------------------
 
 const
   HelloProbe: RawByteString = 'hello duetto';
@@ -3049,6 +3170,7 @@ begin
   RunBoundedReadSection;
   RunDeflateSection;
   RunViolationSection;
+  RunEgressSection(Port, StressPhase);
   RunPlainRequestSection;
   RunUpgradeHookSection;
   RunLimitsSection(StressPhase);

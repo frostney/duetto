@@ -96,6 +96,11 @@ type
     procedure CheckClock(AConn: TWSConnection);
     procedure ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
     function GetId: NativeUInt;
+    // SendText/SendBinary. Where the transport can gather and the
+    // protocol allows it, header + the caller's payload go out in one
+    // write and only what the transport did not take is queued — no copy
+    // into the protocol's out queue on the common path.
+    function SendData(AText: Boolean; P: PByte; ALen: NativeInt): Boolean;
   public
     UserData: Pointer;
     constructor Create;
@@ -399,6 +404,11 @@ uses
 
 const
   HandshakeMaxBytes = 16 * 1024;
+  // Smallest payload worth a gather write over a copy into the queue.
+  // Set from load_test on epoll (separate cores): with no threshold the
+  // two-element sendmsg ran ~2% behind copy + send at 20 B, and the two
+  // were level at 1 KiB.
+  DirectSendMin = 1024;
   RegistryGrowth = 64;
   DefaultHandshakeTimeoutMs = 10000;
   DefaultCloseTimeoutMs = 10000;
@@ -576,7 +586,12 @@ begin
     FServer.FOnMessage(Self, AText, P, ALen);
 end;
 
-function TWSConnection.SendText(P: PByte; ALen: NativeInt): Boolean;
+function TWSConnection.SendData(AText: Boolean; P: PByte;
+  ALen: NativeInt): Boolean;
+var
+  Hdr: TWSFrameHeaderBuf;
+  HLen: Integer;
+  Taken: NativeInt;
 begin
   // Teardown already running (an OnClientClose handler sending into the
   // connection it is being told about): the transport side is gone, so
@@ -584,22 +599,37 @@ begin
   // DropConn and free the object a second time.
   if FDropping then Exit(False);
   Result := True;
-  if FState = wcsOpen then
+  if FState <> wcsOpen then Exit;
+  HLen := 0;
+  if (ALen >= DirectSendMin) and FTConn.SupportsGather then
+    HLen := FProto.DirectHeader(AText, ALen, Hdr);
+  if HLen = 0 then
   begin
-    FProto.SendText(P, ALen);
-    Result := FServer.FlushConn(Self);
+    if AText then
+      FProto.SendText(P, ALen)
+    else
+      FProto.SendBinary(P, ALen);
+    Exit(FServer.FlushConn(Self));
   end;
+  // Same drop contract as FlushConn: -1 = dead, dropped here.
+  Taken := FTConn.SubmitSendV(@Hdr[0], HLen, P, ALen);
+  if Taken < 0 then Exit(FServer.DropConn(Self));
+  FProto.DirectSent(Hdr, HLen, P, ALen, Taken);
+  // A tail left queued goes through FlushConn like any other pending
+  // output, so every per-flush policy judges it; only a short write pays
+  // for the extra offer (which the full socket declines).
+  if FProto.OutPending > 0 then
+    Result := FServer.FlushConn(Self);
+end;
+
+function TWSConnection.SendText(P: PByte; ALen: NativeInt): Boolean;
+begin
+  Result := SendData(True, P, ALen);
 end;
 
 function TWSConnection.SendBinary(P: PByte; ALen: NativeInt): Boolean;
 begin
-  if FDropping then Exit(False);
-  Result := True;
-  if FState = wcsOpen then
-  begin
-    FProto.SendBinary(P, ALen);
-    Result := FServer.FlushConn(Self);
-  end;
+  Result := SendData(False, P, ALen);
 end;
 
 procedure TWSConnection.Post(AProc: TWSConnProc);

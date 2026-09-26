@@ -36,6 +36,10 @@ uses
 type
   TWSRole = (wsrServer, wsrClient);
 
+  // Room for any frame header (DirectHeader), so callers need not know
+  // the wire's maximum header size.
+  TWSFrameHeaderBuf = array[0..WS_MAX_HEADER - 1] of Byte;
+
   // P/Len point into protocol-owned buffers or into the buffer handed to
   // Ingest, valid only for the duration of the callback. Copy if you need
   // to keep the bytes.
@@ -133,6 +137,20 @@ type
     // OutConsume(however many the socket took).
     function OutPtr: PByte; inline;
     function OutPending: NativeInt; inline;
+
+    // Direct send (gather write). When nothing is queued and a data
+    // message needs no transformation — server role (unmasked), no
+    // deflate, close not yet sent — writes the frame header into AHdr
+    // (WS_MAX_HEADER bytes) and returns its length; the caller may then
+    // hand header + its own payload to the wire in one gather write and
+    // report the bytes taken to DirectSent, which queues the rest.
+    // Returns 0 when the message must go through SendText/SendBinary.
+    // Keep its eligibility rules in step with SendDataMessage: any
+    // transformation added there must refuse the direct path here.
+    function DirectHeader(AText: Boolean; ALen: NativeInt;
+      out AHdr: TWSFrameHeaderBuf): Integer;
+    procedure DirectSent(const AHdr: TWSFrameHeaderBuf; AHLen: Integer; P: PByte;
+      ALen, ATaken: NativeInt);
     procedure OutConsume(N: NativeInt);
 
     // Both close frames exchanged (or we failed): time to drop TCP.
@@ -244,6 +262,34 @@ begin
   Result := FOutLen - FOutOff;
 end;
 
+function TWSProtocol.DirectHeader(AText: Boolean; ALen: NativeInt;
+  out AHdr: TWSFrameHeaderBuf): Integer;
+const
+  Opcodes: array[Boolean] of Byte = (WS_OP_BINARY, WS_OP_TEXT);
+begin
+  if (FRole <> wsrServer) or (FDeflater <> nil) or FCloseSent or
+     (FOutLen > FOutOff) then
+    Exit(0);
+  Result := WriteFrameHeader(@AHdr[0], True, False, Opcodes[AText], False, 0,
+    ALen);
+end;
+
+procedure TWSProtocol.DirectSent(const AHdr: TWSFrameHeaderBuf; AHLen: Integer;
+  P: PByte; ALen, ATaken: NativeInt);
+begin
+  // Called straight after the gather write DirectHeader enabled, with
+  // nothing queued in between and ATaken what the transport took of it.
+  Assert((ATaken >= 0) and (ATaken <= AHLen + ALen) and (FOutLen = FOutOff),
+    'DirectSent outside its DirectHeader/gather-write pairing');
+  if ATaken < AHLen then
+  begin
+    OutAppend(@AHdr[ATaken], AHLen - ATaken);
+    OutAppend(P, ALen);
+  end
+  else
+    OutAppend(P + (ATaken - AHLen), ALen - (ATaken - AHLen));
+end;
+
 procedure TWSProtocol.OutConsume(N: NativeInt);
 begin
   Inc(FOutOff, N);
@@ -310,6 +356,8 @@ begin
   end;
 end;
 
+// Any payload transformation added here must also make DirectHeader
+// refuse, or the direct (gather-write) path would skip it.
 procedure TWSProtocol.SendDataMessage(AOpcode: Byte; P: PByte; ALen: NativeInt);
 var
   Z: TBytes;

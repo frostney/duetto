@@ -1,7 +1,9 @@
 unit WS.Transport.Epoll;
 
 // Linux transport: single-threaded epoll reactor implementing the
-// WS.Transport completion contract. The shape every fast WebSocket
+// WS.Transport completion contract, including the optional gather send
+// (ADR-0004: one sendmsg for frame header + caller payload) on non-TLS
+// connections. The shape every fast WebSocket
 // server converges on — one event loop, nonblocking sockets,
 // level-triggered readiness, EPOLLOUT armed only while a connection has
 // backlog. Readiness adapts to the completion contract per ADR-0001:
@@ -55,6 +57,7 @@ uses
 
   Linux,
   Sockets,
+  Syscall,
   TransportSecurity,
   WS.Transport,
   WS.Transport.PostQueue,
@@ -90,6 +93,8 @@ type
     procedure ApplyInterest;
     procedure SetTimed(AValue: Boolean);
     function RawSend(P: PByte; ALen: NativeInt): NativeInt;
+    function SendFailed(ATaken: NativeInt): NativeInt;
+    procedure SendDrained;
     // TWSTlsServerSession callbacks.
     function TlsPlaintext(P: PByte; ALen: NativeInt): Boolean;
     function TlsCiphertext(P: PByte; ALen: NativeInt): NativeInt;
@@ -104,6 +109,9 @@ type
   public
     destructor Destroy; override;
     function SubmitSend(P: PByte; ALen: NativeInt): NativeInt; override;
+    function SupportsGather: Boolean; override;
+    function SubmitSendV(AFirst: PByte; AFirstLen: NativeInt; ASecond: PByte;
+      ASecondLen: NativeInt): NativeInt; override;
     procedure SubmitClose; override;
   end;
 
@@ -281,11 +289,11 @@ begin
 end;
 
 // Socket write, shared by the plaintext send path and the TLS
-// ciphertext egress. Bytes taken, 0 on EAGAIN (EPOLLOUT armed), -1 when
-// the connection is dead.
+// ciphertext egress. Bytes taken (fewer than ALen on EAGAIN, with
+// EPOLLOUT armed), -1 when the connection is dead.
 function TWSEpollConn.RawSend(P: PByte; ALen: NativeInt): NativeInt;
 var
-  W: NativeInt;
+  Sent: NativeInt;
 begin
   // A dead connection has no socket worth writing to (its fd may already
   // be closed); report the failure the caller expects, exactly as the
@@ -295,35 +303,126 @@ begin
   Result := 0;
   while Result < ALen do
   begin
-    W := fpSend(FFd, P + Result, ALen - Result, MSG_NOSIGNAL);
-    if W < 0 then
-    begin
-      if fpgeterrno = ESysEAGAIN then
-      begin
-        if not FWantWrite then
-        begin
-          FWantWrite := True;
-          ApplyInterest;
-        end;
-        Exit;
-      end;
-      FDead := True;
-      Exit(-1);
-    end;
-    Result := Result + W;
+    Sent := fpSend(FFd, P + Result, ALen - Result, MSG_NOSIGNAL);
+    // A signal before anything was sent: nothing happened, send again.
+    if (Sent < 0) and (fpgeterrno = ESysEINTR) then Continue;
+    if Sent < 0 then Exit(SendFailed(Result));
+    Result := Result + Sent;
   end;
 end;
+
+// A send syscall just failed (not EINTR — the callers retry that), ATaken
+// bytes into the offer. EAGAIN arms
+// EPOLLOUT and reports what was taken; anything else kills the
+// connection. Shared by RawSend and SubmitSendV so the two cannot drift.
+function TWSEpollConn.SendFailed(ATaken: NativeInt): NativeInt;
+begin
+  if fpgeterrno <> ESysEAGAIN then
+  begin
+    FDead := True;
+    Exit(-1);
+  end;
+  if not FWantWrite then
+  begin
+    FWantWrite := True;
+    ApplyInterest;
+  end;
+  Result := ATaken;
+end;
+
+// Everything offered went out: stop waiting for writability.
+procedure TWSEpollConn.SendDrained;
+begin
+  if FWantWrite then
+  begin
+    FWantWrite := False;
+    ApplyInterest;
+  end;
+end;
+
+{$if declared(syscall_nr_sendmsg)}
+type
+  // struct msghdr. The RTL's msghdr is bound to its libc wrappers; the
+  // raw syscall needs only this layout (natural alignment, as in C).
+  TSendMsgHdr = record
+    Name: Pointer;
+    NameLen: Cardinal;
+    Iov: PIOVec;
+    IovLen: PtrUInt;
+    Control: Pointer;
+    ControlLen: PtrUInt;
+    Flags: Integer;
+  end;
+{$endif}
+
+// Plaintext only: a TLS connection encrypts into its own buffers, so
+// there is nothing to gather. Targets whose FPC RTL declares no sendmsg
+// syscall number (those that multiplex socketcall, e.g. i386) never opt
+// in; x86_64 and aarch64 do.
+function TWSEpollConn.SupportsGather: Boolean;
+begin
+{$if declared(syscall_nr_sendmsg)}
+  Result := FTls = nil;
+{$else}
+  Result := False;
+{$endif}
+end;
+
+// One sendmsg over both buffers (the raw syscall, so errno lands where
+// fpgeterrno reads it, exactly as fpSend's does). Same result contract as
+// RawSend: bytes taken, EPOLLOUT armed on EAGAIN, -1 when dead.
+function TWSEpollConn.SubmitSendV(AFirst: PByte; AFirstLen: NativeInt;
+  ASecond: PByte; ASecondLen: NativeInt): NativeInt;
+{$if declared(syscall_nr_sendmsg)}
+var
+  Iov: array[0..1] of TIOVec;
+  Msg: TSendMsgHdr;
+  Sent, Total: NativeInt;
+begin
+  if FDead then Exit(-1);
+  if FTls <> nil then
+    Exit(inherited SubmitSendV(AFirst, AFirstLen, ASecond, ASecondLen));
+  Total := AFirstLen + ASecondLen;
+  Result := 0;
+  FillChar(Msg, SizeOf(Msg), 0);
+  Msg.Iov := @Iov[0];
+  while Result < Total do
+  begin
+    if Result < AFirstLen then
+    begin
+      Iov[0].iov_base := AFirst + Result;
+      Iov[0].iov_len := AFirstLen - Result;
+      Iov[1].iov_base := ASecond;
+      Iov[1].iov_len := ASecondLen;
+      Msg.IovLen := 2;
+    end
+    else
+    begin
+      Iov[0].iov_base := ASecond + (Result - AFirstLen);
+      Iov[0].iov_len := Total - Result;
+      Msg.IovLen := 1;
+    end;
+    Sent := Do_SysCall(syscall_nr_sendmsg, TSysParam(FFd), TSysParam(@Msg),
+      TSysParam(MSG_NOSIGNAL));
+    // Interrupted before sending anything (as for RawSend): send again.
+    if (Sent < 0) and (fpgeterrno = ESysEINTR) then Continue;
+    if Sent < 0 then Exit(SendFailed(Result));
+    Result := Result + Sent;
+  end;
+  SendDrained;
+end;
+{$else}
+begin
+  Result := inherited SubmitSendV(AFirst, AFirstLen, ASecond, ASecondLen);
+end;
+{$endif}
 
 function TWSEpollConn.SubmitSend(P: PByte; ALen: NativeInt): NativeInt;
 begin
   if FDead then Exit(-1);
   if FTls <> nil then Exit(TlsSubmitSend(P, ALen));
   Result := RawSend(P, ALen);
-  if (Result >= ALen) and FWantWrite then
-  begin
-    FWantWrite := False;
-    ApplyInterest;
-  end;
+  if Result >= ALen then SendDrained;
 end;
 
 procedure TWSEpollConn.SubmitClose;
