@@ -38,9 +38,10 @@ wsautobahn = { source = "source/apps/wsautobahn.pas", output = "build/wsautobahn
 # (WS.Transport.Iocp), routine cyclomatic 64, routine cognitive 121,
 # duplication 0.89%. Regression ratchets — CI fails when a change pushes
 # a metric past its ceiling; the file ceilings carry ~10% headroom so a
-# new battery case is not a ceiling bump.
+# new battery case is not a ceiling bump. File cyclomatic moved to 300
+# with the close-handler section, which took wsinterop to 281.
 [health]
-max-file-cyclomatic = 280
+max-file-cyclomatic = 300
 max-file-cognitive = 380
 max-routine-cyclomatic = 70
 max-routine-cognitive = 130
