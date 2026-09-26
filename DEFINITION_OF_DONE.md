@@ -37,7 +37,8 @@ recorded reason.
 - `./build/wsinterop` passes when client, server, or protocol behaviour
   changed — on the platform whose transport the change touches, and on
   Linux with `WSINTEROP_REQUIRE_TLS=1` when server TLS is involved (the
-  wss:// section is Linux-only and skips silently without the knob).
+  wss:// section is Linux-only; when its TLS prerequisites are missing
+  it prints a skip, which the knob turns into a failure).
 - Protocol-behaviour changes anticipate the Autobahn suite: it runs on
   every push to main in both directions and a red or skipped suite
   blocks release; run `tools/autobahn.sh` locally (Linux + Docker) when

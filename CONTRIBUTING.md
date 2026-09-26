@@ -36,11 +36,11 @@ formatter and regenerates the `AGENTS.md` command block.
 [`DEFINITION_OF_DONE.md`](DEFINITION_OF_DONE.md) is the checklist. A pull
 request is mergeable when:
 
-1. The universal gate is green in CI on Linux, macOS and Windows:
-   `install --frozen`, `format --check`, `agents --check`, `health`,
-   `duplication`, `build`, `test`, `wsinterop`. PR CI runs `wsinterop`
-   on every platform; locally the Definition of Done requires it when
-   client, server or protocol behaviour changes.
+1. The PR gate is green in CI: `install --frozen`, `build`, `test` and
+   `wsinterop` on Linux, macOS and Windows, plus the platform-independent
+   `format --check`, `agents --check`, `health` and `duplication` on the
+   Linux leg. Locally, the Definition of Done requires `wsinterop` only
+   when client, server or protocol behaviour changes.
 2. Protocol-behaviour changes keep the Autobahn suite green in both
    directions (it runs on every push to `main`; run `tools/autobahn.sh`
    locally when conformance is plausibly affected).
