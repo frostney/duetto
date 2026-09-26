@@ -215,6 +215,7 @@ procedure Nw_connection_set_state_changed_handler(AConn,
   ABlock: Pointer); cdecl; external name 'nw_connection_set_state_changed_handler';
 procedure Nw_connection_start(AConn: Pointer); cdecl; external name 'nw_connection_start';
 procedure Nw_connection_cancel(AConn: Pointer); cdecl; external name 'nw_connection_cancel';
+procedure Nw_connection_force_cancel(AConn: Pointer); cdecl; external name 'nw_connection_force_cancel';
 procedure Nw_connection_receive(AConn: Pointer; AMin, AMax: UInt32;
   ABlock: Pointer); cdecl; external name 'nw_connection_receive';
 procedure Nw_connection_send(AConn, AData, AContext: Pointer;
@@ -346,8 +347,8 @@ type
   // nothing else. The Pascal connection object may already be freed
   // by the time the timer fires (the send completed, the cancel ran,
   // the cancelled state landed), so the block must not name it —
-  // nw_connection_cancel is idempotent and safe on a cancelled
-  // connection, which is all the timer needs. Freed by its own invoke.
+  // cancelling is idempotent and safe on a cancelled connection, which
+  // is all the timer needs. Freed by its own invoke.
   PWSNwDrainTimer = ^TWSNwDrainTimer;
   TWSNwDrainTimer = record
     Nw: Pointer;
@@ -360,7 +361,10 @@ var
 begin
   EnsureThreadInit;
   D := PWSNwDrainTimer(ABlock^.Ctx);
-  Nw_connection_cancel(D^.Nw);
+  // Force: the deadline means the peer is not reading, and a graceful
+  // cancel would still try to flush (and, over TLS, write close_notify)
+  // into the stalled send.
+  Nw_connection_force_cancel(D^.Nw);
   Nw_release(D^.Nw);
   Dispose(D);
 end;

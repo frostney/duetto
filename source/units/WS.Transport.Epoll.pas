@@ -563,7 +563,6 @@ begin
   // garbage in the tag half.
   Ev.data.u64 := QWord(Cardinal(FListenFd));
   epoll_ctl(FEpFd, EPOLL_CTL_ADD, FListenFd, @Ev);
-  OpenReserveFd;
 
   // Stop() must unblock a Run(-1) parked in epoll_wait from another
   // thread; an eventfd in the interest set is the wakeup channel.
@@ -574,6 +573,9 @@ begin
     Ev.data.u64 := QWord(Cardinal(FWakeFd));
     epoll_ctl(FEpFd, EPOLL_CTL_ADD, FWakeFd, @Ev);
   end;
+  // Last: with one descriptor left, the reserve must not be what takes
+  // it from the eventfd.
+  OpenReserveFd;
 end;
 
 destructor TWSEpollTransport.Destroy;
@@ -753,8 +755,12 @@ begin
   begin
     Ev.events := EPOLLIN;
     Ev.data.u64 := QWord(Cardinal(FListenFd));
-    epoll_ctl(FEpFd, EPOLL_CTL_ADD, FListenFd, @Ev);
-    FAcceptBackoffUntil := 0;
+    // The same pressure that forced the backoff (ENOMEM, ENOSPC) can fail
+    // the re-arm: keep a retry deadline, or the listener stays deaf.
+    if epoll_ctl(FEpFd, EPOLL_CTL_ADD, FListenFd, @Ev) = 0 then
+      FAcceptBackoffUntil := 0
+    else
+      FAcceptBackoffUntil := GetTickCount64 + QWord(AcceptBackoffMs);
   end
   else
   begin

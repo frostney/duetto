@@ -88,6 +88,7 @@ type
     FRegistryIndex: Integer;
     procedure Reschedule;
     procedure ArmDeadline(AMs: Integer);
+    procedure BeginDrain;
     procedure NoteActivity;
     procedure CheckClock(AConn: TWSConnection);
     procedure ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
@@ -296,10 +297,11 @@ type
       read FMaxConnections write FMaxConnections;
     // Milliseconds from accept until the 101 has been handed to the
     // transport. A peer that connects and trickles (or says nothing) is
-    // dropped when it lapses, silently — OnOpen never fired. The
-    // plaintext counterpart of TWSTransportTls.HandshakeDeadlineMs,
-    // which on a TLS listener only covers the TLS handshake; this clock
-    // runs after it, over the HTTP upgrade. Default 10 s; 0 = never.
+    // dropped when it lapses, silently — OnOpen never fired. On a TLS
+    // listener this clock also starts at accept, so it runs alongside
+    // TWSTransportTls.HandshakeDeadlineMs (which covers only the TLS
+    // handshake) and bounds TLS handshake plus HTTP upgrade together.
+    // Default 10 s; 0 = never.
     property HandshakeTimeoutMs: Integer
       read FHandshakeTimeoutMs write FHandshakeTimeoutMs;
     // Milliseconds a peer gets to finish what the server is waiting on
@@ -449,6 +451,18 @@ begin
   Reschedule;
 end;
 
+// Only queued output (a response, a close frame) stands between the
+// connection and its drop: give it the close budget, once. Peer
+// traffic must not extend it — NoteActivity skips a draining
+// connection — and there is nothing left to ping for.
+procedure TWSConnection.BeginDrain;
+begin
+  if FDropPending then Exit;
+  FDropPending := True;
+  FPingDue := 0;
+  ArmDeadline(FServer.FCloseTimeoutMs);
+end;
+
 // Bytes arrived from the peer: an open connection's idle and ping
 // clocks restart from now. Waiting states (handshake, close, drain)
 // keep their deadline — progress there is judged by state changes,
@@ -457,7 +471,21 @@ procedure TWSConnection.NoteActivity;
 var
   Now_: QWord;
 begin
-  if FState <> wcsOpen then Exit;
+  // A connection draining ahead of its drop is waiting too, even while
+  // FState is still wcsOpen (protocol failure, echoed Close).
+  if (FState <> wcsOpen) or FDropPending then Exit;
+  // Idle and ping both off (the defaults): no clock to restart, so no
+  // clock read per receive — only the handshake deadline to clear once.
+  if (FServer.FIdleTimeoutMs <= 0) and (FServer.FPingIntervalMs <= 0) then
+  begin
+    if (FDeadline <> 0) or (FPingDue <> 0) then
+    begin
+      FDeadline := 0;
+      FPingDue := 0;
+      Reschedule;
+    end;
+    Exit;
+  end;
   Now_ := GetTickCount64;
   if FServer.FIdleTimeoutMs > 0 then
     FDeadline := Now_ + QWord(FServer.FIdleTimeoutMs)
@@ -814,8 +842,11 @@ begin
   // Anything still pending is backpressure: the transport fires
   // OnSendReady when it can take more — up to a point. Past the cap the
   // peer has stopped reading, and the only thing left to bound is our
-  // memory.
-  if (FMaxPendingOutput > 0) and (AConn.FProto.OutPending > FMaxPendingOutput) then
+  // memory. A draining connection is exempt: its queue was filled in
+  // one step (a plain-HTTP answer, a 403, a close frame), nothing more
+  // can join it, and CloseTimeoutMs already bounds a peer not reading.
+  if (FMaxPendingOutput > 0) and not AConn.FDropPending
+    and (AConn.FProto.OutPending > FMaxPendingOutput) then
     Exit(DropConn(AConn));
 end;
 
@@ -866,8 +897,7 @@ begin
       AConn.FProto := TWSProtocol.Create(wsrServer, HS.Deflate, FMaxMessage);
       AConn.FProto.QueueRaw(@Resp[1], Length(Resp));
       AConn.FHsBuf := '';
-      AConn.FDropPending := True; // drop as soon as the response drains
-      AConn.ArmDeadline(FCloseTimeoutMs);
+      AConn.BeginDrain; // drop as soon as the response drains
       // Nested rather than `and`-ed: FlushConn returning False means the
       // connection was dropped and possibly freed, and the second test
       // would read OutPending out of it.
@@ -903,8 +933,7 @@ begin
       AConn.FProto := TWSProtocol.Create(wsrServer, HS.Deflate, FMaxMessage);
       AConn.FProto.QueueRaw(@Resp[1], Length(Resp));
       AConn.FHsBuf := '';
-      AConn.FDropPending := True;
-      AConn.ArmDeadline(FCloseTimeoutMs);
+      AConn.BeginDrain;
       if FlushConn(AConn) then
       begin
         if AConn.FProto.OutPending = 0 then
@@ -980,10 +1009,7 @@ begin
       if AConn.FProto.OutPending = 0 then
         DropConn(AConn)
       else
-      begin
-        AConn.FDropPending := True;
-        AConn.ArmDeadline(FCloseTimeoutMs);
-      end;
+        AConn.BeginDrain;
     end;
     Exit;
   end;
@@ -994,8 +1020,7 @@ begin
       Exit(DropConn(AConn));
     // Our close echo is stuck behind a peer that is not reading: give
     // it the close budget, not forever.
-    AConn.FDropPending := True;
-    AConn.ArmDeadline(FCloseTimeoutMs);
+    AConn.BeginDrain;
   end;
   Result := True;
 end;

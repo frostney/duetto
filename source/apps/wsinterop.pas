@@ -289,6 +289,11 @@ end;
 { TLimitsHost }
 
 const
+  // Sessions the limits section opens; each must see one OnClientClose.
+  // Linux adds the close-budget case that needs a closed socket's RST.
+  LimitsOpens = {$ifdef LINUX}8{$else}7{$endif};
+
+const
   CloseCue = 'close-me';
 
 constructor TLimitsHost.Create;
@@ -1624,7 +1629,7 @@ begin
   Elapsed := RawWaitForClose(Fd, 3000);
   CloseSocket(Fd);
   Limits.Snapshot(Opens, Closes);
-  Check((Elapsed >= 150) and (Elapsed < 3000) and (Opens = 0) and (Closes = 0),
+  Check((Elapsed >= 150) and (Elapsed < 1500) and (Opens = 0) and (Closes = 0),
     Format('stalled handshake dropped by the 300 ms budget (after %d ms), ' +
     'no OnOpen/OnClientClose', [Elapsed]));
 
@@ -1634,7 +1639,7 @@ begin
   Ok := RawReadCloseCode(Fd, nil) = 1000;
   Elapsed := RawWaitForClose(Fd, 3000);
   CloseSocket(Fd);
-  Check(Ok and (Elapsed >= 0) and (Elapsed < 3000),
+  Check(Ok and (Elapsed >= 0) and (Elapsed < 1500),
     Format('server-side Close with a mute peer dropped by the 300 ms ' +
     'budget (after %d ms)', [Elapsed]));
 
@@ -1646,7 +1651,7 @@ begin
   Elapsed := Integer(GetTickCount64 - LastTick);
   Ok := Ok and (RawWaitForClose(Fd, 3000) >= 0);
   CloseSocket(Fd);
-  Check(Ok and (Elapsed >= 400) and (Elapsed < 3000),
+  Check(Ok and (Elapsed >= 400) and (Elapsed < 2000),
     Format('silent open peer closed 1001 by the 600 ms idle bound ' +
     '(after %d ms), then dropped', [Elapsed]));
 
@@ -1691,6 +1696,11 @@ begin
   // land — and the transport's 300 ms close drain (a close deferred
   // behind a send the peer never takes) bounds the end on the transports
   // that defer.
+  // Idle and ping off for this case, so only the cap (and the close
+  // drain behind it) can end the connection: the idle bound must not be
+  // what passes it.
+  LimSrvT.Srv.IdleTimeoutMs := 0;
+  LimSrvT.Srv.PingIntervalMs := 0;
   Fd := RawUpgraded(LimPort, 4096);
   RawSetSendTimeout(Fd, 1000);
   SetLength(Chunk, 64 * 1024);
@@ -1710,6 +1720,34 @@ begin
     '(%d KiB accepted, %d KiB echoed back, connection ended %d ms ' +
     'after the flood)', [SentBytes div 1024, Length(Got) div 1024,
     Elapsed]));
+
+{$ifdef LINUX}
+  // A peer that sends Close, never reads the echo, and keeps sending:
+  // the echo is stuck behind megabytes of queued output (the cap is off
+  // here so the queue can build), so the server drains it under the
+  // 300 ms CloseTimeoutMs — and the peer's later bytes must not restart
+  // that budget. Linux only: the peer sees the drop through the RST a
+  // closed Linux socket answers further data with.
+  LimSrvT.Srv.MaxPendingOutput := 0;
+  Fd := RawUpgraded(LimPort, 4096);
+  RawSetSendTimeout(Fd, 1000);
+  for I := 1 to 160 do
+    if not RawSendFrame(Fd, WS_OP_BINARY, Chunk, True) then Break;
+  Ok := RawSendFrame(Fd, WS_OP_CLOSE, #$03#$E8, True);
+  LastTick := GetTickCount64;
+  repeat
+    Sleep(50);
+    if not RawSendFrame(Fd, WS_OP_TEXT, 'x', True) then Break;
+  until GetTickCount64 - LastTick > 4000;
+  Elapsed := Integer(GetTickCount64 - LastTick);
+  CloseSocket(Fd);
+  LimSrvT.Srv.MaxPendingOutput := 1024 * 1024;
+  Check(Ok and (Elapsed < 2500),
+    Format('peer traffic after its Close does not extend the 300 ms ' +
+    'close budget (dropped %d ms after the Close)', [Elapsed]));
+{$endif}
+  LimSrvT.Srv.IdleTimeoutMs := 600;
+  LimSrvT.Srv.PingIntervalMs := 200;
 
   // Connection cap: two in, the third is closed before any response;
   // once one leaves, the next is admitted.
@@ -1747,7 +1785,7 @@ begin
     if (Opens = Closes) then Break;
     Sleep(10);
   until GetTickCount64 > Deadline;
-  Check((Opens = 7) and (Closes = 7),
+  Check((Opens = LimitsOpens) and (Closes = LimitsOpens),
     Format('limits section: every OnOpen paired with one OnClientClose ' +
     '(%d/%d)', [Opens, Closes]));
 
