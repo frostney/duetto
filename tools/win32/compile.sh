@@ -2,8 +2,9 @@
 # Cross-compile one duetto program for i386-win32.
 #   compile-win32 <program-name> [/workspace] [/out]
 # The repository is mounted read-only at /workspace; units and the .exe
-# land under /out. Unit paths mirror lwpt.cfg (own units + the three
-# fetched lwpt packages); the toolchain flags mirror lwpt's win32 leg.
+# land under /out. The project's unit paths come from the committed
+# lwpt.cfg (own units + the fetched lwpt packages); the toolchain
+# flags mirror lwpt's win32 leg.
 set -euo pipefail
 program=${1:?program name (wsinterop, wsecho, ...)}
 repo=${2:-/workspace}
@@ -16,8 +17,5 @@ cd "${repo}"
   -Fu"${units}/rtl" -Fu"${units}/rtl-objpas" -Fu"${units}/rtl-generics" -Fu"${units}/rtl-extra" \
   -Fu"${units}/fcl-process" -Fu"${units}/paszlib" -Fu"${units}/hash" \
   -Fu/opt/fpc-source/packages/fcl-base/src -Fu/opt/fpc-source/packages/fcl-net/src \
-  -Fusource/units -Fisource/units \
-  -Fu.lwpt/modules/httpclient/packages/httpclient/source -Fi.lwpt/modules/httpclient/packages/httpclient/source \
-  -Fu.lwpt/modules/testing/packages/testing/source -Fi.lwpt/modules/testing/packages/testing/source \
-  -Fu.lwpt/modules/cli/packages/cli/source -Fi.lwpt/modules/cli/packages/cli/source \
+  @lwpt.cfg \
   -FU"${out}/units" -FE"${out}" "source/apps/${program}.pas"

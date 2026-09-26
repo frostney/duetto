@@ -128,7 +128,7 @@ architecture — the images are emulated where needed):
 
 ```bash
 tools/win32-wine.sh                  # build the two images if missing, run wsinterop
-tools/win32-wine.sh wsecho --port=9001
+DUETTO_WIN32_PUBLISH=9001 tools/win32-wine.sh wsecho --port=9001  # reachable on 127.0.0.1:9001
 DUETTO_WIN32_REBUILD=1 tools/win32-wine.sh
 ```
 
