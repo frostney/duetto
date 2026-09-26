@@ -172,25 +172,48 @@ begin
   Result := ASize / (1024.0 * 1024 * 1024) * Reps / ((Now64 - T) / MicrosPerSec);
 end;
 
+// Times A and B in the order A, B, B, A and keeps each one's best, so
+// neither always runs first (cache state, clock drift) — and in separate
+// statements: the evaluation order of Format's argument list is not
+// defined.
+procedure TimePair(AProcA, AProcB: TCopyProc; ASrc, ADst: PByte;
+  ASize: PtrUInt; out AGbA, AGbB: Double);
+var
+  Gb: Double;
+begin
+  AGbA := TimeCopy(AProcA, ASrc, ADst, ASize);
+  AGbB := TimeCopy(AProcB, ASrc, ADst, ASize);
+  Gb := TimeCopy(AProcB, ASrc, ADst, ASize);
+  if Gb > AGbB then AGbB := Gb;
+  Gb := TimeCopy(AProcA, ASrc, ADst, ASize);
+  if Gb > AGbA then AGbA := Gb;
+end;
+
 procedure BenchCopy;
 const
   Sizes: array[0..2] of Integer = (1024, 16 * 1024, 256 * 1024);
 var
   Src, Dst: TBytes;
   I: Integer;
+  GbA, GbB: Double;
 begin
   SetLength(Src, 256 * 1024);
   SetLength(Dst, 256 * 1024);
   for I := 0 to High(Src) do Src[I] := Byte(I);
-  WriteLn('-- payload copy (cache-warm, repeated for ', MaskSecs:0:1, ' s each) --');
+  WriteLn('-- payload copy (cache-warm, best of two ', MaskSecs:0:1,
+    ' s runs each, interleaved) --');
   for I := 0 to High(Sizes) do
+  begin
+    TimePair(RtlMove, MovePayloadProc, PByte(Src), PByte(Dst), Sizes[I], GbA, GbB);
     WriteLn(Format('%7d B : RTL Move %6.1f GB/s   MovePayload %6.1f GB/s',
-      [Sizes[I], TimeCopy(RtlMove, PByte(Src), PByte(Dst), Sizes[I]),
-       TimeCopy(MovePayloadProc, PByte(Src), PByte(Dst), Sizes[I])]));
+      [Sizes[I], GbA, GbB]));
+  end;
   for I := 0 to High(Sizes) do
+  begin
+    TimePair(CopyThenMask, MaskCopyProc, PByte(Src), PByte(Dst), Sizes[I], GbA, GbB);
     WriteLn(Format('%7d B : copy+unmask %6.1f GB/s   ApplyMaskCopy %6.1f GB/s',
-      [Sizes[I], TimeCopy(CopyThenMask, PByte(Src), PByte(Dst), Sizes[I]),
-       TimeCopy(MaskCopyProc, PByte(Src), PByte(Dst), Sizes[I])]));
+      [Sizes[I], GbA, GbB]));
+  end;
 end;
 
 procedure BenchFrameParse;
