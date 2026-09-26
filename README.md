@@ -14,7 +14,7 @@ live-socket battery, and the Autobahn testsuite. See
 ## Install
 
 ```toml
-duetto = "frostney/duetto@^0.1.0"   # in lwpt.toml [dependencies]
+duetto = "frostney/duetto@^0.4.0"   # in lwpt.toml [dependencies]
 ```
 
 ## Usage
@@ -63,9 +63,11 @@ implementation. Measured numbers against Rust and Python peers live in
 
 Install the [lwpt](https://github.com/frostney/lwpt) release binary,
 then `lwpt install` + `lwpt test`. See
-[docs/quick-start.md](docs/quick-start.md).
+[docs/quick-start.md](docs/quick-start.md) and
+[CONTRIBUTING.md](CONTRIBUTING.md) for the merge gate.
 
 ## References
 
 - [Agent instructions](AGENTS.md)
+- [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md)
 - [License](LICENSE) (MIT)

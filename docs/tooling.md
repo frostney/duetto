@@ -5,7 +5,7 @@
 - FPC **3.2.2** (Delphi mode) is the pinned compiler; the [lwpt](https://github.com/frostney/lwpt) **0.7.0 release binary** is the single toolchain entry point for install / build / test / format.
 - The Autobahn testsuite runs via Docker (`crossbario/autobahn-testsuite`) through `tools/autobahn.sh`, judged by `tools/autobahn-check.py`.
 - Lefthook runs `lwpt format` pre-commit; markdownlint and the PR workflow are the blocking gates.
-- CI: `pr.yml` is the fast Ubuntu pre-merge gate, `ci.yml` (push to main) adds the platform matrix and the Autobahn suite.
+- CI: `pr.yml` is the pre-merge gate (native Linux, macOS and win64), `ci.yml` (push to main) adds the per-arch platform matrix and the Autobahn suite.
 - Changelog generation is git-cliff from Conventional Commits (`cliff.toml`).
 
 ## Toolchain
@@ -24,7 +24,10 @@
 lwpt install         # resolve deps, regenerate lwpt.cfg + lwpt.lock
 lwpt install --frozen  # CI mode: verify lockfile + committed modules, refuse network
 lwpt format          # rewrite Pascal sources in place
-lwpt format --check  # CI / hook form: exit non-zero on drift
+lwpt format --check  # CI form: exit non-zero on drift (the hook rewrites in place)
+lwpt agents --check  # CI form: the generated AGENTS.md block must be current
+lwpt health          # complexity ceilings from [health] in lwpt.toml
+lwpt duplication     # clone ceiling from [duplication] in lwpt.toml
 lwpt build [target]  # binaries land under build/
 lwpt test            # discovers source/units/*.Test.pas
 ./build/wsinterop    # live-socket E2E battery
@@ -47,7 +50,7 @@ Industry conformance fuzzing, run in both directions via
 `crossbario/autobahn-testsuite` (Docker):
 
 ```bash
-tools/autobahn.sh server   # suite fuzzes build/wsecho (Linux only: epoll + host networking)
+tools/autobahn.sh server   # suite fuzzes build/wsecho (Linux only: Docker host networking)
 tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
 ```
 
@@ -151,5 +154,7 @@ job).
 
 ## Markdown
 
-markdownlint-cli2 (config: `.markdownlint-cli2.jsonc`) lints every
-committed Markdown file; the PR `docs` job is blocking.
+markdownlint-cli2 (config: `.markdownlint-cli2.jsonc`) lints the
+committed Markdown files not listed in that config's `ignores` (fetched
+skills, `CHANGELOG.md` and the like are excluded); the PR `docs` job is
+blocking.
