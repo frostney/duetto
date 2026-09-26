@@ -123,6 +123,32 @@ Proven by the native-Autobahn spike (issue #10, run 29694505585:
 recipe validated in five pushes, graduated as the `autobahn-macos`
 job).
 
+## Windows without Windows (Wine)
+
+`tools/win32-wine.sh` cross-compiles a program for i386-win32 and runs
+it under Wine 8, both inside Docker (OrbStack or Docker Desktop, any host
+architecture — the images are emulated where needed):
+
+```bash
+tools/win32-wine.sh                  # build the two images if missing, run wsinterop
+DUETTO_WIN32_PUBLISH=9001 tools/win32-wine.sh wsecho --port=9001  # reachable on 127.0.0.1:9001
+DUETTO_WIN32_REBUILD=1 tools/win32-wine.sh
+```
+
+The whole `wsinterop` battery — the IOCP transport, WinSock2 client,
+the limits section — passes under Wine in about 20 seconds after the
+one-off image builds (`duetto-win32-cross:3.2.2`, an FPC 3.2.2 cross
+toolchain built from the checksum-verified source tarball, ~2 minutes;
+`duetto-wine32:bookworm`, Wine on 32-bit Debian with its prefix
+pre-created). It is the fast pre-push loop for anything touching
+`WS.Transport.Iocp`, and it reproduces IOCP-specific behaviour the
+other transports do not show (a dropped connection keeps draining
+input behind its FIN, for one). It is not a substitute for the CI legs:
+real kernel, SChannel, and win64 only run there — Wine's SChannel is
+absent, so `wss://` stays untested locally, and win32 is the only Wine
+target because Wine's win64 needs a 64-bit userland the i386 image
+does not carry.
+
 ## Markdown
 
 markdownlint-cli2 (config: `.markdownlint-cli2.jsonc`) lints the
