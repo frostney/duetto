@@ -1,5 +1,6 @@
-// SPIKE (never merge): call a function shared from frostney/coderabbit.
+// SPIKE (never merge): shared function + the lock via a JSON import attribute.
 import { defineConfig, includeRemote } from "@coderabbitai/config"
+import lock from "./skills-lock.json" with { type: "json" }
 
 const skills = includeRemote({
   path: "lib/skills.ts",
@@ -9,6 +10,6 @@ const skills = includeRemote({
 export default defineConfig({
   inheritance: true,
   reviews: {
-    path_filters: skills.vendoredSkillFilters(["code-review", "deliver"]),
+    path_filters: skills.vendoredSkillFilters(Object.keys(lock.skills)),
   },
 })
