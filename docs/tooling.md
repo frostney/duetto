@@ -182,7 +182,8 @@ does not carry.
 
 CodeRabbit reads `.coderabbit.config.ts`, which inherits the central
 `frostney/coderabbit` settings and the web-UI settings (`inheritance:
-true`) and excludes the vendored Agent Skills from review. Every skill
+true`) and excludes the vendored Agent Skills from review, using the
+shared `excludeVendoredSkills` function from `frostney/coderabbit`. Every skill
 listed in `skills-lock.json` is installed from upstream by the skills CLI
 and refreshed by `.github/workflows/update-project-skills.yml`, so findings
 on it belong upstream. A skill under `.agents/skills` that the lock does
