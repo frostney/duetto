@@ -2339,8 +2339,8 @@ begin
 end;
 
 procedure RunServerTlsSection;
+{$ifdef LINUX}
 var
-  {$ifdef LINUX}
   TlsDir, TlsUrl: string;
   TlsCfg: TWSTransportTls;
   TlsSrvT: TServerThread;
