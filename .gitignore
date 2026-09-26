@@ -30,6 +30,13 @@ tests/autobahn/reports/
 # job (globs **/*.md) never lints .agent/HANDOFF.md.
 .agent/
 
+# Contender/tool build output that never belongs in the tree
+# (tools/rust-echo's Cargo.lock stays committed: the contender builds the
+# same dependency versions on every machine).
+tools/rust-echo/target/
+__pycache__/
+*.pyc
+
 # OS noise.
 .DS_Store
 Thumbs.db

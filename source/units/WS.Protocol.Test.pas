@@ -5,8 +5,14 @@
   direction, fail-fast UTF-8 (a bad byte in fragment one must kill the
   connection before FIN arrives), close-code policing on the wire, the
   message-size guillotine, and byte-by-byte ingest to exercise every
-  carry-buffer path. Wire close codes are asserted by parsing the actual
-  queued close frame, not by trusting the property. }
+  carry-buffer path. The delivery suite pins both payload paths: a whole
+  frame is handed over from the ingested buffer itself, a frame split
+  across reads is assembled, and either way the bytes are the payload.
+  The direct-send suite pins the gather-write contract: when a header
+  may be built at all, and that whatever part of header + payload the
+  transport did not take lands in the out queue byte for byte.
+  Wire close codes are asserted by parsing the actual queued close frame,
+  not by trusting the property. }
 
 program WS.Protocol.Test;
 
@@ -26,6 +32,8 @@ type
     MsgCount: Integer;
     LastText: Boolean;
     LastMsg: TBytes;
+    LastPtr: PByte;             // where the protocol pointed, for in-place checks
+    History: array of TBytes;   // every message, in delivery order
     Pings, Pongs: Integer;
     LastPing: TBytes;
     CloseFired: Boolean;
@@ -77,6 +85,30 @@ type
     procedure TestBadUtf8CloseReason;
     procedure TestDataAfterCloseIgnored;
     procedure TestOversizeMessage;
+    procedure TestSendCloseWireCodes;
+    procedure TestOversizeHeaderBeyond32Bits;
+    procedure TestNegativeCapRejects;
+  end;
+
+  TProtoDelivery = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestWholeFrameInPlace;
+    procedure TestPipelinedFrames;
+    procedure TestSplitAtEveryCut;
+    procedure TestSplitTextAtEveryCut;
+    procedure TestBadUtf8WholeFrame;
+    procedure TestFragmentsAssembled;
+    procedure TestClientWholeFrameInPlace;
+    procedure TestEmptyFirstFragment;
+  end;
+
+  TProtoDirect = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestHeaderOnlyWhenEligible;
+    procedure TestHeaderMatchesQueuedFrame;
+    procedure TestRemainderForEveryTakenCount;
   end;
 
   TProtoDeflate = class(TTestSuite)
@@ -100,8 +132,11 @@ procedure TSink.OnMsg(AText: Boolean; P: PByte; ALen: NativeInt);
 begin
   Inc(MsgCount);
   LastText := AText;
+  LastPtr := P;
   SetLength(LastMsg, ALen);
   if ALen > 0 then Move(P^, LastMsg[0], ALen);
+  SetLength(History, Length(History) + 1);
+  History[High(History)] := System.Copy(LastMsg, 0, ALen);
 end;
 
 procedure TSink.OnPing(P: PByte; ALen: NativeInt);
@@ -719,6 +754,94 @@ begin
   end;
 end;
 
+procedure TProtoClose.TestSendCloseWireCodes;
+const
+  // code, what the wire carries (1005 = no-status form)
+  Cases: array[0..9] of record Code, Wire: Word end = (
+    (Code: 1000; Wire: 1000), (Code: 1001; Wire: 1001),
+    (Code: 3000; Wire: 3000), (Code: 4999; Wire: 4999),
+    (Code: 1004; Wire: 1005), (Code: 1005; Wire: 1005),
+    (Code: 1006; Wire: 1005), (Code: 1015; Wire: 1005),
+    (Code: 999;  Wire: 1005), (Code: 5000; Wire: 1005)
+  );
+var
+  C, S: TWSProtocol;
+  CS, SS: TSink;
+  I: Integer;
+begin
+  // Whatever the application asks for is what it reads back locally;
+  // the wire only ever carries a code the peer may legally receive —
+  // §7.4.1 forbids 1005/1006/1015 in a close frame, and a conformant
+  // peer answers any other reserved or out-of-range code with 1002.
+  for I := 0 to High(Cases) do
+  begin
+    CS := TSink.Create; SS := TSink.Create;
+    C := Hook(TWSProtocol.Create(wsrClient, NoDeflate), CS);
+    S := Hook(TWSProtocol.Create(wsrServer, NoDeflate), SS);
+    try
+      C.SendClose(Cases[I].Code, 'x');
+      Expect<Integer>(Integer(C.CloseCode)).ToBe(Integer(Cases[I].Code));
+      Expect<Integer>(Integer(WireCloseCode(C))).ToBe(Integer(Cases[I].Wire));
+      Pump(C, S);
+      Expect<Boolean>(SS.CloseFired).ToBe(True);
+      Expect<Integer>(Integer(SS.CloseCode)).ToBe(Integer(Cases[I].Wire));
+      Expect<Boolean>(S.Failed).ToBe(False);
+      Expect<Boolean>(C.CloseDone and S.CloseDone).ToBe(True);
+    finally
+      C.Free; S.Free; CS.Free; SS.Free;
+    end;
+  end;
+end;
+
+procedure TProtoClose.TestOversizeHeaderBeyond32Bits;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Hdr: TBytes;
+begin
+  // A masked binary frame announcing 2^32 + 1 payload bytes, header
+  // only. The cap check must compare in the header's 64-bit width: a
+  // 32-bit build that narrowed first would see length 1, admit the
+  // frame, and start buffering whatever the peer then sends.
+  SS := TSink.Create;
+  S := NewServer(SS, 64);
+  try
+    SetLength(Hdr, 14);
+    Hdr[0] := $80 or WS_OP_BINARY;             // FIN, binary
+    Hdr[1] := $80 or 127;                      // masked, 64-bit length
+    FillChar(Hdr[2], 8, 0);
+    Hdr[5] := 1;                               // 0x0000000100000001
+    Hdr[9] := 1;
+    Hdr[10] := 1; Hdr[11] := 2; Hdr[12] := 3; Hdr[13] := 4; // mask key
+    Expect<Boolean>(S.Ingest(@Hdr[0], Length(Hdr))).ToBe(False);
+    Expect<Integer>(Integer(WireCloseCode(S))).ToBe(1009);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
+procedure TProtoClose.TestNegativeCapRejects;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  One: TBytes;
+begin
+  // The caps compare unsigned: a negative cap must not wrap to 2^64 - 1
+  // and admit every message.
+  SS := TSink.Create;
+  S := NewServer(SS, -1);
+  try
+    SetLength(One, 1);
+    One[0] := Ord('a');
+    Expect<Boolean>(IngestAll(S, [
+      BuildFrame(WS_OP_BINARY, True, False, False, True, One, $01020304)
+    ])).ToBe(False);
+    Expect<Integer>(Integer(WireCloseCode(S))).ToBe(1009);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
 { ───────── permessage-deflate end to end ───────── }
 
 // Run the REAL handshake to get both sides' negotiated params, then build
@@ -867,7 +990,237 @@ begin
   Test('one-byte close payload -> 1002',       TestOneByteClosePayload);
   Test('bad UTF-8 close reason -> 1007',       TestBadUtf8CloseReason);
   Test('data after close is discarded',        TestDataAfterCloseIgnored);
+  Test('SendClose puts only legal codes on the wire', TestSendCloseWireCodes);
+  Test('2^32+1 header fails 1009 before any payload', TestOversizeHeaderBeyond32Bits);
   Test('message over cap -> 1009',             TestOversizeMessage);
+  Test('negative cap rejects, never unbounds', TestNegativeCapRejects);
+end;
+
+{ ───────── payload delivery paths ───────── }
+
+function Pattern(ALen: Integer; ASeed: Byte): TBytes;
+var
+  I: Integer;
+begin
+  SetLength(Result, ALen);
+  for I := 0 to ALen - 1 do Result[I] := Byte(I * 31 + ASeed);
+end;
+
+// Ingest AFrame whole and count what is off: not exactly one message,
+// wrong bytes, or a pointer outside the ingested buffer (i.e. handed over
+// from a protocol copy rather than in place).
+function InPlaceFailures(P: TWSProtocol; ASink: TSink;
+  const AFrame, APayload: TBytes): Integer;
+var
+  Wire_: TBytes;
+begin
+  Result := 0;
+  Wire_ := System.Copy(AFrame, 0, Length(AFrame));
+  if not P.Ingest(@Wire_[0], Length(Wire_)) then Inc(Result);
+  if ASink.MsgCount <> 1 then Inc(Result);
+  if not SameBytes(ASink.LastMsg, APayload) then Inc(Result);
+  if (ASink.LastPtr < PByte(@Wire_[0])) or
+     (ASink.LastPtr >= PByte(@Wire_[0]) + Length(Wire_)) then
+    Inc(Result);
+end;
+
+procedure TProtoDelivery.TestWholeFrameInPlace;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Payload: TBytes;
+begin
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    Payload := Pattern(1000, 7);
+    Expect<Integer>(InPlaceFailures(S, SS,
+      BuildFrame(WS_OP_BINARY, True, False, False, True, Payload, $A1B2C3D4),
+      Payload)).ToBe(0);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
+procedure TProtoDelivery.TestPipelinedFrames;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  A, B, C, Wire_: TBytes;
+begin
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    A := Bytes('first');
+    B := Pattern(70000, 3);   // 64-bit length encoding
+    C := Bytes('third, and last');
+    Wire_ := Concat(
+      BuildFrame(WS_OP_TEXT, True, False, False, True, A, $11223344),
+      BuildFrame(WS_OP_BINARY, True, False, False, True, B, $55667788),
+      BuildFrame(WS_OP_TEXT, True, False, False, True, C, $99AABBCC));
+    Expect<Boolean>(S.Ingest(@Wire_[0], Length(Wire_))).ToBe(True);
+    Expect<Integer>(Length(SS.History)).ToBe(3);
+    Expect<Boolean>(SameBytes(SS.History[0], A)).ToBe(True);
+    Expect<Boolean>(SameBytes(SS.History[1], B)).ToBe(True);
+    Expect<Boolean>(SameBytes(SS.History[2], C)).ToBe(True);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
+// Cut AFrame into two reads at every offset, header included, feeding a
+// fresh server each time; count the cuts where the delivered message is
+// not exactly APayload (with the right text flag).
+function SplitSweepFailures(const AFrame, APayload: TBytes;
+  AText: Boolean): Integer;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Part1, Part2: TBytes;
+  Cut: Integer;
+begin
+  Result := 0;
+  for Cut := 1 to Length(AFrame) - 1 do
+  begin
+    SS := TSink.Create;
+    S := NewServer(SS);
+    try
+      Part1 := System.Copy(AFrame, 0, Cut);
+      Part2 := System.Copy(AFrame, Cut, Length(AFrame) - Cut);
+      if not S.Ingest(@Part1[0], Length(Part1)) then Inc(Result);
+      if not S.Ingest(@Part2[0], Length(Part2)) then Inc(Result);
+      if (SS.MsgCount <> 1) or (SS.LastText <> AText) or
+         (not SameBytes(SS.LastMsg, APayload)) then
+        Inc(Result);
+    finally
+      S.Free; SS.Free;
+    end;
+  end;
+end;
+
+procedure TProtoDelivery.TestSplitAtEveryCut;
+var
+  Payload: TBytes;
+begin
+  Payload := Pattern(300, 11);
+  Expect<Integer>(SplitSweepFailures(
+    BuildFrame(WS_OP_BINARY, True, False, False, True, Payload, $0F1E2D3C),
+    Payload, False)).ToBe(0);
+end;
+
+// Multibyte code points, so every cut also splits UTF-8 validation at a
+// different byte.
+procedure TProtoDelivery.TestSplitTextAtEveryCut;
+var
+  Payload: TBytes;
+begin
+  Payload := Bytes('Größe · 大きさ · размер · ' + 'ε' + ' 🎈 done');
+  Expect<Integer>(SplitSweepFailures(
+    BuildFrame(WS_OP_TEXT, True, False, False, True, Payload, $C0FFEE11),
+    Payload, True)).ToBe(0);
+end;
+
+procedure TProtoDelivery.TestBadUtf8WholeFrame;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Bad: TBytes;
+begin
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    Bad := Bytes('ok so far ');
+    SetLength(Bad, Length(Bad) + 2);
+    Bad[High(Bad) - 1] := $E2; Bad[High(Bad)] := $28; // broken sequence
+    Expect<Boolean>(IngestAll(S, [
+      BuildFrame(WS_OP_TEXT, True, False, False, True, Bad, $01020304)
+    ])).ToBe(False);
+    Expect<Integer>(SS.MsgCount).ToBe(0);
+    Expect<Integer>(Integer(WireCloseCode(S))).ToBe(1007);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
+// A fragmented message never takes the in-place path: each fragment is
+// complete in the buffer, but the message is not.
+procedure TProtoDelivery.TestFragmentsAssembled;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  P1, P2, Whole, Wire_: TBytes;
+begin
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    P1 := Pattern(500, 1);
+    P2 := Pattern(700, 2);
+    Whole := Concat(P1, P2);
+    Wire_ := Concat(
+      BuildFrame(WS_OP_BINARY, False, False, False, True, P1, $0A0B0C0D),
+      BuildFrame(WS_OP_CONT, True, False, False, True, P2, $1A2B3C4D));
+    Expect<Boolean>(S.Ingest(@Wire_[0], Length(Wire_))).ToBe(True);
+    Expect<Integer>(SS.MsgCount).ToBe(1);
+    Expect<Boolean>(SameBytes(SS.LastMsg, Whole)).ToBe(True);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
+// Client role: server frames are unmasked, and a whole one is handed over
+// from the ingested buffer just the same.
+procedure TProtoDelivery.TestClientWholeFrameInPlace;
+var
+  C: TWSProtocol;
+  CS: TSink;
+  Payload: TBytes;
+begin
+  CS := TSink.Create;
+  C := Hook(TWSProtocol.Create(wsrClient, NoDeflate), CS);
+  try
+    Payload := Pattern(2000, 4);
+    Expect<Integer>(InPlaceFailures(C, CS,
+      BuildFrame(WS_OP_BINARY, True, False, False, False, Payload, 0),
+      Payload)).ToBe(0);
+  finally
+    C.Free; CS.Free;
+  end;
+end;
+
+// An empty non-final fragment assembles nothing, so its final
+// continuation is the whole message and may be delivered in place.
+procedure TProtoDelivery.TestEmptyFirstFragment;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Tail, Wire_: TBytes;
+begin
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    Tail := Bytes('all of it is in the continuation');
+    Wire_ := Concat(
+      BuildFrame(WS_OP_TEXT, False, False, False, True, nil, $01020304),
+      BuildFrame(WS_OP_CONT, True, False, False, True, Tail, $05060708));
+    Expect<Boolean>(S.Ingest(@Wire_[0], Length(Wire_))).ToBe(True);
+    Expect<Integer>(SS.MsgCount).ToBe(1);
+    Expect<Boolean>(SS.LastText).ToBe(True);
+    Expect<Boolean>(SameBytes(SS.LastMsg, Tail)).ToBe(True);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
+procedure TProtoDelivery.SetupTests;
+begin
+  Test('whole frame delivered from the ingested buffer', TestWholeFrameInPlace);
+  Test('pipelined frames in one read, in order',   TestPipelinedFrames);
+  Test('binary frame split at every cut',          TestSplitAtEveryCut);
+  Test('multibyte text frame split at every cut',  TestSplitTextAtEveryCut);
+  Test('bad UTF-8 in a whole frame closes 1007',   TestBadUtf8WholeFrame);
+  Test('fragmented message is assembled',          TestFragmentsAssembled);
+  Test('client role: whole frame delivered in place', TestClientWholeFrameInPlace);
+  Test('empty first fragment, final continuation',  TestEmptyFirstFragment);
 end;
 
 procedure TProtoDeflate.SetupTests;
@@ -878,12 +1231,134 @@ begin
   Test('byte-by-byte compressed ingest',       TestByteByByteCompressed);
 end;
 
+{ ───────── direct (gather-write) send ───────── }
+
+function QueuedBytes(P: TWSProtocol): TBytes;
+begin
+  SetLength(Result, P.OutPending);
+  if Length(Result) > 0 then Move(P.OutPtr^, Result[0], Length(Result));
+end;
+
+procedure TProtoDirect.TestHeaderOnlyWhenEligible;
+var
+  S, C, SD, CD: TWSProtocol;
+  SS: TSink;
+  Hdr: TWSFrameHeaderBuf;
+begin
+  SS := TSink.Create;
+  S := NewServer(SS);
+  C := TWSProtocol.Create(wsrClient, NoDeflate);
+  NegotiatedPair(CD, SD);
+  try
+    // Server, nothing queued, no deflate: eligible.
+    Expect<Integer>(S.DirectHeader(False, 100, Hdr)).ToBe(2);
+    Expect<Integer>(S.DirectHeader(True, 70000, Hdr)).ToBe(10);
+    // Client frames are masked into our own copy: never direct.
+    Expect<Integer>(C.DirectHeader(False, 100, Hdr)).ToBe(0);
+    // Deflate rewrites the payload: never direct.
+    Expect<Integer>(SD.DirectHeader(False, 100, Hdr)).ToBe(0);
+    // Something already queued: a direct write would overtake it.
+    S.SendPing(nil, 0);
+    Expect<Integer>(S.DirectHeader(False, 100, Hdr)).ToBe(0);
+    S.OutConsume(S.OutPending);
+    Expect<Integer>(S.DirectHeader(False, 100, Hdr)).ToBe(2);
+    // Close sent: data must be dropped, as SendBinary would.
+    S.SendClose(1000, '');
+    S.OutConsume(S.OutPending);
+    Expect<Integer>(S.DirectHeader(False, 100, Hdr)).ToBe(0);
+  finally
+    S.Free; C.Free; SD.Free; CD.Free; SS.Free;
+  end;
+end;
+
+// Header + payload sent directly must be byte-identical to the frame
+// SendBinary / SendText would have queued.
+procedure TProtoDirect.TestHeaderMatchesQueuedFrame;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Hdr: TWSFrameHeaderBuf;
+  Payload, Queued, Direct: TBytes;
+  HLen, I, Bad: Integer;
+  Sizes: array[0..4] of Integer = (0, 125, 126, 65535, 65536);
+begin
+  Bad := 0;
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    for I := 0 to High(Sizes) do
+    begin
+      Payload := Pattern(Sizes[I], 9);
+      S.SendBinary(PByte(Payload), Length(Payload));
+      Queued := QueuedBytes(S);
+      S.OutConsume(S.OutPending);
+      HLen := S.DirectHeader(False, Length(Payload), Hdr);
+      SetLength(Direct, HLen);
+      Move(Hdr[0], Direct[0], HLen);
+      Direct := Concat(Direct, Payload);
+      if not SameBytes(Direct, Queued) then Inc(Bad);
+    end;
+    S.SendText('text opcode');
+    Queued := QueuedBytes(S);
+    S.OutConsume(S.OutPending);
+    HLen := S.DirectHeader(True, 11, Hdr);
+    if (HLen <> 2) or (Hdr[0] <> Queued[0]) or (Hdr[1] <> Queued[1]) then
+      Inc(Bad);
+  finally
+    S.Free; SS.Free;
+  end;
+  Expect<Integer>(Bad).ToBe(0);
+end;
+
+// For every possible "bytes taken" 0..HLen+Len, the out queue must hold
+// exactly the untaken tail of header + payload.
+procedure TProtoDirect.TestRemainderForEveryTakenCount;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  Hdr: TWSFrameHeaderBuf;
+  Payload, Whole, Tail: TBytes;
+  HLen, Taken, Bad: Integer;
+begin
+  Bad := 0;
+  Payload := Pattern(300, 5);
+  SS := TSink.Create;
+  S := NewServer(SS);
+  try
+    HLen := S.DirectHeader(False, Length(Payload), Hdr);
+    SetLength(Whole, HLen);
+    Move(Hdr[0], Whole[0], HLen);
+    Whole := Concat(Whole, Payload);
+    for Taken := 0 to Length(Whole) do
+    begin
+      S.DirectSent(Hdr, HLen, PByte(Payload), Length(Payload), Taken);
+      Tail := System.Copy(Whole, Taken, Length(Whole) - Taken);
+      if not SameBytes(QueuedBytes(S), Tail) then Inc(Bad);
+      S.OutConsume(S.OutPending);
+    end;
+  finally
+    S.Free; SS.Free;
+  end;
+  Expect<Integer>(Bad).ToBe(0);
+end;
+
+procedure TProtoDirect.SetupTests;
+begin
+  Test('header only for server, no deflate, empty queue, open',
+                                                   TestHeaderOnlyWhenEligible);
+  Test('header + payload = the frame SendBinary queues',
+                                                   TestHeaderMatchesQueuedFrame);
+  Test('untaken tail queued for every taken count', TestRemainderForEveryTakenCount);
+end;
+
 begin
   NoDeflate.Reset;
   TestRunnerProgram.AddSuite(TProtoEcho.Create('Protocol: echo'));
   TestRunnerProgram.AddSuite(TProtoFraming.Create('Protocol: framing rules'));
   TestRunnerProgram.AddSuite(TProtoUtf8.Create('Protocol: UTF-8 policing'));
   TestRunnerProgram.AddSuite(TProtoClose.Create('Protocol: close handshake'));
+  TestRunnerProgram.AddSuite(TProtoDelivery.Create('Protocol: payload delivery'));
+  TestRunnerProgram.AddSuite(TProtoDirect.Create('Protocol: direct send'));
   TestRunnerProgram.AddSuite(TProtoDeflate.Create('Protocol: permessage-deflate'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;

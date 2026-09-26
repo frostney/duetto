@@ -40,6 +40,13 @@ type
   // Outcome of the bounded ReadMessage overload.
   TWSReadResult = (wrrMessage, wrrTimeout, wrrClosed);
 
+  // A pointer-to-bytes view wide enough that an open-array parameter
+  // sees the caller's length, never its own: lwpt's TransportSecurityRead
+  // clamps to Length(ABuffer), and a dereferenced PByte is an open array
+  // of exactly one element.
+  TWSByteSpan = array[0..MaxInt - 1] of Byte;
+  PWSByteSpan = ^TWSByteSpan;
+
   TWSClient = class
   private
     FSock: TWSPlatformSocket;
@@ -319,7 +326,7 @@ end;
 function TWSClient.RawRead(P: PByte; ALen: Integer): Integer;
 begin
   if FUseTls then
-    Result := TransportSecurityRead(FTls, PByte(P)^, ALen)
+    Result := TransportSecurityRead(FTls, PWSByteSpan(P)^, ALen)
   else
     {$ifdef UNIX}
     Result := fpRecv(FSock, P, ALen, 0);

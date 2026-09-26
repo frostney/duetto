@@ -1,5 +1,6 @@
 { WS.Deflate.Test — RFC 7692 round trips (empty message, text, 100 KB
-  random, 1 MB zeros), the §7.2.3.6 empty-message-becomes-#$00 rule,
+  random, 1 MB zeros, incompressible stored blocks delivered in one Feed),
+  the §7.2.3.6 empty-message-becomes-#$00 rule,
   context takeover semantics observable from the wire (a repeated message
   compresses smaller when the window is shared, and does not when
   no_context_takeover resets it), the decompression-bomb output cap, and
@@ -24,6 +25,7 @@ type
     procedure TestRandom100K;
     procedure TestZeros1M;
     procedure TestChunkedFeed;
+    procedure TestIncompressibleSingleFeed;
   end;
 
   TDeflateTakeover = class(TTestSuite)
@@ -38,6 +40,8 @@ type
     procedure SetupTests; override;
     procedure TestBombCap;
     procedure TestCorruptStream;
+    procedure TestTooFarBackReadsZeros;
+    procedure TestSmallWindowFarDistanceStaysInside;
   end;
 
 function RoundTrip(C: TWSDeflater; D: TWSInflater;
@@ -196,6 +200,46 @@ begin
   if I <> 0 then;
 end;
 
+procedure TDeflateRoundTrip.TestIncompressibleSingleFeed;
+var
+  C: TWSDeflater;
+  D: TWSInflater;
+  InB, Z, OutB: TBytes;
+  I, Size: Integer;
+const
+  // Sizes that fit inside inflate's 32 KB window in one Feed, straddle it,
+  // and exceed it: the regression was a message whose entire compressed
+  // input was swallowed into the window while decoded bytes still queued
+  // behind a full output buffer — the pump stopped on avail_in = 0 and
+  // silently delivered a truncated message (20000 → 8192 bytes).
+  Sizes: array[0..5] of Integer = (4097, 8193, 20000, 32768, 32769, 65536);
+begin
+  RandSeed := 20000;
+  for Size in Sizes do
+  begin
+    SetLength(InB, Size);
+    for I := 0 to High(InB) do InB[I] := Byte(Random(256));
+    C := TWSDeflater.Create(15, False);
+    D := TWSInflater.Create(15, False, 1 shl 20);
+    try
+      Expect<Boolean>(C.CompressMessage(@InB[0], Length(InB), Z)).ToBe(True);
+      // Random bytes do not compress: deflate emits stored blocks, so the
+      // compressed stream is at least as long as the input.
+      Expect<Boolean>(Length(Z) >= Length(InB)).ToBe(True);
+      D.BeginMessage;
+      Expect<Boolean>(D.Feed(@Z[0], Length(Z))).ToBe(True);
+      Expect<Boolean>(D.Finish).ToBe(True);
+      Expect<Integer>(Integer(D.OutSize)).ToBe(Size);
+      SetLength(OutB, D.OutSize);
+      Move(D.OutData[0], OutB[0], D.OutSize);
+      Expect<Boolean>(SameBytes(InB, OutB)).ToBe(True);
+    finally
+      C.Free;
+      D.Free;
+    end;
+  end;
+end;
+
 { ───────── context takeover ───────── }
 
 procedure TDeflateTakeover.TestSharedWindowShrinksRepeats;
@@ -292,6 +336,85 @@ begin
   end;
 end;
 
+procedure TDeflateDefence.TestTooFarBackReadsZeros;
+const
+  // One fixed-Huffman block: literal 'a', then <length 3, distance 4> —
+  // a back-reference reaching three bytes before the start of the
+  // output. zlib 1.2 rejects this ("invalid distance too far back");
+  // paszlib copies from its sliding window. The window must therefore
+  // never hold anything the peer did not send: zeros on a fresh
+  // inflater, and zeros again after a no-context-takeover reset.
+  Stream: array[0..4] of Byte = ($4A, $04, $62, $00, $00);
+var
+  D: TWSInflater;
+  C: TWSDeflater;
+  Round, I: Integer;
+  Primer: array[0..7] of Pointer;
+  Big, Got: TBytes;
+begin
+  // A fresh process gets never-touched pages from the allocator, which
+  // would make an uncleared window read as zeros by luck. Real servers
+  // allocate a connection's window after other connections freed
+  // theirs, so recycle window-sized blocks full of a marker first.
+  for I := 0 to High(Primer) do
+  begin
+    GetMem(Primer[I], 32768);
+    FillChar(Primer[I]^, 32768, $A5);
+  end;
+  for I := High(Primer) downto 0 do FreeMem(Primer[I]);
+  D := TWSInflater.Create(15, True, 1 shl 20);
+  C := TWSDeflater.Create(15, True);
+  try
+    for Round := 1 to 2 do
+    begin
+      // Before the second round, fill the whole window with real output
+      // so only the no-context-takeover reset can make it read zeros.
+      if Round = 2 then
+      begin
+        SetLength(Big, 40000);
+        for I := 0 to High(Big) do Big[I] := Byte(I * 7 + 1);
+        Expect<Boolean>(RoundTrip(C, D, Big, Got)).ToBe(True);
+      end;
+      D.BeginMessage;
+      Expect<Boolean>(D.Feed(@Stream[0], Length(Stream))).ToBe(True);
+      Expect<Boolean>(D.Finish).ToBe(True);
+      Expect<Integer>(Integer(D.OutSize)).ToBe(4);
+      Expect<Integer>(D.OutData[0]).ToBe(Ord('a'));
+      Expect<Integer>(D.OutData[1]).ToBe(0);
+      Expect<Integer>(D.OutData[2]).ToBe(0);
+      Expect<Integer>(D.OutData[3]).ToBe(0);
+    end;
+  finally
+    C.Free;
+    D.Free;
+  end;
+end;
+
+procedure TDeflateDefence.TestSmallWindowFarDistanceStaysInside;
+const
+  // Fixed-Huffman block: literal 'a', then <length 3, distance 32768>.
+  // A peer may negotiate client_max_window_bits=9 and still send this:
+  // the distance code is legal deflate. A 512-byte inflate window would
+  // resolve it to memory ~32 KB before the allocation.
+  Stream: array[0..5] of Byte = ($4A, $04, $DE, $FF, $0F, $00);
+var
+  D: TWSInflater;
+begin
+  D := TWSInflater.Create(9, True, 1 shl 20);
+  try
+    D.BeginMessage;
+    Expect<Boolean>(D.Feed(@Stream[0], Length(Stream))).ToBe(True);
+    Expect<Boolean>(D.Finish).ToBe(True);
+    Expect<Integer>(Integer(D.OutSize)).ToBe(4);
+    Expect<Integer>(D.OutData[0]).ToBe(Ord('a'));
+    Expect<Integer>(D.OutData[1]).ToBe(0);
+    Expect<Integer>(D.OutData[2]).ToBe(0);
+    Expect<Integer>(D.OutData[3]).ToBe(0);
+  finally
+    D.Free;
+  end;
+end;
+
 procedure TDeflateRoundTrip.SetupTests;
 begin
   Test('empty message is #$00 and round-trips',  TestEmptyMessage);
@@ -299,6 +422,7 @@ begin
   Test('100 KB random round trip',               TestRandom100K);
   Test('1 MB zeros round trip + ratio sanity',   TestZeros1M);
   Test('chunked Feed at every split',            TestChunkedFeed);
+  Test('incompressible message in one Feed',     TestIncompressibleSingleFeed);
 end;
 
 procedure TDeflateTakeover.SetupTests;
@@ -311,6 +435,8 @@ procedure TDeflateDefence.SetupTests;
 begin
   Test('decompression bomb hits output cap',     TestBombCap);
   Test('corrupt stream rejected',                TestCorruptStream);
+  Test('too-far back-reference reads zeros',    TestTooFarBackReadsZeros);
+  Test('9-bit window, 32 KB distance stays inside', TestSmallWindowFarDistanceStaysInside);
 end;
 
 begin

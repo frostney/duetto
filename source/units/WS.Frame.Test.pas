@@ -3,7 +3,8 @@
   truncation point of every shape, the §5.2 strictness matrix (minimal
   encodings, control rules, reserved opcodes, length top bit), and a
   differential sweep proving UnmaskNaive / UnmaskU64 / UnmaskSSE2 /
-  ApplyMask agree on every length 0..130 x key offset 0..3, that masking
+  ApplyMask agree on every length 0..130 x key offset 0..3 (and so do the
+  copying variants UnmaskCopyU64 / UnmaskCopySSE2 / ApplyMaskCopy), that masking
   is an involution, and that a payload unmasked in arbitrary split chunks
   (the streaming case) equals the payload unmasked whole. }
 
@@ -56,6 +57,8 @@ type
     procedure TestSplitEqualsWhole;
     procedure TestRFCMaskVector;
     procedure TestZeroLengthIsSafe;
+    procedure TestMovePayload;
+    procedure TestMaskCopyAgrees;
   end;
 
 { ───────── helpers ───────── }
@@ -366,13 +369,22 @@ end;
 
 procedure TFrameMasking.TestZeroLengthIsSafe;
 var
-  B: Byte;
+  B, C: Byte;
 begin
   B := $42;
+  C := $24;
   UnmaskNaive(@B, 0, $FFFFFFFF);
   UnmaskU64(@B, 0, $FFFFFFFF);
   ApplyMask(@B, 0, $FFFFFFFF, 3);
+  UnmaskCopyU64(@B, @C, 0, $FFFFFFFF);
+  ApplyMaskCopy(@B, @C, 0, $FFFFFFFF, 3);
+  MovePayload(@B, @C, 0);
+{$if defined(CPUX86_64) and defined(LINUX)}
+  UnmaskSSE2(@B, 0, $FFFFFFFF);
+  UnmaskCopySSE2(@B, @C, 0, $FFFFFFFF);
+{$endif}
   Expect<Integer>(B).ToBe($42);
+  Expect<Integer>(C).ToBe($24);
 end;
 
 procedure TFrameRFCVectors.SetupTests;
@@ -402,6 +414,84 @@ begin
   Test('NeedMore at every truncation point',      TestNeedMoreAtEveryTruncation);
 end;
 
+procedure TFrameMasking.TestMovePayload;
+var
+  Src, Dst: array[0..299] of Byte;
+  Len, I, Mismatch: Integer;
+begin
+  RandSeed := 4242;
+  for I := 0 to High(Src) do Src[I] := Byte(Random(256));
+  Mismatch := 0;
+  for Len := 0 to 260 do
+  begin
+    FillChar(Dst, SizeOf(Dst), $A5);
+    MovePayload(@Src[3], @Dst[5], Len);
+    if not CompareMem(@Src[3], @Dst[5], Len) then Inc(Mismatch);
+    // nothing outside [5, 5 + Len) is touched
+    for I := 0 to 4 do
+      if Dst[I] <> $A5 then Inc(Mismatch);
+    for I := 5 + Len to High(Dst) do
+      if Dst[I] <> $A5 then Inc(Mismatch);
+  end;
+  Expect<Integer>(Mismatch).ToBe(0);
+end;
+
+// The copying unmask equals copy-then-unmask for every length x offset,
+// leaves the source alone, and writes nothing outside [Dst, Dst + Len).
+procedure TFrameMasking.TestMaskCopyAgrees;
+const
+  Guard = $5A;
+var
+  Src, Orig, Want, Dst: array[0..149] of Byte;
+  Len, Off, SrcAt, I, Mismatch: Integer;
+  Key, RotKey: UInt32;
+
+  procedure Check;
+  var
+    J: Integer;
+  begin
+    if not CompareMem(@Want[0], @Dst[4], Len) then Inc(Mismatch);
+    for J := 0 to 3 do
+      if Dst[J] <> Guard then Inc(Mismatch);
+    for J := 4 + Len to High(Dst) do
+      if Dst[J] <> Guard then Inc(Mismatch);
+    if not CompareMem(@Src[0], @Orig[0], SizeOf(Src)) then Inc(Mismatch);
+  end;
+
+begin
+  RandSeed := 2024;
+  Key := $7E3A91C5;
+  Mismatch := 0;
+  for I := 0 to High(Src) do Src[I] := Byte(Random(256));
+  Move(Src, Orig, SizeOf(Src));
+  // Source alignments 0..3 x destination at +4: the two pointers are
+  // misaligned relative to each other in every combination.
+  for SrcAt := 0 to 3 do
+    for Len := 0 to 130 do
+      for Off := 0 to 3 do
+      begin
+        if Off = 0 then
+          RotKey := Key
+        else
+          RotKey := (Key shr (Off * 8)) or (Key shl (32 - Off * 8));
+        Move(Src[SrcAt], Want, Len);
+        ApplyMask(@Want[0], Len, Key, Off);
+
+        FillChar(Dst, SizeOf(Dst), Guard);
+        ApplyMaskCopy(@Src[SrcAt], @Dst[4], Len, Key, Off);
+        Check;
+        FillChar(Dst, SizeOf(Dst), Guard);
+        UnmaskCopyU64(@Src[SrcAt], @Dst[4], Len, RotKey);
+        Check;
+{$if defined(CPUX86_64) and defined(LINUX)}
+        FillChar(Dst, SizeOf(Dst), Guard);
+        UnmaskCopySSE2(@Src[SrcAt], @Dst[4], Len, RotKey);
+        Check;
+{$endif}
+      end;
+  Expect<Integer>(Mismatch).ToBe(0);
+end;
+
 procedure TFrameMasking.SetupTests;
 begin
   Test('naive = u64 = sse2 = ApplyMask, len 0..130 x off 0..3',
@@ -410,6 +500,9 @@ begin
   Test('split-chunk unmask equals whole',         TestSplitEqualsWhole);
   Test('RFC mask key vector',                     TestRFCMaskVector);
   Test('zero length is safe in every impl',       TestZeroLengthIsSafe);
+  Test('MovePayload copies exactly len 0..260',   TestMovePayload);
+  Test('mask-copy = copy + mask, len 0..130 x off 0..3 x src align 0..3',
+                                                  TestMaskCopyAgrees);
 end;
 
 begin

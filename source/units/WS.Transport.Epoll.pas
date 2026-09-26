@@ -1,14 +1,24 @@
 unit WS.Transport.Epoll;
 
 // Linux transport: single-threaded epoll reactor implementing the
-// WS.Transport completion contract. The shape every fast WebSocket
+// WS.Transport completion contract, including the optional gather send
+// (ADR-0004: one sendmsg for frame header + caller payload) on non-TLS
+// connections. The shape every fast WebSocket
 // server converges on — one event loop, nonblocking sockets,
 // level-triggered readiness, EPOLLOUT armed only while a connection has
 // backlog. Readiness adapts to the completion contract per ADR-0001:
 // SubmitSend writes what the socket takes and arms EPOLLOUT for the
-// remainder; EPOLLIN drains into ONE shared 256 KB buffer delivered via
+// remainder; EPOLLIN reads into ONE shared 256 KB buffer delivered via
 // OnData, so by the next readiness event the buffer is free again. Zero
-// steady-state allocation on the hot echo path.
+// steady-state allocation on the hot echo path. A readiness event reads
+// until a short read or MaxFullReadsPerEvent full ones, never to EAGAIN
+// (see ReadBudgetSpent): that last recv is a wasted syscall per message,
+// and a peer that keeps its queue full would hold the loop forever.
+// Readiness is level-triggered, so whatever is left is re-reported on the
+// next epoll_wait. The cost: with server and peers sharing one core, the
+// old loop stayed on one hot connection while the co-scheduled peer
+// refilled it; this one walks the batch, which is slower for large
+// payloads in that shape only (see docs/comparison.md).
 //
 // Server TLS (duetto#22) rides WS.Transport.TlsServer, which wraps
 // lwpt's memory-BIO accept API. The reactor stays a byte mover: it owns
@@ -47,6 +57,7 @@ uses
 
   Linux,
   Sockets,
+  Syscall,
   TransportSecurity,
   WS.Transport,
   WS.Transport.PostQueue,
@@ -82,6 +93,8 @@ type
     procedure ApplyInterest;
     procedure SetTimed(AValue: Boolean);
     function RawSend(P: PByte; ALen: NativeInt): NativeInt;
+    function SendFailed(ATaken: NativeInt): NativeInt;
+    procedure SendDrained;
     // TWSTlsServerSession callbacks.
     function TlsPlaintext(P: PByte; ALen: NativeInt): Boolean;
     function TlsCiphertext(P: PByte; ALen: NativeInt): NativeInt;
@@ -96,8 +109,14 @@ type
   public
     destructor Destroy; override;
     function SubmitSend(P: PByte; ALen: NativeInt): NativeInt; override;
+    function SupportsGather: Boolean; override;
+    function SubmitSendV(AFirst: PByte; AFirstLen: NativeInt; ASecond: PByte;
+      ASecondLen: NativeInt): NativeInt; override;
     procedure SubmitClose; override;
   end;
+
+  // What spending the reserve descriptor on one accept achieved.
+  TWSShedResult = (wsrShed, wsrDrained, wsrNoReserve);
 
   TWSEpollTransport = class(TWSTransport)
   private
@@ -115,11 +134,24 @@ type
     FTimedCount: Integer;      // connections carrying a live deadline
     FTlsReadLen: Integer;      // per-round socket read bound on a TLS conn
     FNextSweepTick: QWord;     // deadline sweeps are amortized on the clock
+    // Descriptor exhaustion. A level-triggered listener that cannot
+    // accept stays readable, so an accept failure that is simply
+    // returned from spins epoll_wait at full CPU without ever draining
+    // the backlog. FReserveFd is one descriptor held open on /dev/null
+    // for exactly that moment: close it, accept the waiting peer, close
+    // the peer, take the reserve back — the backlog is shed instead of
+    // spun on. When even that is not possible the listener leaves the
+    // interest set until FAcceptBackoffUntil.
+    FReserveFd: Integer;
+    FAcceptBackoffUntil: QWord;
 
     procedure EpollMod(AConn: TWSEpollConn; AEvents: Cardinal);
     procedure Track(AConn: TWSEpollConn);
     procedure Untrack(AConn: TWSEpollConn);
     procedure AcceptPending;
+    procedure ListenerArm(AArmed: Boolean);
+    procedure OpenReserveFd;
+    function ShedOneAccept: TWSShedResult;
     procedure HandleReadable(AConn: TWSEpollConn);
     procedure HandleReadableTls(AConn: TWSEpollConn);
     procedure HandleTlsEvent(AConn: TWSEpollConn; AEvents: Cardinal);
@@ -156,6 +188,26 @@ const
   // epoll_wait that would otherwise park, and only while at least one
   // connection carries a deadline — a plaintext listener never sees it.
   TlsDeadlinePollMs = 100;
+  // Full-length reads one readiness event may take before the reactor
+  // moves on to the rest of the batch: 4 x 256 KB on a non-TLS
+  // connection, 4 x the encrypted-input watermark under TLS. Level-
+  // triggered EPOLLIN re-reports whatever is left on the next
+  // epoll_wait, so this bounds how long one peer holds the loop without
+  // dropping any of its bytes. 4 lets a bulk sender move ~1 MB per turn,
+  // so epoll_wait round trips stay rare, and caps what any one peer can
+  // take per turn at that same ~1 MB.
+  MaxFullReadsPerEvent = 4;
+  // Peers one listener event may shed while the descriptor table is
+  // full. Shedding succeeds for as long as peers keep the backlog
+  // populated, so it must hand the loop back: the level-triggered
+  // listener is reported again on the next epoll_wait, alongside every
+  // other connection's events.
+  MaxShedPerEvent = 64;
+  // How long the listener stays out of the interest set after accept
+  // fails for lack of a resource the reserve descriptor cannot cover
+  // (ENOBUFS/ENOMEM, or ENFILE with the reserve already spent). Short:
+  // the backlog is still queueing peers meanwhile.
+  AcceptBackoffMs = 100;
   ShutdownWrite = 1; // shutdown(): SHUT_WR
 
 // The RTL's Linux unit predates eventfd on some targets; bind libc
@@ -167,6 +219,20 @@ function C_eventfd(ACount: Cardinal; AFlags: Integer): Integer; cdecl;
 // transport binds its own for the same reason.
 function C_shutdown(AFd: Integer; AHow: Integer): Integer; cdecl;
   external name 'shutdown';
+
+// The per-event read bound shared by both read loops. A short read means
+// nothing more was readable when it ran: the next recv would almost
+// always report EAGAIN, and anything that arrives later (the peer running
+// meanwhile, or packets queued while the socket was locked) is
+// re-reported by level-triggered EPOLLIN. A full read may have more
+// behind it, but only up to MaxFullReadsPerEvent, so one flooding peer
+// cannot starve the rest of the batch.
+function ReadBudgetSpent(AGot, AReadLen: Integer; var AFullReads: Integer): Boolean; inline;
+begin
+  if AGot < AReadLen then Exit(True);
+  Inc(AFullReads);
+  Result := AFullReads >= MaxFullReadsPerEvent;
+end;
 
 procedure SetNonBlocking(AFd: Integer);
 var
@@ -223,11 +289,11 @@ begin
 end;
 
 // Socket write, shared by the plaintext send path and the TLS
-// ciphertext egress. Bytes taken, 0 on EAGAIN (EPOLLOUT armed), -1 when
-// the connection is dead.
+// ciphertext egress. Bytes taken (fewer than ALen on EAGAIN, with
+// EPOLLOUT armed), -1 when the connection is dead.
 function TWSEpollConn.RawSend(P: PByte; ALen: NativeInt): NativeInt;
 var
-  W: NativeInt;
+  Sent: NativeInt;
 begin
   // A dead connection has no socket worth writing to (its fd may already
   // be closed); report the failure the caller expects, exactly as the
@@ -237,35 +303,126 @@ begin
   Result := 0;
   while Result < ALen do
   begin
-    W := fpSend(FFd, P + Result, ALen - Result, MSG_NOSIGNAL);
-    if W < 0 then
-    begin
-      if fpgeterrno = ESysEAGAIN then
-      begin
-        if not FWantWrite then
-        begin
-          FWantWrite := True;
-          ApplyInterest;
-        end;
-        Exit;
-      end;
-      FDead := True;
-      Exit(-1);
-    end;
-    Result := Result + W;
+    Sent := fpSend(FFd, P + Result, ALen - Result, MSG_NOSIGNAL);
+    // A signal before anything was sent: nothing happened, send again.
+    if (Sent < 0) and (fpgeterrno = ESysEINTR) then Continue;
+    if Sent < 0 then Exit(SendFailed(Result));
+    Result := Result + Sent;
   end;
 end;
+
+// A send syscall just failed (not EINTR — the callers retry that), ATaken
+// bytes into the offer. EAGAIN arms
+// EPOLLOUT and reports what was taken; anything else kills the
+// connection. Shared by RawSend and SubmitSendV so the two cannot drift.
+function TWSEpollConn.SendFailed(ATaken: NativeInt): NativeInt;
+begin
+  if fpgeterrno <> ESysEAGAIN then
+  begin
+    FDead := True;
+    Exit(-1);
+  end;
+  if not FWantWrite then
+  begin
+    FWantWrite := True;
+    ApplyInterest;
+  end;
+  Result := ATaken;
+end;
+
+// Everything offered went out: stop waiting for writability.
+procedure TWSEpollConn.SendDrained;
+begin
+  if FWantWrite then
+  begin
+    FWantWrite := False;
+    ApplyInterest;
+  end;
+end;
+
+{$if declared(syscall_nr_sendmsg)}
+type
+  // struct msghdr. The RTL's msghdr is bound to its libc wrappers; the
+  // raw syscall needs only this layout (natural alignment, as in C).
+  TSendMsgHdr = record
+    Name: Pointer;
+    NameLen: Cardinal;
+    Iov: PIOVec;
+    IovLen: PtrUInt;
+    Control: Pointer;
+    ControlLen: PtrUInt;
+    Flags: Integer;
+  end;
+{$endif}
+
+// Plaintext only: a TLS connection encrypts into its own buffers, so
+// there is nothing to gather. Targets whose FPC RTL declares no sendmsg
+// syscall number (those that multiplex socketcall, e.g. i386) never opt
+// in; x86_64 and aarch64 do.
+function TWSEpollConn.SupportsGather: Boolean;
+begin
+{$if declared(syscall_nr_sendmsg)}
+  Result := FTls = nil;
+{$else}
+  Result := False;
+{$endif}
+end;
+
+// One sendmsg over both buffers (the raw syscall, so errno lands where
+// fpgeterrno reads it, exactly as fpSend's does). Same result contract as
+// RawSend: bytes taken, EPOLLOUT armed on EAGAIN, -1 when dead.
+function TWSEpollConn.SubmitSendV(AFirst: PByte; AFirstLen: NativeInt;
+  ASecond: PByte; ASecondLen: NativeInt): NativeInt;
+{$if declared(syscall_nr_sendmsg)}
+var
+  Iov: array[0..1] of TIOVec;
+  Msg: TSendMsgHdr;
+  Sent, Total: NativeInt;
+begin
+  if FDead then Exit(-1);
+  if FTls <> nil then
+    Exit(inherited SubmitSendV(AFirst, AFirstLen, ASecond, ASecondLen));
+  Total := AFirstLen + ASecondLen;
+  Result := 0;
+  FillChar(Msg, SizeOf(Msg), 0);
+  Msg.Iov := @Iov[0];
+  while Result < Total do
+  begin
+    if Result < AFirstLen then
+    begin
+      Iov[0].iov_base := AFirst + Result;
+      Iov[0].iov_len := AFirstLen - Result;
+      Iov[1].iov_base := ASecond;
+      Iov[1].iov_len := ASecondLen;
+      Msg.IovLen := 2;
+    end
+    else
+    begin
+      Iov[0].iov_base := ASecond + (Result - AFirstLen);
+      Iov[0].iov_len := Total - Result;
+      Msg.IovLen := 1;
+    end;
+    Sent := Do_SysCall(syscall_nr_sendmsg, TSysParam(FFd), TSysParam(@Msg),
+      TSysParam(MSG_NOSIGNAL));
+    // Interrupted before sending anything (as for RawSend): send again.
+    if (Sent < 0) and (fpgeterrno = ESysEINTR) then Continue;
+    if Sent < 0 then Exit(SendFailed(Result));
+    Result := Result + Sent;
+  end;
+  SendDrained;
+end;
+{$else}
+begin
+  Result := inherited SubmitSendV(AFirst, AFirstLen, ASecond, ASecondLen);
+end;
+{$endif}
 
 function TWSEpollConn.SubmitSend(P: PByte; ALen: NativeInt): NativeInt;
 begin
   if FDead then Exit(-1);
   if FTls <> nil then Exit(TlsSubmitSend(P, ALen));
   Result := RawSend(P, ALen);
-  if (Result >= ALen) and FWantWrite then
-  begin
-    FWantWrite := False;
-    ApplyInterest;
-  end;
+  if Result >= ALen then SendDrained;
 end;
 
 procedure TWSEpollConn.SubmitClose;
@@ -461,6 +618,7 @@ begin
   FListenFd := -1;
   FEpFd := -1;
   FWakeFd := -1;
+  FReserveFd := -1;
   FPosts := TWSPostQueue.Create;
   // Validated before any fd exists: a bad literal fails the constructor
   // with nothing to clean up.
@@ -551,6 +709,9 @@ begin
     Ev.data.u64 := QWord(Cardinal(FWakeFd));
     epoll_ctl(FEpFd, EPOLL_CTL_ADD, FWakeFd, @Ev);
   end;
+  // Last: with one descriptor left, the reserve must not be what takes
+  // it from the eventfd.
+  OpenReserveFd;
 end;
 
 destructor TWSEpollTransport.Destroy;
@@ -563,6 +724,7 @@ begin
   if FWakeFd >= 0 then FileClose(FWakeFd);
   if FEpFd >= 0 then FileClose(FEpFd);
   if FListenFd >= 0 then CloseSocket(FListenFd);
+  if FReserveFd >= 0 then FileClose(FReserveFd);
   inherited;
 end;
 
@@ -721,15 +883,97 @@ begin
   FConns[AConn.FFd] := nil;
 end;
 
-procedure TWSEpollTransport.AcceptPending;
+procedure TWSEpollTransport.ListenerArm(AArmed: Boolean);
+var
+  Ev: TEPoll_Event;
+begin
+  if AArmed then
+  begin
+    Ev.events := EPOLLIN;
+    Ev.data.u64 := QWord(Cardinal(FListenFd));
+    // The same pressure that forced the backoff (ENOMEM, ENOSPC) can fail
+    // the re-arm: keep a retry deadline, or the listener stays deaf.
+    if epoll_ctl(FEpFd, EPOLL_CTL_ADD, FListenFd, @Ev) = 0 then
+      FAcceptBackoffUntil := 0
+    else
+      FAcceptBackoffUntil := GetTickCount64 + QWord(AcceptBackoffMs);
+  end
+  else
+  begin
+    epoll_ctl(FEpFd, EPOLL_CTL_DEL, FListenFd, nil);
+    FAcceptBackoffUntil := GetTickCount64 + QWord(AcceptBackoffMs);
+  end;
+end;
+
+procedure TWSEpollTransport.OpenReserveFd;
+begin
+  if FReserveFd < 0 then
+    FReserveFd := fpOpen('/dev/null', O_RDONLY or O_CLOEXEC);
+end;
+
+// The table is full: give the reserve back to the kernel, accept the
+// peer at the head of the backlog, close it, take the reserve again.
+// The peer sees an immediate close — the honest answer from a server
+// with no descriptor to serve it — and the listener stops being
+// readable for it. Linux checks the descriptor table before the
+// backlog, so the outer accept reports EMFILE even once the backlog is
+// empty: only the accept made with the reserve released can tell
+// "another peer shed" from "nothing left to accept".
+function TWSEpollTransport.ShedOneAccept: TWSShedResult;
 var
   Fd: Integer;
+begin
+  if FReserveFd < 0 then Exit(wsrNoReserve);
+  FileClose(FReserveFd);
+  FReserveFd := -1;
+  Fd := fpAccept(FListenFd, nil, nil);
+  if Fd >= 0 then
+  begin
+    CloseSocket(Fd);
+    Result := wsrShed;
+  end
+  else
+    Result := wsrDrained;
+  OpenReserveFd;
+end;
+
+procedure TWSEpollTransport.AcceptPending;
+var
+  Fd, Err, Shed: Integer;
   Conn: TWSEpollConn;
   Ev: TEPoll_Event;
 begin
+  Shed := 0;
   repeat
     Fd := fpAccept(FListenFd, nil, nil);
-    if Fd < 0 then Exit; // EAGAIN: drained
+    if Fd < 0 then
+    begin
+      Err := fpGetErrno;
+      case Err of
+        ESysEINTR, ESysECONNABORTED:
+          Continue; // interrupted, or the peer left the backlog: next
+        ESysEMFILE, ESysENFILE:
+          case ShedOneAccept of
+            wsrShed:
+              begin
+                Inc(Shed);
+                if Shed >= MaxShedPerEvent then Exit;
+                Continue;
+              end;
+            wsrDrained: Exit;
+          else
+            ListenerArm(False);
+            Exit;
+          end;
+        ESysENOBUFS, ESysENOMEM:
+          begin
+            ListenerArm(False);
+            Exit;
+          end;
+      else
+        Exit; // EAGAIN: drained
+      end;
+    end;
     SetNonBlocking(Fd);
     SetNoDelay(Fd);
     Conn := TWSEpollConn.Create;
@@ -774,17 +1018,27 @@ end;
 // then the transport reclaims the connection.
 procedure TWSEpollTransport.RemoteClosed(AConn: TWSEpollConn);
 begin
+  // Dead before the fd is closed: the number is free for reuse the
+  // moment Untrack closes it, so any SubmitSend reached from OnClosed
+  // must report -1 rather than write into whatever now owns it — as the
+  // IOCP and Network.framework transports already do.
+  AConn.FDead := True;
   Untrack(AConn);
-  if Assigned(OnClosed) then OnClosed(AConn);
-  AConn.Free;
+  // Freed even if OnClosed raises (the exception carries on out of Run).
+  try
+    if Assigned(OnClosed) then OnClosed(AConn);
+  finally
+    AConn.Free;
+  end;
 end;
 
 procedure TWSEpollTransport.HandleReadable(AConn: TWSEpollConn);
 var
-  Fd, Got: Integer;
+  Fd, Got, FullReads: Integer;
   Gen: NativeUInt;
 begin
   Fd := AConn.FFd;
+  FullReads := 0;
   // Identity for the mid-dispatch re-check below is the generation, not
   // the pointer: AConn may be freed memory by the time we look, so the
   // Id is captured here, while it is still ours to read.
@@ -796,7 +1050,7 @@ begin
       RemoteClosed(AConn);
       Exit;
     end;
-    if Got < 0 then Exit; // EAGAIN
+    if Got < 0 then Exit; // EAGAIN; an error surfaces as EPOLLERR next round
     if Assigned(OnData) then OnData(AConn, @FRecv[0], Got);
     // Invariant: the fd is still ours only while the table occupant is
     // the same CONNECTION GENERATION we entered with. The session may
@@ -807,6 +1061,7 @@ begin
     // generation compare cannot.
     if (Fd >= Length(FConns)) or (FConns[Fd] = nil) or
       (FConns[Fd].Id <> Gen) then Exit;
+    if ReadBudgetSpent(Got, Length(FRecv), FullReads) then Exit;
   until False;
 end;
 
@@ -817,12 +1072,13 @@ end;
 // the moment lwpt reports encrypted-input backpressure.
 procedure TWSEpollTransport.HandleReadableTls(AConn: TWSEpollConn);
 var
-  Fd, Got: Integer;
+  Fd, Got, FullReads: Integer;
   Gen: NativeUInt;
   Res: TWSTlsIngestResult;
 begin
   Fd := AConn.FFd;
   Gen := AConn.Id;
+  FullReads := 0;
   repeat
     if AConn.FPaused then Exit;
     Got := fpRecv(Fd, @FRecv[0], FTlsReadLen, 0);
@@ -831,7 +1087,7 @@ begin
       RemoteClosed(AConn);
       Exit;
     end;
-    if Got < 0 then Exit; // EAGAIN
+    if Got < 0 then Exit; // EAGAIN; an error surfaces as EPOLLERR next round
     Res := AConn.TlsIngest(@FRecv[0], Got);
     if AConn.FFreeDeferred then
     begin
@@ -847,6 +1103,9 @@ begin
       RemoteClosed(AConn);
       Exit;
     end;
+    // Same bound as HandleReadable: backpressure alone does not stop a
+    // peer whose ciphertext the session keeps up with.
+    if ReadBudgetSpent(Got, FTlsReadLen, FullReads) then Exit;
   until False;
 end;
 
@@ -1055,7 +1314,13 @@ begin
     Wait := ATimeoutMs;
     if FTimedCount > 0 then
       if (Wait < 0) or (Wait > TlsDeadlinePollMs) then Wait := TlsDeadlinePollMs;
+    // A backed-off listener needs the same courtesy: wake in time to
+    // put it back.
+    if FAcceptBackoffUntil <> 0 then
+      if (Wait < 0) or (Wait > AcceptBackoffMs) then Wait := AcceptBackoffMs;
     N := epoll_wait(FEpFd, @Evs[0], Length(Evs), Wait);
+    if (FAcceptBackoffUntil <> 0) and (GetTickCount64 >= FAcceptBackoffUntil) then
+      ListenerArm(True);
     for I := 0 to N - 1 do
     begin
       Fd := Integer(Cardinal(Evs[I].data.u64)); // low half: the fd

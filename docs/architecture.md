@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-- duetto implements RFC 6455 (WebSocket v13) and RFC 7692 (permessage-deflate) in ~8,200 lines of FreePascal.
+- duetto implements RFC 6455 (WebSocket v13) and RFC 7692 (permessage-deflate) in ~8,700 lines of FreePascal (library units; twice that with tests and programs).
 - The heart is `WS.Protocol`, a **sans-I/O state machine** — one instance per connection, either role — that never touches a file descriptor.
 - Every RFC rule lives in that one testable place; the blocking client, the epoll server, and the in-process benchmark all sit behind the same machine unchanged.
 - Layers are strictly bottom-up: frame codec → UTF-8 → handshake → deflate → protocol machine → client / server.
@@ -30,10 +30,10 @@ once on protocol failure, after queueing the appropriate close frame
 | `WS.Deflate` | RFC 7692 over paszlib: raw deflate, sync flush, 4-byte tail, context takeover control, inflate output cap |
 | `WS.Protocol` | the sans-I/O machine above |
 | `WS.Client` | blocking client, `ws://` and `wss://` (TLS via lwpt's TransportSecurity) |
-| `WS.Transport` | the completion-shaped transport contract (ADR-0001): submit sends/closes, receive data/lifecycle completions on the transport's execution context (ADR-0003); also `WSParseBindAddress`, the strict IPv4/IPv6 literal parser every transport binds through (never a resolver) |
+| `WS.Transport` | the completion-shaped transport contract (ADR-0001): submit sends/closes, receive data/lifecycle completions on the transport's execution context (ADR-0003); an optional gather send (ADR-0004: `SupportsGather` / `SubmitSendV`) that only a transport writing synchronously offers, letting the server hand frame header + caller payload to the socket without copying the payload into the out queue; also `WSParseBindAddress`, the strict IPv4/IPv6 literal parser every transport binds through (never a resolver) |
 | `WS.Transport.PostQueue` | thread-safe FIFO behind the reactor transports' `SubmitPost` (cross-thread `Conn.Post` hand-off); the Network.framework transport posts straight onto its per-connection GCD queues instead |
 | `WS.Transport.TlsServer` | platform-neutral per-connection server TLS over lwpt's memory-BIO accept API: handshake pump, accepted-prefix re-offer, input/output flow accounting, `close_notify` drain; used by the fd-owning transports only |
-| `WS.Transport.Epoll` | Linux transport: nonblocking sockets, one shared 256 KB read buffer, `EPOLLOUT` armed only while a connection has backlog; native `wss://` through `WS.Transport.TlsServer`, with the handshake deadline, the inbound pre-handshake budget and the `EPOLLIN` pause/resume owned by the reactor |
+| `WS.Transport.Epoll` | Linux transport: nonblocking sockets, one shared 256 KB read buffer, a bounded number of reads per readiness event (level-triggered, so one busy peer cannot hold the loop), `EPOLLOUT` armed only while a connection has backlog, gather send via `sendmsg` on plaintext connections; native `wss://` through `WS.Transport.TlsServer`, with the handshake deadline, the inbound pre-handshake budget and the `EPOLLIN` pause/resume owned by the reactor |
 | `WS.Transport.NetworkFramework` | macOS transport (ADR-0002): `nw_listener`/`nw_connection` C API, one serial dispatch queue per connection, native TLS via a PKCS#12 `SecIdentity` |
 | `WS.Transport.Iocp` | Windows transport: one completion-port thread, `AcceptEx`/`WSARecv`/`WSASend` always armed overlapped, copy-on-send, outstanding-operation pinning for deferred frees; native `wss://` (x64 and win32, via lwpt's SChannel accept — no OpenSSL on Windows) through `WS.Transport.TlsServer`, with the handshake deadline, the inbound pre-handshake budget and the `WSARecv` suppress/resume owned by the completion loop |
 | `WS.Server` | platform-neutral session layer: handshake accumulation, protocol wiring, flush/backpressure policy over the transport seam; `SendText`/`SendBinary` return False when the transport dropped (and freed) the connection mid-flush, and `Conn.Post` is the any-thread hand-off for server-driven pushes (ADR-0003 amendment); `OnUpgradeRequest` vetoes a parsed upgrade (403, then close — no `OnOpen`/`OnClientClose`) before the 101 is queued, and the constructors take an optional bind address (`''` = every interface; an IPv4 or IPv6 literal binds that one, no DNS) |
@@ -45,7 +45,7 @@ Units higher in the table never depend on units lower down. The programs in
 
 Four nets, from innermost to outermost:
 
-1. **Co-located unit suites** (`lwpt test`, seven of them): RFC §5.7 frame
+1. **Co-located unit suites** (`lwpt test`, one per `source/units/*.Test.pas`): RFC §5.7 frame
    vectors and strictness, an exhaustive 16.8M-case UTF-8 differential,
    handshake acceptance/rejection matrices, deflate round-trips with
    takeover and bomb-cap checks, a 26-test protocol conformance suite
@@ -57,13 +57,18 @@ Four nets, from innermost to outermost:
    the accepted-prefix carry buffer (order, re-offer, compaction), and a
    `WS.Transport` suite pinning the bind-address literal parser (strict
    dotted-quad, RFC 4291 IPv6 forms, and a rejection matrix that names
-   the offending input).
+   the offending input) and the default gather send every transport
+   inherits, plus a protocol direct-send suite (when a frame may bypass
+   the out queue, and that exactly the untaken tail is queued).
 2. **`wsinterop`**: own client ↔ own server over real TCP, plus raw-socket
    violations (unmasked frame → 1002, invalid close code → 1002, fragmented
    ping → 1002, invalid UTF-8 → 1007), an upgrade-hook section (a server
    bound to `127.0.0.1` explicitly whose `OnUpgradeRequest` refuses one
    `Origin` with a 403 — no `OnOpen`, no `OnClientClose` — and treats a
-   raising hook the same way), and — on Linux — a `wss://` section
+   raising hook the same way), a plaintext egress-backpressure probe
+   (a stalled reader backs the server's egress up — on Linux forcing the
+   epoll gather write short mid-message; eight 1 MiB echoes must still
+   arrive intact and in order), and — on Linux — a `wss://` section
    against a TLS listener built from a runtime-generated identity
    (handshake, echo, flow-control windows, `close_notify`, handshake
    deadline, inbound pre-handshake budget).

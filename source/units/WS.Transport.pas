@@ -56,6 +56,18 @@ type
     // -1 when the connection is dead. Short return arms OnSendReady.
     function SubmitSend(P: PByte; ALen: NativeInt): NativeInt; virtual; abstract;
 
+    // Gather send (ADR-0004): SubmitSend's contract over AFirst then
+    // ASecond, in one write where the transport can. A transport opts in
+    // with SupportsGather only where it keeps neither pointer past the
+    // call; epoll does (sendmsg), the completion transports have not yet
+    // (they copy on submit, and could gather into that one copy). The
+    // default below is a contract fallback nothing calls while
+    // SupportsGather is False: two SubmitSends, never offering the
+    // second buffer after a short first.
+    function SupportsGather: Boolean; virtual;
+    function SubmitSendV(AFirst: PByte; AFirstLen: NativeInt; ASecond: PByte;
+      ASecondLen: NativeInt): NativeInt; virtual;
+
     // Teardown. The caller must drop every reference before calling and
     // receives no further completions; OnClosed does not fire. The
     // transport frees this object (possibly deferred — see the
@@ -103,12 +115,13 @@ type
   // Two families of backend consume this record:
   //
   //   - Network.framework (macOS) terminates TLS inside the platform
-  //     stack. It reads Enabled/Pkcs12Path/Pkcs12Passphrase and IGNORES
-  //     every field below them: the flow-control watermarks, the
-  //     handshake deadline and the inbound budget are properties of the
-  //     OpenSSL memory-BIO pipeline that only the fd-owning transports
-  //     drive. nw_connection does its own buffering and its own
-  //     handshake timeout.
+  //     stack. It reads Enabled/Pkcs12Path/Pkcs12Passphrase, and
+  //     HandshakeDeadlineMs solely as its close-drain budget (below);
+  //     it IGNORES the rest: the flow-control watermarks and the
+  //     inbound budget are properties of the OpenSSL memory-BIO
+  //     pipeline that only the fd-owning transports drive, and
+  //     nw_connection does its own buffering and its own handshake
+  //     timeout.
   //   - epoll (Linux) and IOCP (Windows) terminate TLS themselves over
   //     lwpt's TransportSecurity server API (WS.Transport.TlsServer).
   //     Every field here applies.
@@ -163,7 +176,11 @@ type
     // pushing close_notify out and waiting for the peer's FIN is the
     // same "a peer that went quiet must not pin an fd forever" problem
     // on the same time scale, and a second knob for it would be a
-    // configuration surface with no distinct decision behind it.
+    // configuration surface with no distinct decision behind it. The
+    // Network.framework transport reads it for exactly that drain —
+    // how long a close may wait behind a send the peer is not taking
+    // — and for nothing else; it applies there with Enabled = False
+    // too, since plaintext closes defer behind sends the same way.
     HandshakeDeadlineMs: Integer;
 
     // Total ciphertext, in bytes, one connection may push at the server
@@ -284,6 +301,25 @@ implementation
 
 uses
   SysUtils;
+
+{ TWSTransportConn }
+
+function TWSTransportConn.SupportsGather: Boolean;
+begin
+  Result := False;
+end;
+
+function TWSTransportConn.SubmitSendV(AFirst: PByte; AFirstLen: NativeInt; ASecond: PByte;
+  ASecondLen: NativeInt): NativeInt;
+var
+  W: NativeInt;
+begin
+  Result := SubmitSend(AFirst, AFirstLen);
+  if (Result < AFirstLen) or (ASecondLen <= 0) then Exit;
+  W := SubmitSend(ASecond, ASecondLen);
+  if W < 0 then Exit(-1);
+  Inc(Result, W);
+end;
 
 function WSTransportNoTls: TWSTransportTls;
 begin
