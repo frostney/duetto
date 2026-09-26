@@ -159,7 +159,13 @@ begin
   FNoTakeover := ANoTakeover;
   FMaxOut := AMaxOut;
   FillChar(FStrm, SizeOf(FStrm), 0);
-  FLive := inflateInit2(FStrm, -AWindowBits) = Z_OK;
+  // Always inflate with the full 32 KB window. The negotiated
+  // *_max_window_bits (9..15) bounds the peer's compressor, not what a
+  // hostile stream may encode: deflate distances reach 32768 regardless,
+  // and paszlib wraps a distance beyond a smaller window to memory before
+  // the allocation. With 32 KB no distance can leave the window.
+  // AWindowBits stays in the signature for the negotiated value.
+  FLive := inflateInit2(FStrm, -15) = Z_OK;
   ClearWindow;
   SetLength(FOut, 4096);
 end;
