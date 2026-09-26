@@ -1,0 +1,33 @@
+# FPC 3.2.2 i386-win32 cross toolchain on a Linux host (arm64 or amd64),
+# built from the official source tarball: the compiler, the win32 RTL,
+# and the packages duetto needs (rtl-objpas, rtl-generics, rtl-extra for
+# Sockets/WinSock2, fcl-process, paszlib, hash). No downloads at build
+# time beyond the checksum-verified FPC source.
+#
+#   docker build -f tools/win32/Dockerfile.cross -t duetto-win32-cross:3.2.2 tools/win32
+#
+# Reconstructed from the lwpt win32 cross image (2026-08); the compiler
+# build applies the same one-line fix for hosts whose native Extended is
+# Double-sized (aarch64).
+FROM debian:bookworm
+
+ARG FPC_VERSION=3.2.2
+ARG FPC_SOURCE_SHA256=d542e349de246843d4f164829953d1f5b864126c5b62fd17c9b45b33e23d2f44
+
+RUN apt-get update -qq \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+       binutils-mingw-w64-i686 build-essential ca-certificates curl fp-compiler \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY build-cross-toolchain.sh /usr/local/bin/build-cross-toolchain
+COPY ppcross386-wrapper /usr/local/bin/ppcross386-wrapper
+COPY compile.sh /usr/local/bin/compile-win32
+
+RUN chmod +x /usr/local/bin/build-cross-toolchain /usr/local/bin/ppcross386-wrapper /usr/local/bin/compile-win32 \
+  && curl -fsSL "https://downloads.freepascal.org/fpc/dist/${FPC_VERSION}/source/fpc-${FPC_VERSION}.source.tar.gz" \
+       -o "/tmp/fpc-${FPC_VERSION}.source.tar.gz" \
+  && printf '%s  %s\n' "${FPC_SOURCE_SHA256}" "/tmp/fpc-${FPC_VERSION}.source.tar.gz" | sha256sum --check \
+  && /usr/local/bin/build-cross-toolchain "/tmp/fpc-${FPC_VERSION}.source.tar.gz" \
+  && rm -f "/tmp/fpc-${FPC_VERSION}.source.tar.gz"
+
+ENTRYPOINT ["/usr/local/bin/compile-win32"]

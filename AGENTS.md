@@ -42,6 +42,9 @@ no bootstrap. Dependencies resolve from the same release tag.
 lwpt install         # resolve deps, regenerate lwpt.cfg + lwpt.lock
 lwpt install --frozen  # CI mode: verify lockfile + committed modules, no network
 lwpt format --check  # formatter gate (no flag = rewrite in place)
+lwpt agents --check  # generated AGENTS.md command block current?
+lwpt health          # complexity ceilings ([health] in lwpt.toml)
+lwpt duplication     # clone ceiling ([duplication] in lwpt.toml)
 lwpt build           # all programs (Linux, macOS, Windows)
 lwpt test            # co-located unit suites (source/units/*.Test.pas)
 ./build/wsinterop    # live-socket battery (all platforms), exit 0 = pass
@@ -53,7 +56,7 @@ tools/autobahn.sh client   # Autobahn fuzzingserver vs wsautobahn (Docker)
 
 | Path | Role |
 | --- | --- |
-| `source/units/` | Library: `WS.Frame`, `WS.Utf8`, `WS.Handshake`, `WS.Deflate`, `WS.Protocol` (sans-I/O core), `WS.Client`, `WS.Transport(.Epoll/.NetworkFramework/.Iocp)`, `WS.Transport.TlsServer` (server TLS for the fd-owning transports), `WS.Server` (session layer) |
+| `source/units/` | Library: `WS.Frame`, `WS.Utf8`, `WS.Handshake`, `WS.Deflate`, `WS.Protocol` (sans-I/O core), `WS.Client`, `WS.Transport(.Epoll/.NetworkFramework/.Iocp)`, `WS.Transport.PostQueue` (cross-thread post hand-off), `WS.Transport.TlsServer` (server TLS for the fd-owning transports), `WS.Server` (session layer) |
 | `source/apps/` | Programs: `wsecho`, `wsprobe`, `wsinterop`, `wsbench`, `wsautobahn` |
 | `tests/autobahn/` | Autobahn testsuite configs (reports/ is generated) |
 | `tools/` | Cross-implementation checks, benchmarks, Autobahn runner |
@@ -83,10 +86,14 @@ rule may live in one.
 ## Safety / Boundaries
 
 - Never commit generated state: `build/`, `tests/autobahn/reports/`,
-  `.lwpt/tmp/`, `.lwpt/install.lock`.
+  `reports-macos/`, `.lwpt/tmp/`, `.lwpt/sessions/`, `.lwpt/workers/`,
+  `.lwpt/install.lock`.
 - Benchmarks (`wsbench`, `tools/benchmatrix.sh`) are measurement tools;
   never wire their numbers into CI assertions.
 - Edit `AGENTS.md` only — `CLAUDE.md` is a symlink to it.
+- Human contributors follow [CONTRIBUTING.md](CONTRIBUTING.md) (merge
+  gate, commit format); it links here for the constraints rather than
+  repeating them.
 
 <!-- lwpt:agents:begin -->
 

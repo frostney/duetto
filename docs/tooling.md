@@ -5,7 +5,7 @@
 - FPC **3.2.2** (Delphi mode) is the pinned compiler; the [lwpt](https://github.com/frostney/lwpt) **0.7.0 release binary** is the single toolchain entry point for install / build / test / format.
 - The Autobahn testsuite runs via Docker (`crossbario/autobahn-testsuite`) through `tools/autobahn.sh`, judged by `tools/autobahn-check.py`.
 - Lefthook runs `lwpt format` pre-commit; markdownlint and the PR workflow are the blocking gates.
-- CI: `pr.yml` is the fast Ubuntu pre-merge gate, `ci.yml` (push to main) adds the platform matrix and the Autobahn suite.
+- CI: `pr.yml` is the pre-merge gate (native Linux, macOS and win64), `ci.yml` (push to main) adds the per-arch platform matrix and the Autobahn suite.
 - Changelog generation is git-cliff from Conventional Commits (`cliff.toml`).
 
 ## Toolchain
@@ -24,7 +24,10 @@
 lwpt install         # resolve deps, regenerate lwpt.cfg + lwpt.lock
 lwpt install --frozen  # CI mode: verify lockfile + committed modules, refuse network
 lwpt format          # rewrite Pascal sources in place
-lwpt format --check  # CI / hook form: exit non-zero on drift
+lwpt format --check  # CI form: exit non-zero on drift (the hook rewrites in place)
+lwpt agents --check  # CI form: the generated AGENTS.md block must be current
+lwpt health          # complexity ceilings from [health] in lwpt.toml
+lwpt duplication     # clone ceiling from [duplication] in lwpt.toml
 lwpt build [target]  # binaries land under build/
 lwpt test            # discovers source/units/*.Test.pas
 ./build/wsinterop    # live-socket E2E battery
@@ -47,7 +50,7 @@ Industry conformance fuzzing, run in both directions via
 `crossbario/autobahn-testsuite` (Docker):
 
 ```bash
-tools/autobahn.sh server   # suite fuzzes build/wsecho (Linux only: epoll + host networking)
+tools/autobahn.sh server   # suite fuzzes build/wsecho (Linux only: Docker host networking)
 tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
 ```
 
@@ -149,7 +152,35 @@ Proven by the native-Autobahn spike (issue #10, run 29694505585:
 recipe validated in five pushes, graduated as the `autobahn-macos`
 job).
 
+## Windows without Windows (Wine)
+
+`tools/win32-wine.sh` cross-compiles a program for i386-win32 and runs
+it under Wine 8, both inside Docker (OrbStack or Docker Desktop, any host
+architecture — the images are emulated where needed):
+
+```bash
+tools/win32-wine.sh                  # build the two images if missing, run wsinterop
+DUETTO_WIN32_PUBLISH=9001 tools/win32-wine.sh wsecho --port=9001  # reachable on 127.0.0.1:9001
+DUETTO_WIN32_REBUILD=1 tools/win32-wine.sh
+```
+
+The whole `wsinterop` battery — the IOCP transport, WinSock2 client,
+the limits section — passes under Wine in about 20 seconds after the
+one-off image builds (`duetto-win32-cross:3.2.2`, an FPC 3.2.2 cross
+toolchain built from the checksum-verified source tarball, ~2 minutes;
+`duetto-wine32:bookworm`, Wine on 32-bit Debian with its prefix
+pre-created). It is the fast pre-push loop for anything touching
+`WS.Transport.Iocp`, and it reproduces IOCP-specific behaviour the
+other transports do not show (a dropped connection keeps draining
+input behind its FIN, for one). It is not a substitute for the CI legs:
+real kernel, SChannel, and win64 only run there — Wine's SChannel is
+absent, so `wss://` stays untested locally, and win32 is the only Wine
+target because Wine's win64 needs a 64-bit userland the i386 image
+does not carry.
+
 ## Markdown
 
-markdownlint-cli2 (config: `.markdownlint-cli2.jsonc`) lints every
-committed Markdown file; the PR `docs` job is blocking.
+markdownlint-cli2 (config: `.markdownlint-cli2.jsonc`) lints the
+committed Markdown files not listed in that config's `ignores` (fetched
+skills, `CHANGELOG.md` and the like are excluded); the PR `docs` job is
+blocking.

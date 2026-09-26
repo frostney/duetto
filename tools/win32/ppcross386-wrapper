@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# `make rtl` passes -P<cpu> to the compiler it is given; the cross
+# compiler already is the i386 compiler and rejects the flag.
+set -euo pipefail
+args=()
+for a in "$@"; do
+  case "$a" in -P*) ;; *) args+=("$a") ;; esac
+done
+exec /opt/fpc-cross/lib/fpc/3.2.2/ppcross386 "${args[@]}"

@@ -45,7 +45,7 @@ lwpt test            # every source/units/*.Test.pas suite, all green
 ## Run something
 
 ```bash
-./build/wsecho --port=9001                  # echo server (Linux/macOS)
+./build/wsecho --port=9001                  # echo server (Linux, macOS, Windows)
 ./build/wsprobe ws://localhost:9001/ --deflate   # probe it from a second shell
 ```
 

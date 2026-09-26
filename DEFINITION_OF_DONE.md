@@ -25,14 +25,20 @@ recorded reason.
   ```sh
   lwpt install --frozen
   lwpt format --check
-  lwpt build            # Linux; on macOS the platform-appropriate targets
+  lwpt agents --check
+  lwpt health
+  lwpt duplication
+  lwpt build            # every program, on Linux, macOS and Windows alike
   lwpt test
   ```
 
 - Focused tests covering the changed behaviour pass first, including
   negative paths (violations must close with the right code).
 - `./build/wsinterop` passes when client, server, or protocol behaviour
-  changed (Linux until the macOS backend lands).
+  changed — on the platform whose transport the change touches, and on
+  Linux with `WSINTEROP_REQUIRE_TLS=1` when server TLS is involved (the
+  wss:// section is Linux-only; when its TLS prerequisites are missing
+  it prints a skip, which the knob turns into a failure).
 - Protocol-behaviour changes anticipate the Autobahn suite: it runs on
   every push to main in both directions and a red or skipped suite
   blocks release; run `tools/autobahn.sh` locally (Linux + Docker) when

@@ -30,6 +30,13 @@ tests/autobahn/reports/
 # job (globs **/*.md) never lints .agent/HANDOFF.md.
 .agent/
 
+# Contender/tool build output that never belongs in the tree
+# (tools/rust-echo's Cargo.lock stays committed: the contender builds the
+# same dependency versions on every machine).
+tools/rust-echo/target/
+__pycache__/
+*.pyc
+
 # OS noise.
 .DS_Store
 Thumbs.db
@@ -37,8 +44,3 @@ Thumbs.db
 # Autobahn reports from the native macOS merge job (and local runs of
 # its recipe) — generated, like tests/autobahn/reports/.
 reports-macos/
-
-# tools/rust-echo cargo output (tools/benchmatrix.sh's default RUST_ECHO
-# path builds here). Its Cargo.lock is committed: the contender should
-# build the same dependency versions on every machine.
-tools/rust-echo/target/

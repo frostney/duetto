@@ -3,8 +3,8 @@ name: CI
 # Two-stage post-merge confirmation, mirroring the lwpt / GocciaScript
 # CI pattern. Sister workflow:
 #
-#   pr.yml — every PR: fast Ubuntu-native gate (the authoritative
-#            pre-merge signal).
+#   pr.yml — every PR: the native Linux / macOS / win64 gate (the
+#            authoritative pre-merge signal).
 #
 # ci.yml runs ONLY on push to main + manual dispatch. PRs do not
 # trigger ci.yml — pr.yml owns the PR flow. This avoids the
@@ -102,11 +102,12 @@ jobs:
             fpc-win-target: i386-win32
             exe: .exe
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -116,12 +117,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fpc
           fpc -iV
+          [ "$(fpc -iV)" = "3.2.2" ] || { echo "::error::FPC $(fpc -iV) installed, 3.2.2 pinned"; exit 1; }
 
       - name: Install FPC (brew)
         if: matrix.fpc-install == 'brew'
         run: |
           brew install fpc
           fpc -iV
+          [ "$(fpc -iV)" = "3.2.2" ] || { echo "::error::FPC $(fpc -iV) installed, 3.2.2 pinned"; exit 1; }
 
       # One official installer carries native win32 and the win64 cross
       # set (choco's package is i386-only and downloads.freepascal.org
@@ -214,14 +217,26 @@ jobs:
         if: matrix.format-check == true
         run: lwpt agents --check
 
+      - name: lwpt health (complexity ceilings, one runner)
+        if: matrix.format-check == true
+        run: lwpt health
+
+      - name: lwpt duplication (clone ceiling, one runner)
+        if: matrix.format-check == true
+        run: lwpt duplication
+
       - name: lwpt build (all programs)
         run: lwpt build
 
       - name: lwpt test (co-located unit suites)
         run: lwpt test
 
+      # WSINTEROP_REQUIRE_TLS: the Linux legs carry the server's only
+      # runtime TLS coverage; a missing OpenSSL must fail, not skip.
       - name: wsinterop (live-socket battery, own client vs own server)
         if: matrix.loopback-battery != 'skip'
+        env:
+          WSINTEROP_REQUIRE_TLS: ${{ matrix.fpc-install == 'apt' && '1' || '' }}
         run: ./build/wsinterop${{ matrix.exe }}
 
       # Cross-implementation net vs the python `websockets` reference,
@@ -242,16 +257,17 @@ jobs:
           "$PY" -m venv "$RUNNER_TEMP/crosscheck-venv"
           VENV_BIN="$RUNNER_TEMP/crosscheck-venv/bin"
           [ -d "$VENV_BIN" ] || VENV_BIN="$RUNNER_TEMP/crosscheck-venv/Scripts"   # Windows venv layout
-          "$VENV_BIN/pip" install --quiet websockets
+          "$VENV_BIN/pip" install --quiet "websockets==17.1"
           "$VENV_BIN/python" tools/crosscheck.py
 
   autobahn:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -260,6 +276,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fpc
           fpc -iV
+          [ "$(fpc -iV)" = "3.2.2" ] || { echo "::error::FPC $(fpc -iV) installed, 3.2.2 pinned"; exit 1; }
 
       - name: Install lwpt (release binary, checksum-verified)
         run: |
@@ -286,7 +303,7 @@ jobs:
 
       - name: Upload Autobahn reports
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: autobahn-reports
           retention-days: 30
@@ -301,11 +318,12 @@ jobs:
   # the Linux job. Every pin below is load-bearing py2 archaeology.
   autobahn-macos:
     runs-on: macos-latest
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -313,6 +331,7 @@ jobs:
         run: |
           brew install fpc
           fpc -iV
+          [ "$(fpc -iV)" = "3.2.2" ] || { echo "::error::FPC $(fpc -iV) installed, 3.2.2 pinned"; exit 1; }
 
       - name: Install lwpt (release binary, checksum-verified)
         run: |
@@ -352,7 +371,7 @@ jobs:
           "$PY" -m pip install --user --quiet "Twisted==20.3.0"
           "$PY" -m pip install --user --quiet "six==1.16.0" \
             "cryptography==3.3.2" "pyOpenSSL==19.1.0"
-          "$PY" -m pip install --user --quiet autobahntestsuite
+          "$PY" -m pip install --user --quiet "autobahntestsuite==25.10.1"
           "$HOME/Library/Python/2.7/bin/wstest" --help >/dev/null
 
       - name: Autobahn fuzzingclient vs wsecho (native, both agents)
@@ -382,7 +401,7 @@ jobs:
 
       - name: Upload macOS Autobahn reports
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: autobahn-macos-reports
           retention-days: 30
