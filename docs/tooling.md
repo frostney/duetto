@@ -32,7 +32,7 @@ lwpt build [target]  # binaries land under build/
 lwpt test            # discovers source/units/*.Test.pas
 ./build/wsinterop    # live-socket E2E battery
 ./build/wsbench      # component benchmarks (measurement only — never a CI assertion)
-tools/benchmatrix.sh # cross-implementation benchmark matrix
+tools/benchmatrix.sh # cross-implementation benchmark matrix (see Benchmarks)
 tools/crosscheck.py  # validate against Python websockets, both directions
 ```
 
@@ -63,6 +63,35 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
 - `tools/autobahn-check.py` judges `index.json`: `behavior` must be
   OK / NON-STRICT / INFORMATIONAL / UNIMPLEMENTED and `behaviorClose`
   OK / INFORMATIONAL / UNIMPLEMENTED; anything else fails the run.
+
+## Benchmarks
+
+Measurement tools only — never wire their numbers into CI assertions.
+Build in release mode first (`lwpt build --mode release`); a dev build
+keeps range and overflow checks on, and `wsbench`'s banner says which
+one is running.
+
+- `./build/wsbench` — component benchmarks per layer plus the
+  in-process protocol round trip (no sockets).
+- `tools/benchmatrix.sh` — uWebSockets `load_test` (100 connections)
+  against duetto's `wsecho`, the tungstenite echo in `tools/rust-echo`,
+  and the Python `websockets` echo in `tools/pyecho.py`, then a
+  permessage-deflate pass driven by `tools/deflbench.py`. Every path is
+  an environment override (`LOAD_TEST`, `DUETTO`, `RUST_ECHO`,
+  `PYTHON`); missing contenders are reported as skipped, and a run that
+  produced no samples says so instead of scoring 0. Each score is the
+  best full 4-second `load_test` window after the ramp-up (two per run
+  at the default `DUR=14`). `SERVER_CPU` / `CLIENT_CPU` (Linux) pin the
+  server and the generator with `taskset`: the same
+  core for both reproduces the shared-core setup, separate physical
+  cores stop the generator competing with the server. Needs GNU
+  `stdbuf` and `timeout` (`gstdbuf` / `gtimeout` on macOS); the deflate
+  pass needs Python `websockets` 14 or newer.
+
+```bash
+LOAD_TEST=~/src/uWebSockets/benchmarks/load_test \
+  SERVER_CPU=2 CLIENT_CPU=4 tools/benchmatrix.sh
+```
 
 ## CI
 
