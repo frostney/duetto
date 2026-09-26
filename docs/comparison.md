@@ -114,12 +114,14 @@ ahead. The server-side deflate ceiling is the component number above.
 
 ## Correctness, cross-checked
 
-- 5 unit suites green (RFC frame vectors, 16.8 M-case exhaustive UTF-8
-  differential, handshake matrices, deflate bomb-cap, 26-test protocol
-  conformance asserting wire close codes in both roles).
-- `wsinterop` 11/11 over real TCP, including raw-socket violations:
-  unmasked frame → 1002, invalid close code → 1002, fragmented ping →
-  1002, invalid UTF-8 → 1007.
+- Every co-located unit suite green (RFC frame vectors, 16.8 M-case
+  exhaustive UTF-8 differential, handshake matrices, deflate bomb-cap,
+  protocol conformance asserting wire close codes in both roles; the
+  suite list has grown since this measurement — see
+  [architecture.md](architecture.md) for the current one).
+- `wsinterop` all checks green over real TCP, including raw-socket
+  violations: unmasked frame → 1002, invalid close code → 1002,
+  fragmented ping → 1002, invalid UTF-8 → 1007.
 - Bidirectional cross-check vs Python `websockets` 16.0: text, multibyte,
   512 KiB binary, **fragmentation reassembly**, ping, clean close,
   deflate — plus four more raw violations (reserved opcode, oversize

@@ -1,7 +1,7 @@
 // markdownlint-cli2 config for duetto's Markdown corpus.
 //
 // Consumed by .github/workflows/pr.yml's `docs` job
-// (DavidAnson/markdownlint-cli2-action@v19). The job is blocking — any
+// (DavidAnson/markdownlint-cli2-action, SHA-pinned in pr.yml). The job is blocking — any
 // failure rejects the PR. Mirrors lwpt's config.
 //
 // Disabled rules below are deliberate: they're either incompatible

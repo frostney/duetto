@@ -1,8 +1,11 @@
 # tungstenite echo baseline for docs/comparison.md (tools/benchmatrix.sh).
 # Cargo.lock is committed (resolved with rustc 1.98): `cargo build
-# --release --locked` builds the measured versions. An older toolchain
-# (e.g. rustc 1.75 from Ubuntu 24.04 apt) may need newer crates held back,
-# e.g. `cargo update -p idna_adapter --precise 1.1.0`.
+# --release --locked` builds the measured versions and needs rustc 1.88+
+# (icu_normalizer 2.3 and idna_adapter 1.2 are edition-2024 crates; the
+# lockfile itself is v4, cargo 1.78+). On an older toolchain (e.g.
+# rustc 1.75 from Ubuntu 24.04 apt) delete Cargo.lock, run `cargo update
+# -p idna_adapter --precise 1.1.0`, then build; numbers from that graph
+# are not the measured ones.
 [package]
 name = "rust-echo"
 version = "0.1.0"
