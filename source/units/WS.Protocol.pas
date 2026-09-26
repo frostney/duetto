@@ -167,6 +167,9 @@ var
 begin
   inherited Create;
   FRole := ARole;
+  // The caps compare unsigned (64-bit lengths); a negative cap would
+  // become 2^64 - 1 there and admit anything. Treat it as zero.
+  if AMaxMessage < 0 then AMaxMessage := 0;
   FMaxMessage := AMaxMessage;
   FCloseCode := 1005; // "no status received" until told otherwise
 

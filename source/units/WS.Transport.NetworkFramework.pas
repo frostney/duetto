@@ -215,6 +215,7 @@ procedure Nw_connection_set_state_changed_handler(AConn,
   ABlock: Pointer); cdecl; external name 'nw_connection_set_state_changed_handler';
 procedure Nw_connection_start(AConn: Pointer); cdecl; external name 'nw_connection_start';
 procedure Nw_connection_cancel(AConn: Pointer); cdecl; external name 'nw_connection_cancel';
+procedure Nw_connection_force_cancel(AConn: Pointer); cdecl; external name 'nw_connection_force_cancel';
 procedure Nw_connection_receive(AConn: Pointer; AMin, AMax: UInt32;
   ABlock: Pointer); cdecl; external name 'nw_connection_receive';
 procedure Nw_connection_send(AConn, AData, AContext: Pointer;
@@ -346,8 +347,8 @@ type
   // nothing else. The Pascal connection object may already be freed
   // by the time the timer fires (the send completed, the cancel ran,
   // the cancelled state landed), so the block must not name it —
-  // nw_connection_cancel is idempotent and safe on a cancelled
-  // connection, which is all the timer needs. Freed by its own invoke.
+  // cancelling is idempotent and safe on a cancelled connection, which
+  // is all the timer needs. Freed by its own invoke.
   PWSNwDrainTimer = ^TWSNwDrainTimer;
   TWSNwDrainTimer = record
     Nw: Pointer;
@@ -360,7 +361,10 @@ var
 begin
   EnsureThreadInit;
   D := PWSNwDrainTimer(ABlock^.Ctx);
-  Nw_connection_cancel(D^.Nw);
+  // Force: the deadline means the peer is not reading, and a graceful
+  // cancel would still try to flush (and, over TLS, write close_notify)
+  // into the stalled send.
+  Nw_connection_force_cancel(D^.Nw);
   Nw_release(D^.Nw);
   Dispose(D);
 end;
@@ -757,13 +761,16 @@ begin
   // Cancel under the live lock: a connection whose peer hangs up at
   // this very moment runs ConnFinalized on its own queue, and that
   // frees the object — a snapshot read outside the lock would
-  // dereference it. nw_connection_cancel is thread-safe, idempotent
-  // and asynchronous, so holding the lock across it blocks nothing
-  // but the finalizers' own LiveUntrack, briefly.
+  // dereference it. Cancelling is thread-safe, idempotent and
+  // asynchronous, so holding the lock across it blocks nothing but the
+  // finalizers' own LiveUntrack, briefly. Force-cancel, as the other
+  // transports' Shutdown force-closes: a graceful cancel would keep
+  // flushing a send a stalled peer never takes, and the drain below
+  // waits on every cancelled state.
   FLiveLock.Acquire;
   try
     for I := 0 to FLiveCount - 1 do
-      Nw_connection_cancel(FLive[I].FNw);
+      Nw_connection_force_cancel(FLive[I].FNw);
   finally
     FLiveLock.Release;
   end;
