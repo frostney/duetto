@@ -623,9 +623,15 @@ begin
   AEof := Got = 0;
 end;
 
-// Read frames until a close frame arrives; return its status code
-// (0 if the peer hung up without one).
-function RawReadCloseCode(AFd: Tsocket; const ALeftover: TBytes): Word;
+type
+  PTlsSession = ^TTransportSecurityConnection;
+
+// Read frames until a close frame arrives; return its status code (0 if
+// the peer hung up without one). ATls = nil reads the raw socket AFd;
+// otherwise the TLS session (AFd is then unused) — one frame walk for
+// both, so the two cannot drift.
+function ReadCloseCode(AFd: Tsocket; ATls: PTlsSession;
+  const ALeftover: TBytes): Word;
 var
   Buf: TBytes;
   Len, Got, Used: NativeInt;
@@ -658,7 +664,10 @@ begin
     end;
     if R = wprProtocolError then Exit(0);
     SetLength(Buf, Len + 4096);
-    Got := fpRecv(AFd, @Buf[Len], 4096, 0);
+    if ATls = nil then
+      Got := fpRecv(AFd, @Buf[Len], 4096, 0)
+    else
+      Got := TransportSecurityRead(ATls^, PWSByteSpan(@Buf[Len])^, 4096);
     if Got <= 0 then Exit(0); // EOF/timeout without close frame
     Len := Len + Got;
     SetLength(Buf, Len);
@@ -925,47 +934,6 @@ begin
   SetLength(Result, Length(Raw) - HdrEnd);
   if Length(Result) > 0 then
     Move(Raw[HdrEnd + 1], Result[0], Length(Result));
-end;
-
-function TlsProbeReadCloseCode(var ATls: TTransportSecurityConnection;
-  const ALeftover: TBytes): Word;
-var
-  Buf: TBytes;
-  Len, Got, Used: NativeInt;
-  H: TWSFrameHeader;
-  R: TWSParseResult;
-begin
-  Result := 0;
-  Buf := Copy(ALeftover);
-  Len := Length(Buf);
-  repeat
-    R := ParseFrameHeader(PByte(Buf), Len, H);
-    if R = wprOK then
-    begin
-      Used := H.HeaderLen;
-      if Len - Used < H.PayloadLen then
-        R := wprNeedMore
-      else if H.Opcode = WS_OP_CLOSE then
-      begin
-        if H.PayloadLen >= 2 then
-          Exit((Buf[Used] shl 8) or Buf[Used + 1])
-        else
-          Exit(0);
-      end
-      else
-      begin
-        Delete(Buf, 0, Used + H.PayloadLen);
-        Dec(Len, Used + H.PayloadLen);
-        Continue;
-      end;
-    end;
-    if R = wprProtocolError then Exit(0);
-    SetLength(Buf, Len + 4096);
-    Got := TransportSecurityRead(ATls, PWSByteSpan(@Buf[Len])^, 4096);
-    if Got <= 0 then Exit(0);
-    Len := Len + Got;
-    SetLength(Buf, Len);
-  until False;
 end;
 
 // True when the peer's TLS layer shut down in an orderly way: lwpt's
@@ -1749,7 +1717,7 @@ begin
   // socket must still be closed behind the close frame.
   Fd := RawUpgraded(Port);
   RawSendFrame(Fd, WS_OP_TEXT, 'unmasked', False);
-  Check(RawReadCloseCode(Fd, nil) = 1002, 'violation -> 1002 (raising close handler)');
+  Check(ReadCloseCode(Fd, nil, nil) = 1002, 'violation -> 1002 (raising close handler)');
   RawReadToEof(Fd, Eof);
   CloseSocket(Fd);
   Check(Eof, 'raising OnClientClose on a server drop: socket still closed');
@@ -1868,7 +1836,7 @@ begin
   // The server closes; the peer reads the close frame and never answers.
   Fd := RawUpgraded(LimPort);
   RawSendFrame(Fd, WS_OP_TEXT, CloseCue, True);
-  Ok := RawReadCloseCode(Fd, nil) = 1000;
+  Ok := ReadCloseCode(Fd, nil, nil) = 1000;
   Elapsed := RawWaitForClose(Fd, 3000);
   CloseSocket(Fd);
   Check(Ok and (Elapsed >= 0) and (Elapsed < 1500),
@@ -1879,7 +1847,7 @@ begin
   // told 1001 at the idle bound, then dropped.
   Fd := RawUpgraded(LimPort);
   LastTick := GetTickCount64;
-  Ok := RawReadCloseCode(Fd, nil) = 1001;
+  Ok := ReadCloseCode(Fd, nil, nil) = 1001;
   Elapsed := Integer(GetTickCount64 - LastTick);
   Ok := Ok and (RawWaitForClose(Fd, 3000) >= 0);
   CloseSocket(Fd);
@@ -1990,7 +1958,7 @@ begin
   FdC := RawUpgraded(LimPort);
   Ok := (FdA <> -1) and (FdB <> -1) and (FdC = -1);
   RawSendFrame(FdA, WS_OP_CLOSE, #$03#$E8, True);
-  RawReadCloseCode(FdA, nil);
+  ReadCloseCode(FdA, nil, nil);
   RawWaitForClose(FdA, 3000);
   CloseSocket(FdA);
   // The slot frees when the server has released the connection, which
@@ -2003,10 +1971,10 @@ begin
   until GetTickCount64 > Deadline;
   Ok := Ok and (FdC <> -1);
   RawSendFrame(FdC, WS_OP_CLOSE, #$03#$E8, True);
-  RawReadCloseCode(FdC, nil);
+  ReadCloseCode(FdC, nil, nil);
   CloseSocket(FdC);
   RawSendFrame(FdB, WS_OP_CLOSE, #$03#$E8, True);
-  RawReadCloseCode(FdB, nil);
+  ReadCloseCode(FdB, nil, nil);
   CloseSocket(FdB);
   Check(Ok, 'third connection refused at MaxConnections = 2, admitted ' +
     'once a slot frees');
@@ -2060,82 +2028,17 @@ var
   StressPhase: ShortString;
   TotalCycles, TotalPushes, TotalDrops, TotalTransient: Integer;
   AllOk, PushAllOk: Boolean;
-  // Plain-request section
-  PlainHost: TPlainHost;
-  PlainSrvT: TServerThread;
-  PlainPort: Word;
-  PlainReq, PlainGot, PlainWant, PlainRaw: RawByteString;
-  PlainHits, PlainHitsBefore: Integer;
   Eof: Boolean;
   ReadRes: TWSReadResult;
-  // Upgrade-hook section
-  Gate: TUpgradeGate;
-  HookSrvT: TServerThread;
-  HookPort: Word;
-  HookResp: RawByteString;
-  Hits, Opens, Closes, CloseSendsAlive: Integer;
-  {$ifdef LINUX}
-  // Server-TLS section
-  TlsDir, TlsUrl: string;
-  TlsCfg: TWSTransportTls;
-  TlsSrvT: TServerThread;
-  TlsCli: TWSClient;
-  TlsPort: Word;
-  TlsProbe: TTransportSecurityConnection;
-  TlsProbeFd: Tsocket;
-  TlsLeft, Garbage: TBytes;
-  TlsSizes: array of Integer;
-  TlsCode: Word;
-  TlsElapsed: Integer;
-  TlsOk: Boolean;
-  // SSL_CERT_FILE is process-global and OpenSSL caches its trust store at
-  // first client use; capture whatever it held so teardown can restore it
-  // (or unset) before the CA file is deleted, rather than leaving it
-  // pointing at a path that no longer exists.
-  TlsPriorCert: PAnsiChar;
-  TlsHadPriorCert: Boolean;
-  TlsPriorCertVal: AnsiString;
-  {$endif}
+
+// ---------------------------------------------------------------------------
+// The battery's sections, run in order by the main body. They share the
+// program-level state above (the main server, its port and URL, the
+// stress tracker, the watchdog phase marker).
+// ---------------------------------------------------------------------------
+
+procedure RunClientServerSection;
 begin
-  {$ifdef UNIX}
-  // Ignore SIGPIPE once, up front and unconditionally — before any
-  // section, present openssl or not — so the global signal disposition
-  // is deterministic for the whole battery. The TLS close_notify probes
-  // SSL_shutdown into a peer that may already be gone, and a write into a
-  // reset socket would otherwise take the process down with a signal
-  // instead of surfacing as an EPIPE a check can report.
-  fpSignal(SIGPIPE, SignalHandler(SIG_IGN));
-  {$endif}
-  Echo := TEcho.Create;
-  Tracker := TStressTracker.Create;
-  SrvT := TServerThread.Create(True);
-  SrvT.Srv := TWSServer.Create(0, True); // port 0 = kernel-assigned
-  SrvT.Srv.OnMessage := Echo.OnMsg;
-  // Wired before the server thread starts so the method-pointer writes
-  // can never tear against a concurrent open/close; the tracker idles
-  // through the single-connection sections and matters for the stress.
-  SrvT.Srv.OnOpen := Tracker.HandleOpen;
-  SrvT.Srv.OnClientClose := Tracker.HandleClose;
-  Port := SrvT.Srv.Port;
-  Url := Format('ws://127.0.0.1:%d/', [Port]);
-  SrvT.Start;
-  WriteLn('server on ', Port);
-  Flush(Output);
-  LastTick := GetTickCount64;
-
-  // The watchdog covers the whole battery, not just the storm: every
-  // section before it also blocks in unbounded Connect/ReadMessage calls
-  // that a wedged accept path would hang forever. Same overall bound —
-  // it simply starts counting at the first connect instead of the last
-  // section, and the phase marker says where the process got stuck.
-  StressDone := False;
-  StressPhase := 'single-connection sections';
-  Watchdog := TStressWatchdog.Create(True);
-  Watchdog.Done := @StressDone;
-  Watchdog.Srv := SrvT;
-  Watchdog.Phase := @StressPhase;
-  Watchdog.Start;
-
   // --- duetto client vs duetto server ---------------------------------------
   Cli := TWSClient.Create;
   Cli.Connect(Url);
@@ -2173,7 +2076,10 @@ begin
   Cli.Close(1000, 'done');
   Check(Cli.CloseCode = 1000, 'clean close echoes 1000');
   Cli.Free;
+end;
 
+procedure RunHostnameSection;
+begin
   // --- hostname resolution (files before dns) -------------------------------
   // The UNIX client resolved names with DNS-only ResolveHostByName, so
   // ws://localhost failed on any glibc resolver that does not synthesize
@@ -2191,7 +2097,10 @@ begin
     'ws://localhost echo (hosts-file resolution)');
   Cli.Close(1000, 'done');
   Cli.Free;
+end;
 
+procedure RunBoundedReadSection;
+begin
   // --- bounded ReadMessage (ws:// only) -----------------------------------
   StressPhase := 'bounded-read section';
   Cli := TWSClient.Create;
@@ -2220,7 +2129,10 @@ begin
   Check(Cli.ReadMessage(IsText, Data, 200) = wrrClosed,
     'bounded read after a clean close reports wrrClosed');
   Cli.Free;
+end;
 
+procedure RunDeflateSection;
+begin
   // --- permessage-deflate over the wire ----------------------------------
   Cli := TWSClient.Create;
   Cli.Connect(Url, True);
@@ -2234,14 +2146,17 @@ begin
     'deflate echo ~200 KiB content-identical');
   Cli.Close;
   Cli.Free;
+end;
 
+procedure RunViolationSection;
+begin
   // --- raw-socket violations ---------------------------------------------
   StressPhase := 'violation sections';
   // A client frame without a mask: MUST fail the connection, 1002 (§5.1).
   Fd := RawConnect(Port);
   Left := RawHandshake(Fd);
   RawSendFrame(Fd, WS_OP_TEXT, 'naughty', False);
-  Code := RawReadCloseCode(Fd, Left);
+  Code := ReadCloseCode(Fd, nil, Left);
   CloseSocket(Fd);
   Check(Code = 1002, 'unmasked client frame -> close 1002');
 
@@ -2249,7 +2164,7 @@ begin
   Fd := RawConnect(Port);
   Left := RawHandshake(Fd);
   RawSendFrame(Fd, WS_OP_CLOSE, Chr(999 shr 8) + Chr(999 and $FF), True);
-  Code := RawReadCloseCode(Fd, Left);
+  Code := ReadCloseCode(Fd, nil, Left);
   CloseSocket(Fd);
   Check(Code = 1002, 'close with invalid code 999 -> close 1002');
 
@@ -2259,7 +2174,7 @@ begin
   S := #$09#$80; // FIN=0, opcode=9, masked, len 0
   S := S + #0#0#0#0; // mask key
   fpSend(Fd, @S[1], Length(S), 0);
-  Code := RawReadCloseCode(Fd, Left);
+  Code := ReadCloseCode(Fd, nil, Left);
   CloseSocket(Fd);
   Check(Code = 1002, 'fragmented ping -> close 1002');
 
@@ -2267,10 +2182,19 @@ begin
   Fd := RawConnect(Port);
   Left := RawHandshake(Fd);
   RawSendFrame(Fd, WS_OP_TEXT, #$FF#$FE'broken', True);
-  Code := RawReadCloseCode(Fd, Left);
+  Code := ReadCloseCode(Fd, nil, Left);
   CloseSocket(Fd);
   Check(Code = 1007, 'invalid UTF-8 text -> close 1007');
+end;
 
+procedure RunPlainRequestSection;
+var
+  PlainHost: TPlainHost;
+  PlainSrvT: TServerThread;
+  PlainPort: Word;
+  PlainReq, PlainGot, PlainRaw: RawByteString;
+  PlainHits, PlainHitsBefore: Integer;
+begin
   // --- plain HTTP on the WebSocket port (OnPlainRequest) ------------------
   // A second, short-lived server carries the hook: the fallback is
   // opt-in, so the main instance must stay hook-less for the refusal
@@ -2348,7 +2272,16 @@ begin
   CloseSocket(Fd);
   Check(Copy(PlainGot, 1, 12) = 'HTTP/1.1 400',
     'plain GET refused 400 when no hook is set');
+end;
 
+procedure RunUpgradeHookSection;
+var
+  Gate: TUpgradeGate;
+  HookSrvT: TServerThread;
+  HookPort: Word;
+  HookResp: RawByteString;
+  Hits, Opens, Closes, CloseSendsAlive: Integer;
+begin
   // --- bind address + OnUpgradeRequest -----------------------------------
   // A second server, bound to 127.0.0.1 explicitly (port 0 still
   // kernel-assigned) and carrying the veto hook; the main instance stays
@@ -2407,7 +2340,7 @@ begin
   begin
     RawSendFrame(Fd, WS_OP_TEXT, 'still here', True);
     RawSendFrame(Fd, WS_OP_CLOSE, #$03#$E8, True); // 1000
-    Ok := RawReadCloseCode(Fd, nil) = 1000;
+    Ok := ReadCloseCode(Fd, nil, nil) = 1000;
   end;
   CloseSocket(Fd);
   Check(Ok, 'allowed Origin -> 101, frames flow, clean close');
@@ -2441,10 +2374,32 @@ begin
   HookSrvT.Srv.Free;
   HookSrvT.Free;
   Gate.Free;
+end;
 
-  RunLimitsSection(StressPhase);
-  RunCloseHandlerSection(StressPhase);
-
+procedure RunServerTlsSection;
+{$ifdef LINUX}
+var
+  TlsDir, TlsUrl: string;
+  TlsCfg: TWSTransportTls;
+  TlsSrvT: TServerThread;
+  TlsCli: TWSClient;
+  TlsPort: Word;
+  TlsProbe: TTransportSecurityConnection;
+  TlsProbeFd: Tsocket;
+  TlsLeft, Garbage: TBytes;
+  TlsSizes: array of Integer;
+  TlsCode: Word;
+  TlsElapsed: Integer;
+  TlsOk: Boolean;
+  // SSL_CERT_FILE is process-global and OpenSSL caches its trust store at
+  // first client use; capture whatever it held so teardown can restore it
+  // (or unset) before the CA file is deleted, rather than leaving it
+  // pointing at a path that no longer exists.
+  TlsPriorCert: PAnsiChar;
+  TlsHadPriorCert: Boolean;
+  TlsPriorCertVal: AnsiString;
+  {$endif}
+begin
   // --- server TLS terminated by the transport (duetto#22) -----------------
   // Linux only, and the reason is the CLIENT half of the battery on the
   // other two platforms — both fd-owning transports now terminate wss://
@@ -2616,7 +2571,7 @@ begin
         TlsLeft := TlsProbeHandshake(TlsProbe, TlsPort);
         TlsOk := TlsOk and TlsProbeWrite(TlsProbe,
           BuildFrameBytes(WS_OP_CLOSE, #$03#$E8, True));
-        TlsCode := TlsProbeReadCloseCode(TlsProbe, TlsLeft);
+        TlsCode := ReadCloseCode(0, @TlsProbe, TlsLeft);
         TlsOk := TlsOk and (TlsCode = 1000) and
           TlsProbeSawCloseNotify(TlsProbe) and RawSawOrderlyFin(TlsProbeFd);
       except
@@ -2657,7 +2612,7 @@ begin
           BuildFrameBytes(WS_OP_CLOSE, #$03#$E8, True) +
           BuildFrameBytes(WS_OP_BINARY,
           TlsBurstPayload(0, TlsClosePipelineBytes), True));
-        TlsCode := TlsProbeReadCloseCode(TlsProbe, TlsLeft);
+        TlsCode := ReadCloseCode(0, @TlsProbe, TlsLeft);
         TlsOk := TlsOk and (TlsCode = 1000) and
           TlsProbeSawCloseNotify(TlsProbe) and RawSawOrderlyFin(TlsProbeFd);
       except
@@ -2854,7 +2809,10 @@ begin
       'written into the machine trust store; the server half is native ',
       'on every platform since lwpt 0.6.0)');
   {$endif}
+end;
 
+procedure RunStressSection;
+begin
   // --- concurrent-connections stress -------------------------------------
   StressPhase := 'storm';
   // The budget is a floor under the window in which all 33 threads are
@@ -3044,7 +3002,59 @@ begin
   StressDone := True;
   Watchdog.WaitFor; // exits within one 250 ms poll slice
   Watchdog.Free;
+end;
 
+begin
+  {$ifdef UNIX}
+  // Ignore SIGPIPE once, up front and unconditionally — before any
+  // section, present openssl or not — so the global signal disposition
+  // is deterministic for the whole battery. The TLS close_notify probes
+  // SSL_shutdown into a peer that may already be gone, and a write into a
+  // reset socket would otherwise take the process down with a signal
+  // instead of surfacing as an EPIPE a check can report.
+  fpSignal(SIGPIPE, SignalHandler(SIG_IGN));
+  {$endif}
+  Echo := TEcho.Create;
+  Tracker := TStressTracker.Create;
+  SrvT := TServerThread.Create(True);
+  SrvT.Srv := TWSServer.Create(0, True); // port 0 = kernel-assigned
+  SrvT.Srv.OnMessage := Echo.OnMsg;
+  // Wired before the server thread starts so the method-pointer writes
+  // can never tear against a concurrent open/close; the tracker idles
+  // through the single-connection sections and matters for the stress.
+  SrvT.Srv.OnOpen := Tracker.HandleOpen;
+  SrvT.Srv.OnClientClose := Tracker.HandleClose;
+  Port := SrvT.Srv.Port;
+  Url := Format('ws://127.0.0.1:%d/', [Port]);
+  SrvT.Start;
+  WriteLn('server on ', Port);
+  Flush(Output);
+  LastTick := GetTickCount64;
+
+  // The watchdog covers the whole battery, not just the storm: every
+  // section before it also blocks in unbounded Connect/ReadMessage calls
+  // that a wedged accept path would hang forever. Same overall bound —
+  // it simply starts counting at the first connect instead of the last
+  // section, and the phase marker says where the process got stuck.
+  StressDone := False;
+  StressPhase := 'single-connection sections';
+  Watchdog := TStressWatchdog.Create(True);
+  Watchdog.Done := @StressDone;
+  Watchdog.Srv := SrvT;
+  Watchdog.Phase := @StressPhase;
+  Watchdog.Start;
+
+  RunClientServerSection;
+  RunHostnameSection;
+  RunBoundedReadSection;
+  RunDeflateSection;
+  RunViolationSection;
+  RunPlainRequestSection;
+  RunUpgradeHookSection;
+  RunLimitsSection(StressPhase);
+  RunCloseHandlerSection(StressPhase);
+  RunServerTlsSection;
+  RunStressSection;
   for I := 0 to High(Linger) do
     if Linger[I] <> nil then Linger[I].Free;
   Tracker.Free;
