@@ -44,6 +44,7 @@ type
     FOutSize: NativeInt;
     FMaxOut: NativeInt;
     function Pump(P: PByte; ALen: NativeInt): Boolean;
+    procedure ClearWindow;
   public
     constructor Create(AWindowBits: Integer; ANoTakeover: Boolean;
       AMaxOut: NativeInt);
@@ -158,8 +159,31 @@ begin
   FNoTakeover := ANoTakeover;
   FMaxOut := AMaxOut;
   FillChar(FStrm, SizeOf(FStrm), 0);
-  FLive := inflateInit2(FStrm, -AWindowBits) = Z_OK;
+  // Always inflate with the full 32 KB window. The negotiated
+  // *_max_window_bits (9..15) bounds the peer's compressor, not what a
+  // hostile stream may encode: deflate distances reach 32768 regardless,
+  // and paszlib wraps a distance beyond a smaller window to memory before
+  // the allocation. With 32 KB no distance can leave the window.
+  // AWindowBits stays in the signature for the negotiated value.
+  FLive := inflateInit2(FStrm, -15) = Z_OK;
+  ClearWindow;
   SetLength(FOut, 4096);
+end;
+
+// paszlib is zlib 1.1-era inflate: its sliding window is GetMem'd, never
+// cleared, and a back-reference reaching before the start of the
+// produced output is copied from it rather than rejected (zlib 1.2 added
+// the "invalid distance too far back" check). Until the inflater
+// enforces that itself, keep the window free of anything a peer did not
+// send: zeros after init, zeros again after every context reset.
+procedure TWSInflater.ClearWindow;
+var
+  B: pInflate_blocks_state;
+begin
+  if (not FLive) or (FStrm.state = nil) then Exit;
+  B := FStrm.state^.blocks;
+  if (B = nil) or (B^.window = nil) then Exit;
+  FillChar(B^.window^, B^.zend - B^.window, 0);
 end;
 
 destructor TWSInflater.Destroy;
@@ -223,7 +247,10 @@ begin
   Move(DeflateTail, Tail, 4);
   Result := Pump(@Tail[0], 4);
   if Result and FNoTakeover then
+  begin
     Result := inflateReset(FStrm) = Z_OK;
+    ClearWindow;
+  end;
 end;
 
 end.
