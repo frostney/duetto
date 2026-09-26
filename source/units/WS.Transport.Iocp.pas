@@ -137,6 +137,11 @@ type
     // too. The peer address is never interpreted (no receive prefix).
     FAcceptBuffer: array[0..(2 * (SizeOf(TSockAddrIn6) + 16)) - 1] of Byte;
     FAcceptPending: Boolean;
+    // Set when ArmAccept could not arm (WSAENOBUFS, WSAEMFILE, ...):
+    // the listener is silent until the tick passes, then Run re-arms.
+    // Raising out of ArmAccept instead would unwind the completion
+    // thread and leave the listener unarmed for good.
+    FAcceptBackoffUntil: QWord;
     FOpen: Boolean;
     FRunning: Boolean;
     FStopping: Boolean;
@@ -154,6 +159,7 @@ type
     FTlsReadLen: DWORD;        // per-round WSARecv bound on a TLS conn
     FNextSweepTick: QWord;     // deadline sweeps are amortized on the clock
     procedure ArmAccept;
+    procedure MaybeRearmAccept;
     procedure Track(AConn: TWSIocpConn);
     procedure Untrack(AConn: TWSIocpConn);
     procedure RemoteClosed(AConn: TWSIocpConn);
@@ -212,6 +218,10 @@ const
   // that would otherwise park, and only while at least one connection
   // carries a deadline — a plaintext listener never sees it.
   TlsDeadlinePollMs = 100;
+  // How long the listener stays unarmed after AcceptEx (or the accept
+  // socket's creation) failed for want of a resource. Short: the kernel
+  // backlog is still completing handshakes meanwhile.
+  AcceptBackoffMs = 100;
 
 type
   PWSIocpBuffer = ^TWSIocpBuffer;
@@ -831,7 +841,10 @@ begin
     FAcceptSocket := C_WSASocketW(FFamily, SOCK_STREAM, IPPROTO_TCP,
       nil, 0, WSA_FLAG_OVERLAPPED);
     if FAcceptSocket = INVALID_SOCKET then
-      raise Exception.Create('accept WSASocketW() failed');
+    begin
+      FAcceptBackoffUntil := SysUtils.GetTickCount64 + QWord(AcceptBackoffMs);
+      Exit;
+    end;
     FillChar(FAcceptOverlapped, SizeOf(FAcceptOverlapped), 0);
     FillChar(FAcceptBuffer, SizeOf(FAcceptBuffer), 0);
     Bytes := 0;
@@ -850,8 +863,15 @@ begin
     WinSock2.closesocket(FAcceptSocket);
     FAcceptSocket := INVALID_SOCKET;
     if (Err <> WSAECONNRESET) and (Err <> WSAECONNABORTED) then
-      raise Exception.CreateFmt('AcceptEx() failed (%d)', [Err]);
+    begin
+      // Out of a resource (WSAENOBUFS, WSAEMFILE, ...) or something
+      // stranger: leave the listener unarmed for a beat rather than
+      // for good, and let Run try again.
+      FAcceptBackoffUntil := SysUtils.GetTickCount64 + QWord(AcceptBackoffMs);
+      Exit;
+    end;
   until False;
+  FAcceptBackoffUntil := 0;
   FAcceptPending := True;
 end;
 
@@ -1433,9 +1453,21 @@ end;
 function TWSIocpTransport.DeadlineBoundedWait(ATimeout: DWORD): DWORD;
 begin
   Result := ATimeout;
+  if FAcceptBackoffUntil <> 0 then
+    if (Result = InfiniteWait) or (Result > DWORD(AcceptBackoffMs)) then
+      Result := DWORD(AcceptBackoffMs);
   if FTimedCount <= 0 then Exit;
   if (Result = InfiniteWait) or (Result > DWORD(TlsDeadlinePollMs)) then
     Result := DWORD(TlsDeadlinePollMs);
+end;
+
+// A backed-off listener is re-armed from the completion thread once
+// its tick has passed; ArmAccept itself decides whether it can.
+procedure TWSIocpTransport.MaybeRearmAccept;
+begin
+  if (FAcceptBackoffUntil = 0) or FStopping or FAcceptPending then Exit;
+  if SysUtils.GetTickCount64 < FAcceptBackoffUntil then Exit;
+  ArmAccept;
 end;
 
 procedure TWSIocpTransport.Run(ATimeoutMs: Integer);
@@ -1445,12 +1477,14 @@ begin
   if ATimeoutMs < 0 then
     repeat
       WaitAndDispatch(DeadlineBoundedWait(InfiniteWait));
+      MaybeRearmAccept;
       SweepPosts;
       MaybeSweepTlsDeadlines;
     until not FRunning
   else
   begin
     WaitAndDispatch(DeadlineBoundedWait(DWORD(ATimeoutMs)));
+    MaybeRearmAccept;
     SweepPosts;
     MaybeSweepTlsDeadlines;
   end;

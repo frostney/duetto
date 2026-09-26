@@ -44,8 +44,18 @@ var
 // Microseconds. SysUtils.Now ticks in whole milliseconds, which turned a
 // 10-19 ms masking pass into a reading quantised to whole-millisecond
 // steps (100 / 90.9 / 55.6 GB/s); these clocks resolve to a microsecond
-// or better. Monotonic on Linux and Windows; macOS falls back to
+// or better, and are monotonic on Linux, macOS and Windows (a clock step
+// must not stretch or cut a timed loop); other Unixes fall back to
 // gettimeofday.
+{$ifdef DARWIN}
+const
+  DarwinClockMonotonic = 6; // CLOCK_MONOTONIC in <time.h>
+
+// libSystem, macOS 10.12+: nanoseconds on the given clock.
+function clock_gettime_nsec_np(AClock: Integer): UInt64; cdecl;
+  external 'c' name 'clock_gettime_nsec_np';
+{$endif}
+
 function Now64: Int64;
 {$if defined(LINUX)}
 var
@@ -53,6 +63,10 @@ var
 begin
   clock_gettime(CLOCK_MONOTONIC, @Ts);
   Result := Int64(Ts.tv_sec) * MicrosPerSec + Ts.tv_nsec div 1000;
+end;
+{$elseif defined(DARWIN)}
+begin
+  Result := Int64(clock_gettime_nsec_np(DarwinClockMonotonic) div 1000);
 end;
 {$elseif defined(UNIX)}
 var

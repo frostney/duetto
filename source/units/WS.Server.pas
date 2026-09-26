@@ -31,6 +31,7 @@ interface
 {$if defined(LINUX) or defined(DARWIN) or defined(WINDOWS)}
 
 uses
+  Classes,
   syncobjs,
   SysUtils,
 
@@ -53,6 +54,9 @@ type
   private
     FServer: TWSServer;
     FTConn: TWSTransportConn;
+    // The transport's id, cached at accept: Id and Post must not reach
+    // through FTConn once the transport may have freed it (Destroy).
+    FId: NativeUInt;
     FState: TWSConnState;
     FProto: TWSProtocol;
     FHsBuf: RawByteString;     // handshake accumulator
@@ -64,11 +68,32 @@ type
     FInDelivery: Boolean;      // inside Ingest/OnOpen delivery — drops defer
     FDropping: Boolean;        // teardown running; re-entrant drops no-op
     FDropDeferred: Boolean;    // dropped mid-delivery; freed on unwind
+    // Clock state, all in GetTickCount64 milliseconds, written only on
+    // this connection's execution context. FDeadline is when the peer
+    // must have done what the current state is waiting for (finished
+    // the handshake, answered a close, read a draining response, sent
+    // any byte at all when idle timing is on); FPingDue is when the
+    // keepalive ping goes out; 0 = not armed. FSweepAt is the earlier
+    // of the two and the one field the sweeper thread reads — racily,
+    // by design: a torn or stale read only costs a spare post, because
+    // the posted check re-judges against the authoritative values on
+    // this context. FSweepPosted keeps the sweeper from re-posting an
+    // already queued check; it is set right before each post and
+    // cleared by that post's proc before it judges anything.
+    FDeadline: QWord;
+    FPingDue: QWord;
+    FSweepAt: QWord;
+    FSweepPosted: Boolean;
     // Own slot in FServer.FRegistry, or -1 when unregistered (set at
     // construction, before the object is reachable). Once registered,
     // written and read only under FServer.FLock; makes the Post
     // rendezvous O(1) instead of a scan of every live connection.
     FRegistryIndex: Integer;
+    procedure Reschedule;
+    procedure ArmDeadline(AMs: Integer);
+    procedure BeginDrain;
+    procedure NoteActivity;
+    procedure CheckClock(AConn: TWSConnection);
     procedure ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
     function GetId: NativeUInt;
     // SendText/SendBinary. Where the transport can gather and the
@@ -98,7 +123,9 @@ type
     // protocol layer discarded the message for its own reasons. The
     // only thing this result reports is False = dropped; if you need to
     // know that bytes were actually queued, track it at the protocol
-    // layer, not here.
+    // layer, not here. Inside your own OnClientClose handler the
+    // connection is already being dropped, so these return False
+    // without queueing anything.
     function SendText(P: PByte; ALen: NativeInt): Boolean;
     function SendBinary(P: PByte; ALen: NativeInt): Boolean;
     // Same contract as SendText/SendBinary: False = the transport
@@ -200,8 +227,17 @@ type
     FOnOpen, FOnClose: TWSServerNotify;
     FOnPlainRequest: TWSPlainRequestEvent;
     FOnUpgradeRequest: TWSUpgradeRequestEvent;
+    FMaxPendingOutput: NativeInt;
+    FMaxConnections: Integer;
+    FHandshakeTimeoutMs: Integer;
+    FCloseTimeoutMs: Integer;
+    FIdleTimeoutMs: Integer;
+    FPingIntervalMs: Integer;
+    FSweeper: TThread;
+    FSweepWake: TEvent;
 
     procedure RegistryAdd(AConn: TWSConnection);
+    procedure SweepClocks;
     procedure RegistryRemove(AConn: TWSConnection);
     procedure ReleaseConn(AConn: TWSConnection);
     // Caller-initiated teardown; returns False so drop sites can chain
@@ -250,8 +286,77 @@ type
     procedure Stop;
 
     property Port: Word read GetPort;
+
+    // Resource bounds. Every one of these is judged on the connection's
+    // own execution context, so a change takes effect for connections
+    // whose next event lands after it; set them before Run for clarity.
+    //
+    // Bytes of protocol output one connection may hold unsent — frames
+    // the transport has not yet taken because the peer is not reading.
+    // Crossing it drops the connection (no close frame: a peer that is
+    // not reading would never see one). Without this a peer that floods
+    // pings, or echoes, and never reads grows the queue at line rate.
+    // Default 4 x the message cap, floor 1 MiB: one cap-sized message
+    // plus a few behind it is normal backpressure, more is a peer that
+    // has stopped. 0 = unbounded (the pre-0.5.0 behaviour).
+    property MaxPendingOutput: NativeInt
+      read FMaxPendingOutput write FMaxPendingOutput;
+    // Live connections, handshaking ones included. An accept beyond
+    // the cap is closed at once, before any session state exists —
+    // no handshake, no OnOpen, no OnClientClose. 0 = unbounded
+    // (default; the OS descriptor limit is then the only ceiling).
+    property MaxConnections: Integer
+      read FMaxConnections write FMaxConnections;
+    // Milliseconds from accept until the 101 has been handed to the
+    // transport. A peer that connects and trickles (or says nothing) is
+    // dropped when it lapses, silently — OnOpen never fired. On a TLS
+    // listener this clock also starts at accept, so it runs alongside
+    // TWSTransportTls.HandshakeDeadlineMs (which covers only the TLS
+    // handshake) and bounds TLS handshake plus HTTP upgrade together.
+    // Default 10 s; 0 = never.
+    property HandshakeTimeoutMs: Integer
+      read FHandshakeTimeoutMs write FHandshakeTimeoutMs;
+    // Milliseconds a peer gets to finish what the server is waiting on
+    // at the end of a connection: answer a Close, or read a response
+    // (403, plain-HTTP answer, protocol-error close frame) that is
+    // draining ahead of the drop. Lapsing drops the connection.
+    // Default 10 s; 0 = never.
+    property CloseTimeoutMs: Integer
+      read FCloseTimeoutMs write FCloseTimeoutMs;
+    // Milliseconds without a single byte from the peer after which an
+    // open connection is closed (1001 is queued best-effort, then it is
+    // dropped; OnClientClose fires). Pongs count as bytes, so pair this
+    // with PingIntervalMs to keep a live-but-quiet peer open. Default
+    // 0 = never: idle connections are legitimate for many hosts.
+    property IdleTimeoutMs: Integer
+      read FIdleTimeoutMs write FIdleTimeoutMs;
+    // Milliseconds of quiet after which the server pings the peer; the
+    // pong (or any other byte) resets the quiet clock. Default 0 =
+    // never ping. Meaningful mostly together with IdleTimeoutMs, where
+    // it turns "no traffic" into "no pong": IdleTimeoutMs should then
+    // exceed PingIntervalMs by a round trip.
+    property PingIntervalMs: Integer
+      read FPingIntervalMs write FPingIntervalMs;
+
     property OnMessage: TWSServerMessage read FOnMessage write FOnMessage;
     property OnOpen: TWSServerNotify read FOnOpen write FOnOpen;
+    // Fires exactly once for every connection that saw OnOpen: when the
+    // peer goes away, when the server drops it, and — for connections
+    // still open at the time — from TWSServer.Destroy, on the thread
+    // calling Destroy once the transport is quiesced (there, sends and
+    // Close on any connection report False and Post is discarded). On
+    // Network.framework the transport's Shutdown cancels the connections
+    // and they arrive earlier, as ordinary remote closes on their own
+    // queues. Sends inside the handler report False (the connection is
+    // already being torn down). An exception escaping the handler is
+    // treated like one from OnOpen or OnMessage, but only after the
+    // session connection has been released (and, on a plaintext
+    // listener, closed at the transport: on epoll its socket closed, on
+    // IOCP its FIN sent — once Run resumes if a send is still in
+    // flight): on the epoll and IOCP transports it propagates out
+    // of Run; on Network.framework, where callbacks run on GCD threads,
+    // an escaping exception terminates the process, as it does from any
+    // callback. During Destroy it is swallowed so shutdown completes.
     property OnClientClose: TWSServerNotify read FOnClose write FOnClose;
     // Opt-in single-port fallback: fired for a well-formed, body-less
     // HTTP request (GET or HEAD without Content-Length or
@@ -305,14 +410,41 @@ const
   // were level at 1 KiB.
   DirectSendMin = 1024;
   RegistryGrowth = 64;
+  DefaultHandshakeTimeoutMs = 10000;
+  DefaultCloseTimeoutMs = 10000;
+  MinPendingOutput = 1024 * 1024;
+  PendingOutputFactor = 4;
+  // How often the sweeper looks for lapsed clocks. Coarse on purpose:
+  // every deadline here is seconds long, and the walk is a lock plus
+  // one compare per live connection.
+  SweepIntervalMs = 100;
 
 type
+  // The one thread the session layer owns. It never touches a
+  // connection: it reads each one's FSweepAt under the registry lock
+  // and, for any that has lapsed, Posts CheckClock onto that
+  // connection's execution context — the seam's cross-thread hook —
+  // where the real judgement and any drop happen with the ordinary
+  // per-connection serialization (ADR-0003).
+  TWSSweeper = class(TThread)
+  private
+    FServer: TWSServer;
+  protected
+    procedure Execute; override;
+  end;
+
   // What travels through the transport's SubmitPost: a method pointer
   // is two pointers, one too many for the opaque AData slot.
   PWSPostEnvelope = ^TWSPostEnvelope;
   TWSPostEnvelope = record
     Proc: TWSConnProc;
   end;
+
+function NewEnvelope(AProc: TWSConnProc): PWSPostEnvelope;
+begin
+  New(Result);
+  Result^.Proc := AProc;
+end;
 
 { TWSConnection }
 
@@ -333,7 +465,115 @@ end;
 
 function TWSConnection.GetId: NativeUInt;
 begin
-  Result := FTConn.Id;
+  Result := FId;
+end;
+
+procedure TWSConnection.Reschedule;
+begin
+  if (FDeadline = 0) or ((FPingDue <> 0) and (FPingDue < FDeadline)) then
+    FSweepAt := FPingDue
+  else
+    FSweepAt := FDeadline;
+end;
+
+procedure TWSConnection.ArmDeadline(AMs: Integer);
+begin
+  if AMs > 0 then
+    FDeadline := GetTickCount64 + QWord(AMs)
+  else
+    FDeadline := 0;
+  Reschedule;
+end;
+
+// Only queued output (a response, a close frame) stands between the
+// connection and its drop: give it the close budget, once. Peer
+// traffic must not extend it — NoteActivity skips a draining
+// connection — and there is nothing left to ping for.
+procedure TWSConnection.BeginDrain;
+begin
+  if FDropPending then Exit;
+  FDropPending := True;
+  FPingDue := 0;
+  ArmDeadline(FServer.FCloseTimeoutMs);
+end;
+
+// Bytes arrived from the peer: an open connection's idle and ping
+// clocks restart from now. Waiting states (handshake, close, drain)
+// keep their deadline — progress there is judged by state changes,
+// not by traffic, or a trickling peer could extend them forever.
+procedure TWSConnection.NoteActivity;
+var
+  Now_: QWord;
+begin
+  // A connection draining ahead of its drop is waiting too, even while
+  // FState is still wcsOpen (protocol failure, echoed Close).
+  if (FState <> wcsOpen) or FDropPending then Exit;
+  // Idle and ping both off (the defaults): no clock to restart, so no
+  // clock read per receive — only the handshake deadline to clear once.
+  if (FServer.FIdleTimeoutMs <= 0) and (FServer.FPingIntervalMs <= 0) then
+  begin
+    if (FDeadline <> 0) or (FPingDue <> 0) then
+    begin
+      FDeadline := 0;
+      FPingDue := 0;
+      Reschedule;
+    end;
+    Exit;
+  end;
+  Now_ := GetTickCount64;
+  if FServer.FIdleTimeoutMs > 0 then
+    FDeadline := Now_ + QWord(FServer.FIdleTimeoutMs)
+  else
+    FDeadline := 0;
+  if FServer.FPingIntervalMs > 0 then
+    FPingDue := Now_ + QWord(FServer.FPingIntervalMs)
+  else
+    FPingDue := 0;
+  Reschedule;
+end;
+
+// Posted by the sweeper; runs on this connection's execution context.
+// AConn is Self (the Post signature), kept for the method-pointer shape.
+procedure TWSConnection.CheckClock(AConn: TWSConnection);
+var
+  Now_: QWord;
+begin
+  FSweepPosted := False;
+  if FDropping then Exit;
+  Now_ := GetTickCount64;
+  if (FDeadline <> 0) and (Now_ >= FDeadline) then
+  begin
+    FDeadline := 0;
+    case FState of
+      wcsHandshake:
+        FServer.DropConn(Self); // never opened: silent, like a 403
+      wcsOpen:
+        begin
+          // Idle: say goodbye in case the peer is merely quiet, then go
+          // without waiting for the echo — a peer that has fallen off
+          // the network is the common case here.
+          FProto.SendClose(1001, 'idle timeout');
+          FState := wcsClosing;
+          if FServer.FlushConn(Self) then FServer.DropConn(Self);
+        end;
+      wcsClosing:
+        FServer.DropConn(Self);
+    end;
+    Exit;
+  end;
+  if (FPingDue <> 0) and (Now_ >= FPingDue) then
+  begin
+    // One ping per quiet period: the next is scheduled by the peer's
+    // reply (NoteActivity), not by the clock, so an unanswered ping
+    // simply lets the idle deadline run out.
+    FPingDue := 0;
+    Reschedule;
+    if FState = wcsOpen then
+    begin
+      FProto.SendPing(nil, 0);
+      FServer.FlushConn(Self);
+    end;
+  end;
 end;
 
 procedure TWSConnection.ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
@@ -353,6 +593,11 @@ var
   HLen: Integer;
   Taken: NativeInt;
 begin
+  // Teardown already running (an OnClientClose handler sending into the
+  // connection it is being told about): the transport side is gone, so
+  // report the drop without touching it — a flush here would re-enter
+  // DropConn and free the object a second time.
+  if FDropping then Exit(False);
   Result := True;
   if FState <> wcsOpen then Exit;
   HLen := 0;
@@ -394,11 +639,14 @@ end;
 
 function TWSConnection.Close(ACode: Word; const AReason: string): Boolean;
 begin
+  if FDropping then Exit(False);
   Result := True;
   if FState = wcsOpen then
   begin
     FProto.SendClose(ACode, AReason);
     FState := wcsClosing;
+    FPingDue := 0;
+    ArmDeadline(FServer.FCloseTimeoutMs);
     Result := FServer.FlushConn(Self);
   end;
 end;
@@ -417,7 +665,13 @@ begin
   inherited Create;
   FAllowDeflate := AAllowDeflate;
   FMaxMessage := AMaxMessage;
+  FMaxPendingOutput := AMaxMessage * PendingOutputFactor;
+  if FMaxPendingOutput < MinPendingOutput then
+    FMaxPendingOutput := MinPendingOutput;
+  FHandshakeTimeoutMs := DefaultHandshakeTimeoutMs;
+  FCloseTimeoutMs := DefaultCloseTimeoutMs;
   FLock := TCriticalSection.Create;
+  FSweepWake := TEvent.Create(nil, False, False, '');
   {$ifdef LINUX}
   FTransport := TWSEpollTransport.Create(APort, ATls, ABindAddress);
   {$endif}
@@ -433,10 +687,14 @@ begin
   FTransport.OnClosed := HandleClosed;
   FTransport.OnPost := HandlePost;
   FTransport.Open;
+  FSweeper := TWSSweeper.Create(True);
+  TWSSweeper(FSweeper).FServer := Self;
+  FSweeper.Start;
 end;
 
 destructor TWSServer.Destroy;
 var
+  Open: array of TWSConnection;
   I: Integer;
 begin
   // Quiesce the transport first: after Shutdown returns, no completion
@@ -446,15 +704,90 @@ begin
   // against still-valid state.) The nil guard keeps a transport
   // constructor failure from masking its own exception when FPC runs
   // this destructor on the partially constructed server.
+  // The sweeper goes first: once it has joined, no new post can be
+  // issued from this side, and the transport drain below settles the
+  // ones in flight.
+  if FSweeper <> nil then
+  begin
+    FSweeper.Terminate;
+    FSweepWake.SetEvent;
+    FSweeper.WaitFor;
+    FSweeper.Free;
+  end;
   if FTransport <> nil then
   begin
     FTransport.Shutdown;
-    for I := 0 to FRegistryCount - 1 do
-      FRegistry[I].Free;
+    // Connections still open get their OnClientClose here, so every
+    // OnOpen is paired and a handler holding references (the Post
+    // lifetime contract) learns they are gone. The transport is
+    // quiesced and has freed its connection objects, so first detach
+    // every session connection from it at once: marked dropping (sends
+    // and Close report False), out of the registry (Post drops), FTConn
+    // cleared. Only then run the handlers — one may reach any other
+    // connection (a "user left" broadcast), not just its own.
+    FLock.Acquire;
+    try
+      Open := Copy(FRegistry, 0, FRegistryCount);
+      FRegistryCount := 0;
+    finally
+      FLock.Release;
+    end;
+    for I := 0 to High(Open) do
+    begin
+      Open[I].FRegistryIndex := -1;
+      Open[I].FDropping := True;
+      Open[I].FTConn := nil;
+    end;
+    for I := 0 to High(Open) do
+      try
+        ReleaseConn(Open[I]);
+      except
+        // A destructor has to finish: the connection was released by
+        // ReleaseConn's finally; the handler's exception is dropped.
+        on Exception do;
+      end;
     FTransport.Free;
   end;
+  FSweepWake.Free;
   FLock.Free;
   inherited;
+end;
+
+{ TWSSweeper }
+
+procedure TWSSweeper.Execute;
+begin
+  while not Terminated do
+  begin
+    FServer.FSweepWake.WaitFor(SweepIntervalMs);
+    if Terminated then Break;
+    FServer.SweepClocks;
+  end;
+end;
+
+procedure TWSServer.SweepClocks;
+var
+  I: Integer;
+  Now_: QWord;
+  Conn: TWSConnection;
+begin
+  Now_ := GetTickCount64;
+  FLock.Acquire;
+  try
+    for I := 0 to FRegistryCount - 1 do
+    begin
+      Conn := FRegistry[I];
+      if (Conn.FSweepAt = 0) or (Now_ < Conn.FSweepAt) or
+        Conn.FSweepPosted then Continue;
+      Conn.FSweepPosted := True;
+      // Same rendezvous PostToConn performs, done inline because the
+      // lock is already held: only the transport-neutral id crosses to
+      // the connection's context.
+      FTransport.SubmitPost(Conn.FId, NewEnvelope(Conn.CheckClock));
+    end;
+  finally
+    FLock.Release;
+  end;
 end;
 
 procedure TWSServer.RegistryAdd(AConn: TWSConnection);
@@ -499,14 +832,18 @@ end;
 procedure TWSServer.ReleaseConn(AConn: TWSConnection);
 begin
   RegistryRemove(AConn);
-  if (AConn.FState <> wcsHandshake) and Assigned(FOnClose) then
-    FOnClose(AConn);
-  AConn.Free;
+  // A raising OnClientClose still releases the connection; the
+  // exception carries on to the caller.
+  try
+    if (AConn.FState <> wcsHandshake) and Assigned(FOnClose) then
+      FOnClose(AConn);
+  finally
+    AConn.Free;
+  end;
 end;
 
 procedure TWSServer.PostToConn(AConn: TWSConnection; AProc: TWSConnProc);
 var
-  Env: PWSPostEnvelope;
   TransportId: NativeUInt;
   Live: Boolean;
   Idx: Integer;
@@ -545,14 +882,12 @@ begin
     Idx := AConn.FRegistryIndex;
     Live := (Idx >= 0) and (Idx < FRegistryCount) and (FRegistry[Idx] = AConn);
     if Live then
-      TransportId := AConn.FTConn.Id;
+      TransportId := AConn.FId;
   finally
     FLock.Release;
   end;
   if not Live then Exit; // already gone: silently dropped
-  New(Env);
-  Env^.Proc := AProc;
-  FTransport.SubmitPost(TransportId, Env);
+  FTransport.SubmitPost(TransportId, NewEnvelope(AProc));
 end;
 
 function TWSServer.DropConn(AConn: TWSConnection): Boolean;
@@ -578,8 +913,13 @@ begin
   AConn.FDropping := True;
   TConn := AConn.FTConn;
   TConn.UserData := nil;
-  ReleaseConn(AConn);
-  TConn.SubmitClose;
+  // The transport side is closed even if OnClientClose raises: the
+  // socket must not outlive the session object that owned it.
+  try
+    ReleaseConn(AConn);
+  finally
+    TConn.SubmitClose;
+  end;
 end;
 
 function TWSServer.FlushConn(AConn: TWSConnection): Boolean;
@@ -592,7 +932,14 @@ begin
   if W < 0 then Exit(DropConn(AConn));
   AConn.FProto.OutConsume(W);
   // Anything still pending is backpressure: the transport fires
-  // OnSendReady when it can take more.
+  // OnSendReady when it can take more — up to a point. Past the cap the
+  // peer has stopped reading, and the only thing left to bound is our
+  // memory. A draining connection is exempt: its queue was filled in
+  // one step (a plain-HTTP answer, a 403, a close frame), nothing more
+  // can join it, and CloseTimeoutMs already bounds a peer not reading.
+  if (FMaxPendingOutput > 0) and not AConn.FDropPending
+    and (AConn.FProto.OutPending > FMaxPendingOutput) then
+    Exit(DropConn(AConn));
 end;
 
 function TWSServer.FinishHandshake(AConn: TWSConnection;
@@ -642,7 +989,7 @@ begin
       AConn.FProto := TWSProtocol.Create(wsrServer, HS.Deflate, FMaxMessage);
       AConn.FProto.QueueRaw(@Resp[1], Length(Resp));
       AConn.FHsBuf := '';
-      AConn.FDropPending := True; // drop as soon as the response drains
+      AConn.BeginDrain; // drop as soon as the response drains
       // Nested rather than `and`-ed: FlushConn returning False means the
       // connection was dropped and possibly freed, and the second test
       // would read OutPending out of it.
@@ -678,7 +1025,7 @@ begin
       AConn.FProto := TWSProtocol.Create(wsrServer, HS.Deflate, FMaxMessage);
       AConn.FProto.QueueRaw(@Resp[1], Length(Resp));
       AConn.FHsBuf := '';
-      AConn.FDropPending := True;
+      AConn.BeginDrain;
       if FlushConn(AConn) then
       begin
         if AConn.FProto.OutPending = 0 then
@@ -697,9 +1044,13 @@ begin
   // handler queues).
   Resp := ServerBuildResponse(HS);
   AConn.FProto.QueueRaw(@Resp[1], Length(Resp));
-  AConn.FState := wcsOpen;
   AConn.FHsBuf := '';
+  // Open only once the 101 is on its way: a peer that resets right after
+  // sending its request fails this flush, and the drop must not look
+  // like a closed session to OnClientClose when OnOpen never ran.
   if not FlushConn(AConn) then Exit;
+  AConn.FState := wcsOpen;
+  AConn.NoteActivity;
 
   // Same deferral guard as the Ingest run: a send inside OnOpen may
   // find the peer dead, and the caller still reads Conn state after we
@@ -750,24 +1101,49 @@ begin
       if AConn.FProto.OutPending = 0 then
         DropConn(AConn)
       else
-        AConn.FDropPending := True;
+        AConn.BeginDrain;
     end;
     Exit;
   end;
   if not FlushConn(AConn) then Exit;
-  if AConn.FProto.CloseDone and (AConn.FProto.OutPending = 0) then
-    Exit(DropConn(AConn));
+  if AConn.FProto.CloseDone then
+  begin
+    if AConn.FProto.OutPending = 0 then
+      Exit(DropConn(AConn));
+    // Our close echo is stuck behind a peer that is not reading: give
+    // it the close budget, not forever.
+    AConn.BeginDrain;
+  end;
   Result := True;
 end;
 
 procedure TWSServer.HandleAccept(ATConn: TWSTransportConn);
 var
   Conn: TWSConnection;
+  Full: Boolean;
 begin
+  if FMaxConnections > 0 then
+  begin
+    FLock.Acquire;
+    try
+      Full := FRegistryCount >= FMaxConnections;
+    finally
+      FLock.Release;
+    end;
+    if Full then
+    begin
+      // Refused before any session state exists: the transport closes
+      // it and no OnOpen/OnClientClose pair is owed to anyone.
+      ATConn.SubmitClose;
+      Exit;
+    end;
+  end;
   Conn := TWSConnection.Create;
   Conn.FServer := Self;
   Conn.FTConn := ATConn;
+  Conn.FId := ATConn.Id;
   Conn.FState := wcsHandshake;
+  Conn.ArmDeadline(FHandshakeTimeoutMs);
   ATConn.UserData := Conn;
   RegistryAdd(Conn);
 end;
@@ -811,7 +1187,10 @@ begin
           IngestAndFlush(Conn, @Left[0], LeftLen);
       end;
     wcsOpen, wcsClosing:
-      IngestAndFlush(Conn, P, ALen);
+      begin
+        Conn.NoteActivity;
+        IngestAndFlush(Conn, P, ALen);
+      end;
   end;
 end;
 
@@ -821,17 +1200,18 @@ var
 begin
   Conn := TWSConnection(ATConn.UserData);
   if Conn = nil then Exit;
+  // The TLS transports report send-ready after their own handshake
+  // flight completes, before any HTTP upgrade has been parsed: nothing
+  // is queued yet and no protocol object exists to flush.
+  if Conn.FProto = nil then Exit;
   if not FlushConn(Conn) then Exit;
-  if Conn.FProto <> nil then
+  if Conn.FDropPending and (Conn.FProto.OutPending = 0) then
   begin
-    if Conn.FDropPending and (Conn.FProto.OutPending = 0) then
-    begin
-      DropConn(Conn);
-      Exit;
-    end;
-    if Conn.FProto.CloseDone and (Conn.FProto.OutPending = 0) then
-      DropConn(Conn);
+    DropConn(Conn);
+    Exit;
   end;
+  if Conn.FProto.CloseDone and (Conn.FProto.OutPending = 0) then
+    DropConn(Conn);
 end;
 
 procedure TWSServer.HandleClosed(ATConn: TWSTransportConn);
@@ -841,6 +1221,10 @@ begin
   Conn := TWSConnection(ATConn.UserData);
   if Conn = nil then Exit;
   ATConn.UserData := nil;
+  // Same teardown marker DropConn sets: a send or Close inside the
+  // OnClientClose handler must return False, not flush into the dead
+  // transport connection and release the session object a second time.
+  Conn.FDropping := True;
   ReleaseConn(Conn);
   // The transport frees ATConn after this callback returns.
 end;
