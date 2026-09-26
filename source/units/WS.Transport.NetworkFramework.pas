@@ -756,13 +756,16 @@ begin
   // Cancel under the live lock: a connection whose peer hangs up at
   // this very moment runs ConnFinalized on its own queue, and that
   // frees the object — a snapshot read outside the lock would
-  // dereference it. nw_connection_cancel is thread-safe, idempotent
-  // and asynchronous, so holding the lock across it blocks nothing
-  // but the finalizers' own LiveUntrack, briefly.
+  // dereference it. Cancelling is thread-safe, idempotent and
+  // asynchronous, so holding the lock across it blocks nothing but the
+  // finalizers' own LiveUntrack, briefly. Force-cancel, as the other
+  // transports' Shutdown force-closes: a graceful cancel would keep
+  // flushing a send a stalled peer never takes, and the drain below
+  // waits on every cancelled state.
   FLiveLock.Acquire;
   try
     for I := 0 to FLiveCount - 1 do
-      Nw_connection_cancel(FLive[I].FNw);
+      Nw_connection_force_cancel(FLive[I].FNw);
   finally
     FLiveLock.Release;
   end;

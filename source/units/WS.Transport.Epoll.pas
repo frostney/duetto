@@ -189,6 +189,12 @@ const
   // so epoll_wait round trips stay rare, and caps what any one peer can
   // take per turn at that same ~1 MB.
   MaxFullReadsPerEvent = 4;
+  // Peers one listener event may shed while the descriptor table is
+  // full. Shedding succeeds for as long as peers keep the backlog
+  // populated, so it must hand the loop back: the level-triggered
+  // listener is reported again on the next epoll_wait, alongside every
+  // other connection's events.
+  MaxShedPerEvent = 64;
   // How long the listener stays out of the interest set after accept
   // fails for lack of a resource the reserve descriptor cannot cover
   // (ENOBUFS/ENOMEM, or ENFILE with the reserve already spent). Short:
@@ -834,10 +840,11 @@ end;
 
 procedure TWSEpollTransport.AcceptPending;
 var
-  Fd, Err: Integer;
+  Fd, Err, Shed: Integer;
   Conn: TWSEpollConn;
   Ev: TEPoll_Event;
 begin
+  Shed := 0;
   repeat
     Fd := fpAccept(FListenFd, nil, nil);
     if Fd < 0 then
@@ -848,7 +855,12 @@ begin
           Continue; // interrupted, or the peer left the backlog: next
         ESysEMFILE, ESysENFILE:
           case ShedOneAccept of
-            wsrShed: Continue;
+            wsrShed:
+              begin
+                Inc(Shed);
+                if Shed >= MaxShedPerEvent then Exit;
+                Continue;
+              end;
             wsrDrained: Exit;
           else
             ListenerArm(False);
