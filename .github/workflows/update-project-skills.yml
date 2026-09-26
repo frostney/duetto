@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   update:
-    uses: frostney/known-good-route/.github/workflows/update-project-skills.yml@bb3ec0bc7505c60fcc623b98d76fbaf8d0f77c9c # main 2026-09-17
+    uses: frostney/known-good-route/.github/workflows/update-project-skills.yml@1099a7f5afc3e35afd2a13193ef17819b4267320 # main 2026-09-26
     with:
       skills-root: "."
       skills-cli-version: "1.5.23"
