@@ -1,0 +1,11 @@
+# Keeps the SHA-pinned actions in .github/workflows current. Pascal
+# dependencies are not here on purpose: they resolve from lwpt's release
+# tag through lwpt.toml / lwpt.lock (`lwpt outdated`, `lwpt update`).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies
