@@ -79,6 +79,7 @@ type
     procedure TestOversizeMessage;
     procedure TestSendCloseWireCodes;
     procedure TestOversizeHeaderBeyond32Bits;
+    procedure TestNegativeCapRejects;
   end;
 
   TProtoDeflate = class(TTestSuite)
@@ -787,6 +788,28 @@ begin
   end;
 end;
 
+procedure TProtoClose.TestNegativeCapRejects;
+var
+  S: TWSProtocol;
+  SS: TSink;
+  One: TBytes;
+begin
+  // The caps compare unsigned: a negative cap must not wrap to 2^64 - 1
+  // and admit every message.
+  SS := TSink.Create;
+  S := NewServer(SS, -1);
+  try
+    SetLength(One, 1);
+    One[0] := Ord('a');
+    Expect<Boolean>(IngestAll(S, [
+      BuildFrame(WS_OP_BINARY, True, False, False, True, One, $01020304)
+    ])).ToBe(False);
+    Expect<Integer>(Integer(WireCloseCode(S))).ToBe(1009);
+  finally
+    S.Free; SS.Free;
+  end;
+end;
+
 { ───────── permessage-deflate end to end ───────── }
 
 // Run the REAL handshake to get both sides' negotiated params, then build
@@ -938,6 +961,7 @@ begin
   Test('SendClose puts only legal codes on the wire', TestSendCloseWireCodes);
   Test('2^32+1 header fails 1009 before any payload', TestOversizeHeaderBeyond32Bits);
   Test('message over cap -> 1009',             TestOversizeMessage);
+  Test('negative cap rejects, never unbounds', TestNegativeCapRejects);
 end;
 
 procedure TProtoDeflate.SetupTests;

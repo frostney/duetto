@@ -4,7 +4,7 @@
 
 - Delphi mode, `{$H+}`, and all project-wide directives live in `source/units/Shared.inc` — every unit pulls `{$I Shared.inc}`, directives are never repeated per file.
 - Naming follows the native-nostalgia-stack conventions: `T`/`I`/`E` type prefixes, `F` fields, `A` parameters, PascalCase everywhere, no abbreviations beyond standard acronyms.
-- `lwpt format` is the canonical formatter; `--check` is the CI / pre-commit form.
+- `lwpt format` is the canonical formatter; `--check` is the CI form (the Lefthook pre-commit hook runs the rewriting form and re-stages).
 - Units are namespaced in the filename (`WS.<Name>.pas`) and flat under `source/units/`; tests are co-located as `WS.<Name>.Test.pas`.
 - The library's public surface is deliberately minimal; protocol rules belong in `WS.Protocol` only.
 
@@ -47,7 +47,8 @@ path; replacing it is justified by a `wsbench` number, not by taste.
 ## Formatter
 
 `lwpt format` rewrites sources in place (uses-clause grouping, identifier
-casing); `lwpt format --check` exits non-zero on drift and is what CI and
-the Lefthook pre-commit hook run. Style rules are encoded in the tool —
+casing); `lwpt format --check` exits non-zero on drift and is what CI
+runs, while the Lefthook pre-commit hook runs the rewriting form and
+re-stages what it changed. Style rules are encoded in the tool —
 adding a rule means changing lwpt's formatter, not adding a config file
 here.
