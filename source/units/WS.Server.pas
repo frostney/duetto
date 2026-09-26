@@ -340,8 +340,9 @@ type
     // already being torn down). An exception escaping the handler is
     // treated like one from OnOpen or OnMessage, but only after the
     // session connection has been released (and, on a plaintext
-    // listener, its socket closed — or, on IOCP with a send in flight,
-    // its FIN sent): on the epoll and IOCP transports it propagates out
+    // listener, closed at the transport: on epoll its socket closed, on
+    // IOCP its FIN sent — once Run resumes if a send is still in
+    // flight): on the epoll and IOCP transports it propagates out
     // of Run; on Network.framework, where callbacks run on GCD threads,
     // an escaping exception terminates the process, as it does from any
     // callback. During Destroy it is swallowed so shutdown completes.
