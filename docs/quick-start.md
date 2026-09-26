@@ -38,14 +38,14 @@ no sibling checkout is needed. The committed `.lwpt/modules/` tree plus
 
 ```bash
 lwpt build           # all five programs (Linux, macOS, Windows)
-lwpt test            # seven suites, all green
+lwpt test            # every source/units/*.Test.pas suite, all green
 ./build/wsinterop    # live-socket battery, exit 0 = pass
 ```
 
 ## Run something
 
 ```bash
-./build/wsecho --port=9001                  # echo server (Linux/macOS)
+./build/wsecho --port=9001                  # echo server (Linux, macOS, Windows)
 ./build/wsprobe ws://localhost:9001/ --deflate   # probe it from a second shell
 ```
 

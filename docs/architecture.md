@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-- duetto implements RFC 6455 (WebSocket v13) and RFC 7692 (permessage-deflate) in ~8,200 lines of FreePascal.
+- duetto implements RFC 6455 (WebSocket v13) and RFC 7692 (permessage-deflate) in ~8,700 lines of FreePascal (library units; twice that with tests and programs).
 - The heart is `WS.Protocol`, a **sans-I/O state machine** — one instance per connection, either role — that never touches a file descriptor.
 - Every RFC rule lives in that one testable place; the blocking client, the epoll server, and the in-process benchmark all sit behind the same machine unchanged.
 - Layers are strictly bottom-up: frame codec → UTF-8 → handshake → deflate → protocol machine → client / server.
@@ -45,7 +45,7 @@ Units higher in the table never depend on units lower down. The programs in
 
 Four nets, from innermost to outermost:
 
-1. **Co-located unit suites** (`lwpt test`, seven of them): RFC §5.7 frame
+1. **Co-located unit suites** (`lwpt test`, one per `source/units/*.Test.pas`): RFC §5.7 frame
    vectors and strictness, an exhaustive 16.8M-case UTF-8 differential,
    handshake acceptance/rejection matrices, deflate round-trips with
    takeover and bomb-cap checks, a 26-test protocol conformance suite
