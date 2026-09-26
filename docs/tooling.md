@@ -178,6 +178,21 @@ absent, so `wss://` stays untested locally, and win32 is the only Wine
 target because Wine's win64 needs a 64-bit userland the i386 image
 does not carry.
 
+## Code review (CodeRabbit)
+
+CodeRabbit reads `.coderabbit.config.ts`, which inherits the central
+`frostney/coderabbit` settings and the web-UI settings (`inheritance:
+true`) and excludes the vendored Agent Skills from review. Every skill
+listed in `skills-lock.json` is installed from upstream by the skills CLI
+and refreshed by `.github/workflows/update-project-skills.yml`, so findings
+on it belong upstream. A skill under `.agents/skills` that the lock does
+not list is project-authored and is reviewed like any other file. The
+config reads the lock through `skills-lock.yaml`, a symlink, because the
+config sandbox imports `.yaml` but not `.json`.
+
+Pull requests opened by a bot (the skills updater, Dependabot) are skipped
+by CodeRabbit's automatic review.
+
 ## Markdown
 
 markdownlint-cli2 (config: `.markdownlint-cli2.jsonc`) lints the
