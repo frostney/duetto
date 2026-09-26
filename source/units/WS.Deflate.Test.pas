@@ -1,5 +1,6 @@
 { WS.Deflate.Test — RFC 7692 round trips (empty message, text, 100 KB
-  random, 1 MB zeros), the §7.2.3.6 empty-message-becomes-#$00 rule,
+  random, 1 MB zeros, incompressible stored blocks delivered in one Feed),
+  the §7.2.3.6 empty-message-becomes-#$00 rule,
   context takeover semantics observable from the wire (a repeated message
   compresses smaller when the window is shared, and does not when
   no_context_takeover resets it), the decompression-bomb output cap, and
@@ -24,6 +25,7 @@ type
     procedure TestRandom100K;
     procedure TestZeros1M;
     procedure TestChunkedFeed;
+    procedure TestIncompressibleSingleFeed;
   end;
 
   TDeflateTakeover = class(TTestSuite)
@@ -196,6 +198,46 @@ begin
   end;
   I := 0; // silence unused in case the loop folds
   if I <> 0 then;
+end;
+
+procedure TDeflateRoundTrip.TestIncompressibleSingleFeed;
+var
+  C: TWSDeflater;
+  D: TWSInflater;
+  InB, Z, OutB: TBytes;
+  I, Size: Integer;
+const
+  // Sizes that fit inside inflate's 32 KB window in one Feed, straddle it,
+  // and exceed it: the regression was a message whose entire compressed
+  // input was swallowed into the window while decoded bytes still queued
+  // behind a full output buffer — the pump stopped on avail_in = 0 and
+  // silently delivered a truncated message (20000 → 8192 bytes).
+  Sizes: array[0..5] of Integer = (4097, 8193, 20000, 32768, 32769, 65536);
+begin
+  RandSeed := 20000;
+  for Size in Sizes do
+  begin
+    SetLength(InB, Size);
+    for I := 0 to High(InB) do InB[I] := Byte(Random(256));
+    C := TWSDeflater.Create(15, False);
+    D := TWSInflater.Create(15, False, 1 shl 20);
+    try
+      Expect<Boolean>(C.CompressMessage(@InB[0], Length(InB), Z)).ToBe(True);
+      // Random bytes do not compress: deflate emits stored blocks, so the
+      // compressed stream is at least as long as the input.
+      Expect<Boolean>(Length(Z) >= Length(InB)).ToBe(True);
+      D.BeginMessage;
+      Expect<Boolean>(D.Feed(@Z[0], Length(Z))).ToBe(True);
+      Expect<Boolean>(D.Finish).ToBe(True);
+      Expect<Integer>(Integer(D.OutSize)).ToBe(Size);
+      SetLength(OutB, D.OutSize);
+      Move(D.OutData[0], OutB[0], D.OutSize);
+      Expect<Boolean>(SameBytes(InB, OutB)).ToBe(True);
+    finally
+      C.Free;
+      D.Free;
+    end;
+  end;
 end;
 
 { ───────── context takeover ───────── }
@@ -380,6 +422,7 @@ begin
   Test('100 KB random round trip',               TestRandom100K);
   Test('1 MB zeros round trip + ratio sanity',   TestZeros1M);
   Test('chunked Feed at every split',            TestChunkedFeed);
+  Test('incompressible message in one Feed',     TestIncompressibleSingleFeed);
 end;
 
 procedure TDeflateTakeover.SetupTests;

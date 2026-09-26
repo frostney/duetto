@@ -107,6 +107,10 @@ type
     procedure SendBinary(P: PByte; ALen: NativeInt);
     procedure SendPing(P: PByte; ALen: NativeInt);
     procedure SendPong(P: PByte; ALen: NativeInt);
+    // ACode is reported locally as CloseCode as given; on the wire only
+    // codes a peer may legally receive are sent (WSValidCloseCode) — a
+    // reserved or out-of-range code such as 1005/1006/1015 goes out as
+    // a close frame with no status, the §7.4.1 "no status" form.
     procedure SendClose(ACode: Word = 1000; const AReason: string = '');
 
     // Enqueue raw pre-framed bytes (e.g. the server's 101 response) so they
@@ -163,6 +167,9 @@ var
 begin
   inherited Create;
   FRole := ARole;
+  // The caps compare unsigned (64-bit lengths); a negative cap would
+  // become 2^64 - 1 there and admit anything. Treat it as zero.
+  if AMaxMessage < 0 then AMaxMessage := 0;
   FMaxMessage := AMaxMessage;
   FCloseCode := 1005; // "no status received" until told otherwise
 
@@ -339,8 +346,12 @@ var
 begin
   if FCloseSent then Exit;
   FCloseSent := True;
-  if ACode = 1005 then
-    SendFrame(WS_OP_CLOSE, False, nil, 0)  // echo "no status" as empty
+  // 1005 echoes "no status" as an empty payload; every other code the
+  // RFC reserves for local reporting (1004, 1006, 1015) or leaves
+  // undefined would draw a 1002 from a conformant peer, so it travels
+  // the same way.
+  if not WSValidCloseCode(ACode) then
+    SendFrame(WS_OP_CLOSE, False, nil, 0)
   else
   begin
     Buf[0] := ACode shr 8;
@@ -487,8 +498,10 @@ begin
   // Cumulative uncompressed cap, checked at header time so an oversize
   // message dies before a payload byte is buffered. Compressed messages
   // are governed by the inflater's output cap instead.
+  // Compare in the header's own width: narrowing a 64-bit length to
+  // NativeInt first would let a 32-bit build wrap 2^32 + k down to k.
   if not FMsgCompressed then
-    if FMsgLen + NativeInt(H.PayloadLen) > FMaxMessage then
+    if UInt64(FMsgLen) + H.PayloadLen > UInt64(FMaxMessage) then
       Exit(Fail(1009, 'message too big'));
 end;
 
@@ -622,7 +635,7 @@ begin
 
     // Oversize data frames die before we touch a byte of them.
     if not H.IsControl then
-      if NativeInt(H.PayloadLen) > FMaxMessage then
+      if H.PayloadLen > UInt64(FMaxMessage) then
         Exit(Fail(1009, 'frame exceeds message cap'));
 
     if H.IsControl then
