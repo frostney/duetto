@@ -4,9 +4,10 @@
 #
 #   tools/autobahn.sh client   # fuzzingserver in Docker tests build/wsautobahn
 #   tools/autobahn.sh server   # fuzzingclient in Docker tests build/wsecho
-#                              # (Linux only — the container reaches the
-#                              #  host's listener via --network=host,
-#                              #  which Docker only offers on Linux)
+#                              # (Linux only in this script — the container
+#                              #  reaches the host's listener via
+#                              #  --network=host; Docker Desktop 4.34+ can
+#                              #  enable that too, untested here)
 #
 # Reports land under tests/autobahn/reports/ (gitignored). Binaries are
 # expected in build/ — run `lwpt build` first.
@@ -58,9 +59,10 @@ run_client_suite() {
 run_server_suite() {
   # Direction 2: the suite is the client, our server (wsecho) is the peer
   # under test. wsecho runs on every platform, but the container reaches
-  # the host's listeners via --network=host, which only works on Linux.
+  # the host's listeners via --network=host, which this script only relies
+  # on under Linux (Docker Desktop 4.34+ can enable it, untested here).
   if [ "$(uname -s)" != "Linux" ]; then
-    echo "error: the server direction needs Linux (epoll server + host networking)" >&2
+    echo "error: the server direction is Linux-only in this script (needs --network=host)" >&2
     exit 1
   fi
   [ -x "$ROOT/build/wsecho" ] || { echo "error: build/wsecho missing (run lwpt build)" >&2; exit 1; }

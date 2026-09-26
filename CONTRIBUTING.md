@@ -38,7 +38,9 @@ request is mergeable when:
 
 1. The universal gate is green in CI on Linux, macOS and Windows:
    `install --frozen`, `format --check`, `agents --check`, `health`,
-   `duplication`, `build`, `test`, `wsinterop`.
+   `duplication`, `build`, `test`, `wsinterop`. PR CI runs `wsinterop`
+   on every platform; locally the Definition of Done requires it when
+   client, server or protocol behaviour changes.
 2. Protocol-behaviour changes keep the Autobahn suite green in both
    directions (it runs on every push to `main`; run `tools/autobahn.sh`
    locally when conformance is plausibly affected).

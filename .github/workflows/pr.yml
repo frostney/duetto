@@ -37,11 +37,6 @@ concurrency:
 permissions:
   contents: read
 
-# A superseded push must not keep three runners busy on a stale head.
-concurrency:
-  group: pr-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   LWPT_VERSION: "0.7.0"
 

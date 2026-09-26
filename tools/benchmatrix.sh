@@ -2,27 +2,21 @@
 # Bench matrix: uWebSockets load_test against each echo server.
 # Single-vCPU sandbox: generator and server share the core; the handicap is
 # identical for every contender, so relative numbers are meaningful.
-#
-# Paths default to a checkout layout with the contenders beside duetto;
-# override any of them through the environment.
-set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LT=${LT:-$ROOT/../uWebSockets/benchmarks/load_test}
-DUETTO=${DUETTO:-$ROOT/build/wsecho}
-RUST=${RUST:-$ROOT/tools/rust-echo/target/release/rust-echo}
-PY=${PY:-$ROOT/tools/pyecho.py}
+set -u
+LT=/home/claude/uWebSockets/benchmarks/load_test
+DUETTO=/home/claude/duetto/build/wsecho
+RUST=/home/claude/rust-echo/target/release/rust-echo
+PY=/home/claude/duetto/tools/pyecho.py
 DUR=${DUR:-14}
-SRV_LOG=$(mktemp -t bench-srv.XXXXXX)
-trap 'rm -f "$SRV_LOG"' EXIT
 
 run_one() { # name start_cmd port deflate payload
   local name=$1 cmd=$2 port=$3 defl=$4 size=$5
-  nohup bash -c "$cmd" > "$SRV_LOG" 2>&1 &
+  nohup bash -c "$cmd" > /tmp/bench-srv.log 2>&1 &
   local pid=$!
-  for i in $(seq 50); do grep -q "listening" "$SRV_LOG" 2>/dev/null && break; sleep 0.1; done
+  for i in $(seq 50); do grep -q "listening" /tmp/bench-srv.log 2>/dev/null && break; sleep 0.1; done
   local out
-  out=$(timeout "$DUR" "$LT" 100 127.0.0.1 "$port" 0 "$defl" "$size" 2>/dev/null | grep -o 'Msg/sec: [0-9.]*' | awk '{print $2}' || true)
-  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+  out=$(timeout "$DUR" "$LT" 100 127.0.0.1 "$port" 0 "$defl" "$size" 2>/dev/null | grep -o 'Msg/sec: [0-9.]*' | awk '{print $2}')
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
   # discard the first (ramp-up) window, report the best of the rest
   local best
   best=$(echo "$out" | tail -n +2 | sort -n | tail -1)
