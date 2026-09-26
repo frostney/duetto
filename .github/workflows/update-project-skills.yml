@@ -1,0 +1,34 @@
+# Thin caller for known-good-route's reusable project-skills refresh
+# (see .agents/skills/maintain-project-skills/references/
+# project-skills-runbook.md). The refresh job runs read-only; the publish
+# job opens or updates a DRAFT pull request on the automation branch,
+# which then goes through ordinary review. Pin: KGR main at the SHA below;
+# bump it only after reading the KGR diff between the two pins. Dependabot
+# does not move it: it is a branch SHA, not a release tag.
+#
+# No timeout-minutes: a job that only calls a reusable workflow cannot
+# take one (the called jobs own their limits).
+#
+# The draft PR is opened with GITHUB_TOKEN, and events from that token do
+# not trigger pr.yml, so the required checks never start on their own:
+# run pr.yml on the automation branch (workflow_dispatch) or close and
+# reopen the PR before it can merge.
+name: Update project Agent Skills
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    uses: frostney/known-good-route/.github/workflows/update-project-skills.yml@bb3ec0bc7505c60fcc623b98d76fbaf8d0f77c9c # main 2026-09-17
+    with:
+      skills-root: "."
+      skills-cli-version: "1.5.23"
+      pr-branch: "automation/update-agent-skills"
