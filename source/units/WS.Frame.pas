@@ -58,12 +58,26 @@ function WriteFrameHeader(ABuf: PByte; AFin: Boolean; ARsv1: Boolean;
 // available implementation.
 procedure ApplyMask(P: PByte; ALen: PtrUInt; AKey: UInt32; AKeyOffset: PtrUInt);
 
-// Individual implementations, exported so wsbench can race them and the
-// tests can assert equivalence.
+// Unmask while copying: ADst[i] := ASrc[i] xor key, same key-offset rule
+// as ApplyMask. One pass where a copy followed by an in-place unmask
+// would take two. ASrc and ADst must not overlap.
+procedure ApplyMaskCopy(ASrc, ADst: PByte; ALen: PtrUInt; AKey: UInt32;
+  AKeyOffset: PtrUInt);
+
+// Non-overlapping copy for payload bytes. The RTL's Move runs 3-4x
+// slower than libc memcpy from 1 KiB up (wsbench "payload copy"), so on
+// Unix this is memcpy; elsewhere it stays Move. Overlapping ranges must
+// use Move.
+procedure MovePayload(ASrc, ADst: PByte; ALen: PtrUInt);
+
+// Individual implementations, exported so the tests can assert
+// equivalence (and wsbench can race the in-place ones).
 procedure UnmaskNaive(P: PByte; ALen: PtrUInt; ARotKey: UInt32);
 procedure UnmaskU64(P: PByte; ALen: PtrUInt; ARotKey: UInt32);
+procedure UnmaskCopyU64(ASrc, ADst: PByte; ALen: PtrUInt; ARotKey: UInt32);
 {$if defined(CPUX86_64) and defined(LINUX)}
 procedure UnmaskSSE2(P: PByte; ALen: PtrUInt; ARotKey: UInt32);
+procedure UnmaskCopySSE2(ASrc, ADst: PByte; ALen: PtrUInt; ARotKey: UInt32);
 {$endif}
 
 implementation
@@ -199,6 +213,23 @@ begin
   Result := N;
 end;
 
+{$ifdef UNIX}
+// Named library, not a bare external: a program without cthreads links
+// statically unless something asks for libc.
+function C_memcpy(ADst, ASrc: Pointer; ALen: PtrUInt): Pointer; cdecl;
+  external 'c' name 'memcpy';
+{$endif}
+
+procedure MovePayload(ASrc, ADst: PByte; ALen: PtrUInt);
+begin
+  if ALen = 0 then Exit; // memcpy with a nil pointer is undefined even at 0
+{$ifdef UNIX}
+  C_memcpy(ADst, ASrc, ALen);
+{$else}
+  Move(ASrc^, ADst^, ALen);
+{$endif}
+end;
+
 procedure UnmaskNaive(P: PByte; ALen: PtrUInt; ARotKey: UInt32);
 var
   I: PtrUInt;
@@ -212,23 +243,35 @@ begin
   end;
 end;
 
+// The main loops of UnmaskU64 / UnmaskCopyU64 run 64 bytes per pass up
+// to an end pointer. The earlier 32-byte form that counted a length down
+// ran anywhere from 35 to 53 GB/s on Zen 5 for reasons outside the code:
+// where the loop was placed (a static harness shifting it through eight
+// 8-byte offsets: 35.6-52.5) and how the binary was linked (the same
+// bytes at the same address: ~52 static, ~36 once libc is linked). This
+// shape measured 52-58 GB/s in every one of those configurations. The
+// tails keep the key phase: every step is a multiple of 4 bytes.
 procedure UnmaskU64(P: PByte; ALen: PtrUInt; ARotKey: UInt32);
 var
   K64: UInt64;
-  P64: PUInt64;
+  P64, PEnd: PUInt64;
 begin
   K64 := UInt64(ARotKey) or (UInt64(ARotKey) shl 32);
   P64 := PUInt64(P);
-  // 32 bytes per iteration: four independent XORs keep the single port busy.
-  while ALen >= 32 do
+  PEnd := PUInt64(P + (ALen and not PtrUInt(63)));
+  while P64 < PEnd do
   begin
     P64[0] := P64[0] xor K64;
     P64[1] := P64[1] xor K64;
     P64[2] := P64[2] xor K64;
     P64[3] := P64[3] xor K64;
-    Inc(P64, 4);
-    Dec(ALen, 32);
+    P64[4] := P64[4] xor K64;
+    P64[5] := P64[5] xor K64;
+    P64[6] := P64[6] xor K64;
+    P64[7] := P64[7] xor K64;
+    Inc(P64, 8);
   end;
+  ALen := ALen and 63;
   while ALen >= 8 do
   begin
     P64^ := P64^ xor K64;
@@ -239,7 +282,100 @@ begin
     UnmaskNaive(PByte(P64), ALen, ARotKey);
 end;
 
+procedure UnmaskCopyU64(ASrc, ADst: PByte; ALen: PtrUInt; ARotKey: UInt32);
+var
+  K64: UInt64;
+  S, D, SEnd: PUInt64;
+begin
+  K64 := UInt64(ARotKey) or (UInt64(ARotKey) shl 32);
+  S := PUInt64(ASrc);
+  D := PUInt64(ADst);
+  SEnd := PUInt64(ASrc + (ALen and not PtrUInt(63)));
+  while S < SEnd do
+  begin
+    D[0] := S[0] xor K64;
+    D[1] := S[1] xor K64;
+    D[2] := S[2] xor K64;
+    D[3] := S[3] xor K64;
+    D[4] := S[4] xor K64;
+    D[5] := S[5] xor K64;
+    D[6] := S[6] xor K64;
+    D[7] := S[7] xor K64;
+    Inc(S, 8);
+    Inc(D, 8);
+  end;
+  ALen := ALen and 63;
+  while ALen >= 8 do
+  begin
+    D^ := S^ xor K64;
+    Inc(S);
+    Inc(D);
+    Dec(ALen, 8);
+  end;
+  ASrc := PByte(S);
+  ADst := PByte(D);
+  while ALen > 0 do
+  begin
+    ADst^ := ASrc^ xor Byte(ARotKey);
+    ARotKey := (ARotKey shr 8) or (ARotKey shl 24);
+    Inc(ASrc);
+    Inc(ADst);
+    Dec(ALen);
+  end;
+end;
+
 {$if defined(CPUX86_64) and defined(LINUX)}
+// SysV AMD64: Src=RDI, Dst=RSI, Len=RDX, RotKey=ECX. The copying twin of
+// UnmaskSSE2, same 64-byte main loop.
+procedure UnmaskCopySSE2(ASrc, ADst: PByte; ALen: PtrUInt; ARotKey: UInt32); assembler; nostackframe;
+asm
+  movd    xmm0, ecx
+  pshufd  xmm0, xmm0, 0
+@Loop64:
+  cmp     rdx, 64
+  jb      @Loop16
+  movdqu  xmm1, [rdi]
+  movdqu  xmm2, [rdi + 16]
+  movdqu  xmm3, [rdi + 32]
+  movdqu  xmm4, [rdi + 48]
+  pxor    xmm1, xmm0
+  pxor    xmm2, xmm0
+  pxor    xmm3, xmm0
+  pxor    xmm4, xmm0
+  movdqu  [rsi], xmm1
+  movdqu  [rsi + 16], xmm2
+  movdqu  [rsi + 32], xmm3
+  movdqu  [rsi + 48], xmm4
+  add     rdi, 64
+  add     rsi, 64
+  sub     rdx, 64
+  jmp     @Loop64
+@Loop16:
+  cmp     rdx, 16
+  jb      @Tail
+  movdqu  xmm1, [rdi]
+  pxor    xmm1, xmm0
+  movdqu  [rsi], xmm1
+  add     rdi, 16
+  add     rsi, 16
+  sub     rdx, 16
+  jmp     @Loop16
+@Tail:
+  test    rdx, rdx
+  jz      @Done
+  movd    eax, xmm0
+@TailLoop:
+  mov     cl, byte ptr [rdi]
+  xor     cl, al
+  mov     byte ptr [rsi], cl
+  ror     eax, 8
+  inc     rdi
+  inc     rsi
+  dec     rdx
+  jnz     @TailLoop
+@Done:
+end;
+
 // SysV AMD64: P=RDI, Len=RSI, RotKey=EDX. 64 bytes per main iteration.
 procedure UnmaskSSE2(P: PByte; ALen: PtrUInt; ARotKey: UInt32); assembler; nostackframe;
 asm
@@ -304,6 +440,26 @@ begin
   else
 {$endif}
     UnmaskU64(P, ALen, RotKey);
+end;
+
+procedure ApplyMaskCopy(ASrc, ADst: PByte; ALen: PtrUInt; AKey: UInt32;
+  AKeyOffset: PtrUInt);
+var
+  RotKey: UInt32;
+  Shift: Integer;
+begin
+  if ALen = 0 then Exit;
+  Shift := Integer(AKeyOffset and 3) * 8;
+  if Shift = 0 then
+    RotKey := AKey
+  else
+    RotKey := (AKey shr Shift) or (AKey shl (32 - Shift));
+{$if defined(CPUX86_64) and defined(LINUX)}
+  if ALen >= 16 then
+    UnmaskCopySSE2(ASrc, ADst, ALen, RotKey)
+  else
+{$endif}
+    UnmaskCopyU64(ASrc, ADst, ALen, RotKey);
 end;
 
 end.

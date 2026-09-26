@@ -14,9 +14,12 @@ unit WS.Protocol;
 // frame with the appropriate status code (1002 protocol error, 1007 bad
 // payload, 1009 too big). The owner flushes the out buffer, then drops TCP.
 //
-// Ingest MUTATES the buffer it is given (in-place unmask). Socket recv
-// buffers are private to their connection, so this costs nothing and
-// avoids a copy per frame.
+// Ingest MUTATES the buffer it is given (in-place unmask), and may hand
+// OnMessage a pointer into it: the caller must neither reuse nor free
+// that buffer while Ingest runs (a transport's read buffer — shared by
+// every connection on epoll — is refilled only after OnData returns).
+// Ingest is not re-entrant: do not call it from inside its own
+// callbacks.
 
 {$I Shared.inc}
 
@@ -33,8 +36,9 @@ uses
 type
   TWSRole = (wsrServer, wsrClient);
 
-  // P/Len point into protocol-owned buffers, valid only for the duration
-  // of the callback. Copy if you need to keep the bytes.
+  // P/Len point into protocol-owned buffers or into the buffer handed to
+  // Ingest, valid only for the duration of the callback. Copy if you need
+  // to keep the bytes.
   TWSMessageEvent = procedure(AText: Boolean; P: PByte; Len: NativeInt) of object;
   TWSControlEvent = procedure(P: PByte; Len: NativeInt) of object;
   TWSCloseEvent   = procedure(ACode: Word; const AReason: string) of object;
@@ -54,9 +58,10 @@ type
     FMsgCompressed: Boolean;
     FUtf8: UInt32;
 
-    // data-frame payload being streamed (header already consumed). Data
-    // payloads never enter the carry buffer: each chunk is unmasked in
-    // the caller's buffer and routed straight to assembly/inflater.
+    // data-frame payload being streamed (header already consumed). A
+    // whole final frame is unmasked where it lies and delivered from
+    // there; any other chunk is unmasked while being copied into the
+    // assembly buffer, or unmasked in place and fed to the inflater.
     FStreamRemaining: UInt64;
     FStreamFin: Boolean;
     FStreamMasked: Boolean;
@@ -84,6 +89,7 @@ type
     FOnClose: TWSCloseEvent;
 
     function NextMaskKey: UInt32;
+    function OutReserve(ALen: NativeInt): PByte;
     procedure OutAppend(P: PByte; ALen: NativeInt);
     procedure SendFrame(AOpcode: Byte; ARsv1: Boolean; P: PByte; ALen: NativeInt);
     procedure SendDataMessage(AOpcode: Byte; P: PByte; ALen: NativeInt);
@@ -92,14 +98,19 @@ type
     function HandleControl(const H: TWSFrameHeader; P: PByte): Boolean;
     function BeginDataFrame(const H: TWSFrameHeader): Boolean;
     function DataChunk(P: PByte; ALen: NativeInt): Boolean;
+    function MsgReserve(ALen: NativeInt): PByte;
+    function AssembleMaskedChunk(P: PByte; ALen: NativeInt): Boolean;
     function FinishMessage: Boolean;
+    function FinishInPlace(P: PByte; ALen: NativeInt): Boolean;
+    function DeliverMessage(P: PByte; ALen: NativeInt): Boolean;
   public
     constructor Create(ARole: TWSRole; const ADeflate: TWSDeflateParams;
       AMaxMessage: NativeInt = 16 * 1024 * 1024);
     destructor Destroy; override;
 
-    // Feed bytes read from the socket. Mutates the buffer. False means the
-    // connection has failed: flush the out queue, then close TCP.
+    // Feed bytes read from the socket. Mutates the buffer (see the unit
+    // header). Not re-entrant. False means the connection has failed:
+    // flush the out queue, then close TCP.
     function Ingest(P: PByte; ALen: NativeInt): Boolean;
 
     procedure SendText(const S: RawByteString); overload;
@@ -248,11 +259,13 @@ begin
   OutAppend(P, ALen);
 end;
 
-procedure TWSProtocol.OutAppend(P: PByte; ALen: NativeInt);
+// Claims ALen bytes at the tail of the out queue and returns where they
+// start; the caller fills them. Nothing to claim: nil, queue untouched.
+function TWSProtocol.OutReserve(ALen: NativeInt): PByte;
 var
   Need: NativeInt;
 begin
-  if ALen <= 0 then Exit;
+  if ALen <= 0 then Exit(nil);
   // Compact first if the dead prefix dominates the buffer.
   if (FOutOff > 0) and (FOutOff * 2 > FOutLen) then
   begin
@@ -263,8 +276,14 @@ begin
   Need := FOutLen + ALen;
   if Need > Length(FOut) then
     SetLength(FOut, Need + Need shr 1 + 256);
-  Move(P^, FOut[FOutLen], ALen);
-  Inc(FOutLen, ALen);
+  Result := @FOut[FOutLen];
+  FOutLen := Need;
+end;
+
+procedure TWSProtocol.OutAppend(P: PByte; ALen: NativeInt);
+begin
+  if ALen <= 0 then Exit;
+  MovePayload(P, OutReserve(ALen), ALen);
 end;
 
 procedure TWSProtocol.SendFrame(AOpcode: Byte; ARsv1: Boolean;
@@ -273,17 +292,15 @@ var
   Hdr: array[0..WS_MAX_HEADER - 1] of Byte;
   HLen: Integer;
   Key: UInt32;
-  PayloadAt: NativeInt;
 begin
   if FRole = wsrClient then
   begin
     Key := NextMaskKey;
     HLen := WriteFrameHeader(@Hdr[0], True, ARsv1, AOpcode, True, Key, ALen);
     OutAppend(@Hdr[0], HLen);
-    PayloadAt := FOutLen;
-    OutAppend(P, ALen);
-    // Mask the copy that now lives in our out buffer — never the caller's.
-    ApplyMask(@FOut[PayloadAt], ALen, Key, 0);
+    // Mask while copying into our out buffer — never the caller's.
+    if ALen > 0 then
+      ApplyMaskCopy(P, OutReserve(ALen), ALen, Key, 0);
   end
   else
   begin
@@ -434,6 +451,25 @@ begin
   end;
 end;
 
+// The one place a complete message leaves the machine.
+function TWSProtocol.DeliverMessage(P: PByte; ALen: NativeInt): Boolean;
+begin
+  Result := True;
+  FInMessage := False;
+  FMsgLen := 0;
+  if Assigned(FOnMessage) then FOnMessage(FMsgText, P, ALen);
+end;
+
+// An uncompressed message whose whole payload is one final frame sitting
+// in the Ingest buffer (already unmasked and UTF-8 checked as a whole):
+// deliver it from there.
+function TWSProtocol.FinishInPlace(P: PByte; ALen: NativeInt): Boolean;
+begin
+  if FMsgText and (FUtf8 <> UTF8_ACCEPT) then
+    Exit(Fail(1007, 'truncated UTF-8 at message end'));
+  Result := DeliverMessage(P, ALen);
+end;
+
 function TWSProtocol.FinishMessage: Boolean;
 var
   P: PByte;
@@ -468,9 +504,7 @@ begin
     N := FMsgLen;
     if N > 0 then P := @FMsg[0] else P := nil;
   end;
-  FInMessage := False;
-  FMsgLen := 0;
-  if Assigned(FOnMessage) then FOnMessage(FMsgText, P, N);
+  Result := DeliverMessage(P, N);
 end;
 
 function TWSProtocol.BeginDataFrame(const H: TWSFrameHeader): Boolean;
@@ -507,7 +541,7 @@ end;
 
 function TWSProtocol.DataChunk(P: PByte; ALen: NativeInt): Boolean;
 var
-  Prev, Need: NativeInt;
+  Prev: NativeInt;
 begin
   Result := True;
   if ALen = 0 then Exit;
@@ -533,12 +567,38 @@ begin
     if FMsgText then
       if not Utf8Advance(FUtf8, P, ALen) then
         Exit(Fail(1007, 'invalid UTF-8'));
-    Need := FMsgLen + ALen;
-    if Need > Length(FMsg) then
-      SetLength(FMsg, Need + Need shr 1 + 64);
-    Move(P^, FMsg[FMsgLen], ALen);
-    FMsgLen := Need;
+    MovePayload(P, MsgReserve(ALen), ALen);
+    Inc(FMsgLen, ALen);
   end;
+end;
+
+// Room for ALen more assembled bytes (ALen > 0); returns where they go.
+// The caller advances FMsgLen once the chunk is accepted.
+function TWSProtocol.MsgReserve(ALen: NativeInt): PByte;
+var
+  Need: NativeInt;
+begin
+  Need := FMsgLen + ALen;
+  if Need > Length(FMsg) then
+    SetLength(FMsg, Need + Need shr 1 + 64);
+  Result := @FMsg[FMsgLen];
+end;
+
+// Assembly of a masked, uncompressed payload chunk: unmask straight
+// into the assembly buffer (one pass instead of unmask-then-copy), then
+// validate UTF-8 over the unmasked bytes.
+function TWSProtocol.AssembleMaskedChunk(P: PByte; ALen: NativeInt): Boolean;
+var
+  Dst: PByte;
+begin
+  Result := True;
+  if ALen = 0 then Exit;
+  Dst := MsgReserve(ALen);
+  ApplyMaskCopy(P, Dst, ALen, FStreamKey, FStreamOff);
+  if FMsgText then
+    if not Utf8Advance(FUtf8, Dst, ALen) then
+      Exit(Fail(1007, 'invalid UTF-8'));
+  Inc(FMsgLen, ALen);
 end;
 
 function TWSProtocol.Ingest(P: PByte; ALen: NativeInt): Boolean;
@@ -567,11 +627,13 @@ begin
 
   if FCarryLen > 0 then
   begin
-    // Splice: partial header / control frame + new bytes. Data payloads
-    // never sit in the carry, so this stays small (header + 125 max).
+    // Splice: the leftover (at most a partial header or a split control
+    // frame, header + 125) plus the whole new read, so the carry can be
+    // as large as one read — and a data frame completed inside it is
+    // delivered from here in place.
     if FCarryLen + ALen > Length(FCarry) then
       SetLength(FCarry, FCarryLen + ALen);
-    Move(P^, FCarry[FCarryLen], ALen);
+    MovePayload(P, @FCarry[FCarryLen], ALen);
     Inc(FCarryLen, ALen);
     Work := @FCarry[0];
     WLen := FCarryLen;
@@ -587,20 +649,43 @@ begin
   Off := 0;
   while True do
   begin
-    // A data frame mid-payload: stream chunks straight through, unmasking
-    // in place with the mask phase carried across Ingest calls. No copy
-    // into carry, no header reparse.
+    // A data frame mid-payload: stream chunks straight through with the
+    // mask phase carried across Ingest calls — no copy into the carry, no
+    // header reparse.
     if FStreamRemaining > 0 then
     begin
       Take := WLen - Off;
       if Take <= 0 then Break;
       if UInt64(Take) > FStreamRemaining then
         Take := NativeInt(FStreamRemaining);
-      if FStreamMasked then
-        ApplyMask(Work + Off, Take, FStreamKey, FStreamOff);
+      // Whole final frame of an uncompressed message with nothing
+      // assembled before it: unmask in place, validate and deliver from
+      // the buffer it already sits in instead of copying it into FMsg.
+      if FStreamFin and (not FMsgCompressed) and (FMsgLen = 0) and
+         (UInt64(Take) = FStreamRemaining) then
+      begin
+        if FStreamMasked then
+          ApplyMask(Work + Off, Take, FStreamKey, FStreamOff);
+        FStreamRemaining := 0;
+        if FMsgText and (not Utf8Advance(FUtf8, Work + Off, Take)) then
+          Exit(Fail(1007, 'invalid UTF-8'));
+        Inc(Off, Take);
+        if not FinishInPlace(Work + Off - Take, Take) then Exit(False);
+        Continue;
+      end;
+      if FStreamMasked and (not FMsgCompressed) then
+      begin
+        if not AssembleMaskedChunk(Work + Off, Take) then Exit(False);
+      end
+      else
+      begin
+        // The inflater reads the chunk where it lies: unmask in place.
+        if FStreamMasked then
+          ApplyMask(Work + Off, Take, FStreamKey, FStreamOff);
+        if not DataChunk(Work + Off, Take) then Exit(False);
+      end;
       Inc(FStreamOff, Take);
       Dec(FStreamRemaining, Take);
-      if not DataChunk(Work + Off, Take) then Exit(False);
       Inc(Off, Take);
       if (FStreamRemaining = 0) and FStreamFin then
         if not FinishMessage then Exit(False);
