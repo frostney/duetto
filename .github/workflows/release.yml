@@ -1,0 +1,87 @@
+name: Release
+
+# Tag-triggered GitHub Release. Companion to ci.yml and pr.yml:
+#
+#   pr.yml      — every PR: the pre-merge gate
+#   ci.yml      — push to main: platform matrix + Autobahn (the release gate)
+#   release.yml — version tag push: publish the GitHub Release
+#
+# duetto is a library: consumers resolve it from the git tag through
+# lwpt (docs/deployment.md), so there is nothing to build or attach. The
+# Release carries the tag's CHANGELOG.md section as its notes — the same
+# section the release PR generated with git-cliff before the tag.
+#
+# Tags are SemVer without a `v` (the frostney Pascal convention); a `v`
+# prefix is accepted and stripped. A hyphenated version (`1.0.0-rc.1`)
+# publishes as a pre-release.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions:
+  contents: write   # softprops/action-gh-release creates the release
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve tag + version
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          if [[ "$VERSION" == *-* ]]; then PRERELEASE=true; else PRERELEASE=false; fi
+          # The tag must name the version the release PR declared.
+          MANIFEST=$(sed -n 's/^version = "\(.*\)"$/\1/p' lwpt.toml | head -1)
+          if [ "$MANIFEST" != "$VERSION" ]; then
+            echo "::error::tag ${TAG} does not match lwpt.toml version ${MANIFEST}"
+            exit 1
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "prerelease=${PRERELEASE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          # The section body only: its `## [x.y.z] - date` heading repeats
+          # what the release title and date already say.
+          awk -v version="$VERSION" '
+            /^## \[/ {
+              if (capture) exit
+              if (index($0, "## [" version "]") == 1) capture = 1
+              next
+            }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::CHANGELOG.md has no section for ${VERSION}"
+            exit 1
+          fi
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
+          draft: false
+          body_path: release-notes.md
