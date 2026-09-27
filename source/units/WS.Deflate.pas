@@ -43,6 +43,7 @@ type
     FOut: TBytes;
     FOutSize: NativeInt;
     FMaxOut: NativeInt;
+    FOutLimit: NativeInt;
     function Pump(P: PByte; ALen: NativeInt): Boolean;
     procedure ClearWindow;
   public
@@ -158,6 +159,14 @@ begin
   inherited Create;
   FNoTakeover := ANoTakeover;
   FMaxOut := AMaxOut;
+  // One byte of slack past the cap: a message that inflates to exactly
+  // FMaxOut leaves room in the buffer, so the pump ends on exhausted
+  // input instead of tripping the bomb guard, and any further byte
+  // still lands in the slack and fails FOutSize > FMaxOut.
+  if AMaxOut < High(NativeInt) then
+    FOutLimit := AMaxOut + 1
+  else
+    FOutLimit := AMaxOut;
   FillChar(FStrm, SizeOf(FStrm), 0);
   // Always inflate with the full 32 KB window. The negotiated
   // *_max_window_bits (9..15) bounds the peer's compressor, not what a
@@ -207,9 +216,9 @@ begin
   repeat
     if FOutSize = Length(FOut) then
     begin
-      if NativeInt(Length(FOut)) >= FMaxOut then Exit; // bomb guard
-      if NativeInt(Length(FOut)) * 2 > FMaxOut then
-        SetLength(FOut, FMaxOut)
+      if NativeInt(Length(FOut)) >= FOutLimit then Exit; // bomb guard
+      if NativeInt(Length(FOut)) * 2 > FOutLimit then
+        SetLength(FOut, FOutLimit)
       else
         SetLength(FOut, Length(FOut) * 2);
     end;

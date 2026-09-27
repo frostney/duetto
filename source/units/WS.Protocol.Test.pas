@@ -22,6 +22,7 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
+  WS.Deflate,
   WS.Frame,
   WS.Handshake,
   WS.Protocol;
@@ -118,6 +119,8 @@ type
     procedure TestCompressedBitOnWire;
     procedure TestLargeCompressible;
     procedure TestByteByByteCompressed;
+    procedure TestCompressedExactCap;
+    procedure TestCompressedContinuationOverCapWire;
   end;
 
 const
@@ -846,7 +849,8 @@ end;
 
 // Run the REAL handshake to get both sides' negotiated params, then build
 // the two protocols from them — no hand-assembled TWSDeflateParams.
-procedure NegotiatedPair(out C, S: TWSProtocol);
+procedure NegotiatedPair(out C, S: TWSProtocol;
+  AServerMax: NativeInt = 16 * 1024 * 1024);
 var
   Key, Req, Resp, Err: string;
   HS: TWSServerHandshake;
@@ -860,7 +864,7 @@ begin
   if not ClientParseResponse(Resp, Key, True, CD, Err) then
     raise Exception.Create('client parse failed: ' + Err);
   C := TWSProtocol.Create(wsrClient, CD);
-  S := TWSProtocol.Create(wsrServer, HS.Deflate);
+  S := TWSProtocol.Create(wsrServer, HS.Deflate, AServerMax);
 end;
 
 procedure TProtoDeflate.TestNegotiatedRoundTrip;
@@ -1229,6 +1233,121 @@ begin
   Test('RSV1 + mask verified on the wire',     TestCompressedBitOnWire);
   Test('512 KB compressible shrinks and echoes', TestLargeCompressible);
   Test('byte-by-byte compressed ingest',       TestByteByByteCompressed);
+  Test('inflated size exactly at cap ok, +1 -> 1009', TestCompressedExactCap);
+  Test('compressed CONT frame longer than the cap still inflates', TestCompressedContinuationOverCapWire);
+end;
+
+// AIncompressible: xorshift bytes, which deflate cannot shrink, so the
+// compressed frame on the wire is longer than the message it carries.
+function CapPayload(ALen: Integer; AIncompressible: Boolean): TBytes;
+var
+  I: Integer;
+  X: UInt32;
+begin
+  SetLength(Result, ALen);
+  X := $9E3779B9;
+  for I := 0 to ALen - 1 do
+    if AIncompressible then
+    begin
+      X := X xor (X shl 13);
+      X := X xor (X shr 17);
+      X := X xor (X shl 5);
+      Result[I] := Byte(X);
+    end
+    else
+      Result[I] := Byte(Ord('A') + (I mod 7));
+end;
+
+procedure TProtoDeflate.TestCompressedExactCap;
+const
+  // 64 KiB lands on a doubling step of the inflater's buffer, 50000 on
+  // its clamp.
+  Caps: array[0..1] of NativeInt = (64 * 1024, 50000);
+var
+  C, S: TWSProtocol;
+  SS: TSink;
+  Msg: TBytes;
+  I: Integer;
+  Incompressible: Boolean;
+  WireLen: NativeInt;
+begin
+  // The cap means "at most" on both paths: an uncompressed message of
+  // exactly the cap is accepted, so a compressed one must be too —
+  // including one whose compressed frame is longer than the cap — and
+  // one inflated byte more fails 1009 just like the plain path.
+  for Incompressible := False to True do
+    for I := 0 to High(Caps) do
+    begin
+      Msg := CapPayload(Caps[I], Incompressible);
+      NegotiatedPair(C, S, Caps[I]);
+      SS := TSink.Create;
+      Hook(S, SS);
+      try
+        C.SendBinary(@Msg[0], Length(Msg));
+        WireLen := C.OutPending;
+        if Incompressible then
+          Expect<Boolean>(WireLen > Caps[I]).ToBe(True);
+        Wire(C, S);
+        Expect<Boolean>(S.Failed).ToBe(False);
+        Expect<Integer>(SS.MsgCount).ToBe(1);
+        Expect<Boolean>(SameBytes(SS.LastMsg, Msg)).ToBe(True);
+      finally
+        C.Free; S.Free; SS.Free;
+      end;
+
+      Msg := CapPayload(Caps[I] + 1, Incompressible);
+      NegotiatedPair(C, S, Caps[I]);
+      SS := TSink.Create;
+      Hook(S, SS);
+      try
+        C.SendBinary(@Msg[0], Length(Msg));
+        Wire(C, S);
+        Expect<Boolean>(S.Failed).ToBe(True);
+        Expect<Integer>(SS.MsgCount).ToBe(0);
+        Expect<Integer>(Integer(WireCloseCode(S))).ToBe(1009);
+      finally
+        C.Free; S.Free; SS.Free;
+      end;
+    end;
+end;
+
+procedure TProtoDeflate.TestCompressedContinuationOverCapWire;
+const
+  Cap = 64 * 1024;
+var
+  C, S: TWSProtocol;
+  SS: TSink;
+  D: TWSDeflater;
+  Msg, Z, Head, Tail: TBytes;
+begin
+  // RSV1 sits on the first frame only, so the compressed-message
+  // exemption from the per-frame wire cap must follow the message into
+  // its continuations: a CONT frame longer than the cap still inflates
+  // to at most the cap.
+  Msg := CapPayload(Cap, True);
+  D := TWSDeflater.Create(15, False);
+  try
+    Expect<Boolean>(D.CompressMessage(@Msg[0], Length(Msg), Z)).ToBe(True);
+  finally
+    D.Free;
+  end;
+  Head := System.Copy(Z, 0, 1);
+  Tail := System.Copy(Z, 1, Length(Z) - 1);
+  Expect<Boolean>(Length(Tail) > Cap).ToBe(True);
+
+  NegotiatedPair(C, S, Cap);
+  SS := TSink.Create;
+  Hook(S, SS);
+  try
+    Expect<Boolean>(IngestAll(S, [
+      BuildFrame(WS_OP_BINARY, False, True, False, True, Head, $01020304),
+      BuildFrame(WS_OP_CONT,   True,  False, False, True, Tail, $05060708)
+    ])).ToBe(True);
+    Expect<Integer>(SS.MsgCount).ToBe(1);
+    Expect<Boolean>(SameBytes(SS.LastMsg, Msg)).ToBe(True);
+  finally
+    C.Free; S.Free; SS.Free;
+  end;
 end;
 
 { ───────── direct (gather-write) send ───────── }

@@ -70,7 +70,7 @@ type
     FStreamFin: Boolean;
     FStreamMasked: Boolean;
     FStreamKey: UInt32;
-    FStreamOff: PtrUInt;       // mask phase within the frame payload
+    FStreamOff: PtrUInt;       // mask phase within the frame payload (mod 4)
 
     // outbound queue
     FOut: TBytes;
@@ -529,7 +529,7 @@ begin
     Prev := FInflater.OutSize;
     if not FInflater.Finish then
     begin
-      if FInflater.OutSize >= FMaxMessage then
+      if FInflater.OutSize > FMaxMessage then
         Exit(Fail(1009, 'message too big'))
       else
         Exit(Fail(1007, 'invalid deflate stream'));
@@ -599,7 +599,7 @@ begin
     Prev := FInflater.OutSize;
     if not FInflater.Feed(P, ALen) then
     begin
-      if FInflater.OutSize >= FMaxMessage then
+      if FInflater.OutSize > FMaxMessage then
         Exit(Fail(1009, 'message too big'))
       else
         Exit(Fail(1007, 'invalid deflate stream'));
@@ -732,7 +732,9 @@ begin
           ApplyMask(Work + Off, Take, FStreamKey, FStreamOff);
         if not DataChunk(Work + Off, Take) then Exit(False);
       end;
-      Inc(FStreamOff, Take);
+      // Only the phase matters to the mask, and a compressed frame's
+      // length is not capped: keep it mod 4 so it can never overflow.
+      FStreamOff := (FStreamOff + PtrUInt(Take)) and 3;
       Dec(FStreamRemaining, Take);
       Inc(Off, Take);
       if (FStreamRemaining = 0) and FStreamFin then
@@ -766,10 +768,16 @@ begin
     else if H.Masked then
       Exit(Fail(1002, 'server frame masked'));
 
-    // Oversize data frames die before we touch a byte of them.
+    // Oversize uncompressed data frames die before we touch a byte of
+    // them. A compressed frame's wire length does not bound what it
+    // inflates to (incompressible data grows slightly under deflate), so
+    // compressed messages — RSV1 on the first frame, carried by their
+    // continuations — are governed by the inflater's output cap instead.
     if not H.IsControl then
-      if H.PayloadLen > UInt64(FMaxMessage) then
-        Exit(Fail(1009, 'frame exceeds message cap'));
+      if not (H.Rsv1 or ((H.Opcode = WS_OP_CONT) and FInMessage and
+              FMsgCompressed)) then
+        if H.PayloadLen > UInt64(FMaxMessage) then
+          Exit(Fail(1009, 'frame exceeds message cap'));
 
     if H.IsControl then
     begin

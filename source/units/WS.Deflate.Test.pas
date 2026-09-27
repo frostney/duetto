@@ -39,6 +39,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestBombCap;
+    procedure TestExactCapBoundary;
     procedure TestCorruptStream;
     procedure TestTooFarBackReadsZeros;
     procedure TestSmallWindowFarDistanceStaysInside;
@@ -318,6 +319,38 @@ begin
   end;
 end;
 
+procedure TDeflateDefence.TestExactCapBoundary;
+const
+  // 64 KB lands on a doubling step of the output buffer; 50000 lands on
+  // the clamp. Both must accept exactly the cap and refuse one byte more.
+  Caps: array[0..1] of NativeInt = (64 * 1024, 50000);
+var
+  C: TWSDeflater;
+  D: TWSInflater;
+  InB, OutB: TBytes;
+  I, J: Integer;
+begin
+  for I := 0 to High(Caps) do
+  begin
+    C := TWSDeflater.Create(15, True);
+    D := TWSInflater.Create(15, True, Caps[I]);
+    try
+      SetLength(InB, Caps[I]);
+      for J := 0 to High(InB) do InB[J] := Byte(Ord('A') + (J mod 7));
+      Expect<Boolean>(RoundTrip(C, D, InB, OutB)).ToBe(True);
+      Expect<Boolean>(SameBytes(OutB, InB)).ToBe(True);
+
+      SetLength(InB, Caps[I] + 1);
+      InB[Caps[I]] := Ord('A');
+      Expect<Boolean>(RoundTrip(C, D, InB, OutB)).ToBe(False);
+      Expect<Boolean>(D.OutSize > Caps[I]).ToBe(True);
+    finally
+      C.Free;
+      D.Free;
+    end;
+  end;
+end;
+
 procedure TDeflateDefence.TestCorruptStream;
 var
   D: TWSInflater;
@@ -434,6 +467,7 @@ end;
 procedure TDeflateDefence.SetupTests;
 begin
   Test('decompression bomb hits output cap',     TestBombCap);
+  Test('exactly the cap inflates, cap + 1 fails', TestExactCapBoundary);
   Test('corrupt stream rejected',                TestCorruptStream);
   Test('too-far back-reference reads zeros',    TestTooFarBackReadsZeros);
   Test('9-bit window, 32 KB distance stays inside', TestSmallWindowFarDistanceStaysInside);
