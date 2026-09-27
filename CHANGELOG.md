@@ -2,6 +2,45 @@
 
 All notable changes to duetto are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); entries are generated from Conventional Commits by git-cliff.
 
+## [0.5.0] - 2026-09-27
+
+### Bug Fixes
+
+- drive every deadline from a monotonic clock (#71)
+- accept a compressed message exactly at the cap (#70)
+- make the benchmark tooling runnable and accurate (#52)
+- release on a raising OnClientClose, and pair it at Destroy (#58)
+- bound the reads one readiness event takes (#53)
+- audit correctness batch — inflater truncation, server teardown, wss reads, close codes (#33)
+- keep the inflate window free of memory the peer never sent (#50)
+
+### Documentation
+
+- re-measure on the optimised build (#57)
+
+### Internal
+
+- use the shared excludeVendoredSkills instead of inline logic (#69)
+- stop reviewing vendored Agent Skills, keep project-authored ones (#67)
+- refresh project Agent Skills (#65)
+- pin the skills updater to the hosted-runner fix (#64)
+- refresh project Agent Skills and adopt the consolidated delivery loop (#36)
+- run the battery as section procedures (#60)
+- enforce analysis ceilings, require TLS coverage, pin actions, fix docs drift (#35)
+- run the PR workflow for stacked pull requests (#59)
+- bump lwpt to 0.7.0 (#31)
+
+### New Features
+
+- run the win32 battery under Wine in Docker (#51)
+- resource bounds, peer clocks and transport accept/close hardening (#34)
+- optional bind address and OnUpgradeRequest handshake hook (#32)
+
+### Performance
+
+- gather-write sends on the epoll transport (#56)
+- fewer payload copies on the hot path (#55)
+
 ## [0.4.0] - 2026-08-14
 
 ### Documentation
