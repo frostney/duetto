@@ -56,7 +56,7 @@ tools/autobahn.sh client   # Autobahn fuzzingserver vs wsautobahn (Docker)
 
 | Path | Role |
 | --- | --- |
-| `source/units/` | Library: `WS.Frame`, `WS.Utf8`, `WS.Handshake`, `WS.Deflate`, `WS.Protocol` (sans-I/O core), `WS.Client`, `WS.Transport(.Epoll/.NetworkFramework/.Iocp)`, `WS.Transport.PostQueue` (cross-thread post hand-off), `WS.Transport.TlsServer` (server TLS for the fd-owning transports), `WS.Server` (session layer) |
+| `source/units/` | Library: `WS.Clock` (monotonic deadline clock), `WS.Frame`, `WS.Utf8`, `WS.Handshake`, `WS.Deflate`, `WS.Protocol` (sans-I/O core), `WS.Client`, `WS.Transport(.Epoll/.NetworkFramework/.Iocp)`, `WS.Transport.PostQueue` (cross-thread post hand-off), `WS.Transport.TlsServer` (server TLS for the fd-owning transports), `WS.Server` (session layer) |
 | `source/apps/` | Programs: `wsecho`, `wsprobe`, `wsinterop`, `wsbench`, `wsautobahn` |
 | `tests/autobahn/` | Autobahn testsuite configs (reports/ is generated) |
 | `tools/` | Cross-implementation checks, benchmarks, Autobahn runner |

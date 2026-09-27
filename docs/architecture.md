@@ -24,6 +24,7 @@ once on protocol failure, after queueing the appropriate close frame
 
 | Unit | Role |
 |------|------|
+| `WS.Clock` | `WSMonotonicMs`, the monotonic millisecond clock behind every deadline (session clocks, close drains, TLS handshake budgets, accept backoff, the client's bounded read); `CLOCK_UPTIME_RAW` on macOS, where FPC 3.2.2's `GetTickCount64` is wall-clock |
 | `WS.Frame` | header parse/encode, strict minimal-length rules; masking via byte loop / UInt64 / SSE2 |
 | `WS.Utf8` | Höhrmann DFA with an 8-byte-word ASCII fast path; resumable across fragments |
 | `WS.Handshake` | upgrade request/response both directions, `Sec-WebSocket-Accept`, deflate parameter negotiation |
@@ -59,7 +60,9 @@ Four nets, from innermost to outermost:
    dotted-quad, RFC 4291 IPv6 forms, and a rejection matrix that names
    the offending input) and the default gather send every transport
    inherits, plus a protocol direct-send suite (when a frame may bypass
-   the out queue, and that exactly the untaken tail is queued).
+   the out queue, and that exactly the untaken tail is queued), and a
+   `WS.Clock` suite checking that the deadline clock never runs
+   backwards and advances in milliseconds.
 2. **`wsinterop`**: own client ↔ own server over real TCP, plus raw-socket
    violations (unmasked frame → 1002, invalid close code → 1002, fragmented
    ping → 1002, invalid UTF-8 → 1007), an upgrade-hook section (a server
