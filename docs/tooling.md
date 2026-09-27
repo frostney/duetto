@@ -5,7 +5,7 @@
 - FPC **3.2.2** (Delphi mode) is the pinned compiler; the [lwpt](https://github.com/frostney/lwpt) **0.7.0 release binary** is the single toolchain entry point for install / build / test / format.
 - The Autobahn testsuite runs via Docker (`crossbario/autobahn-testsuite`) through `tools/autobahn.sh`, judged by `tools/autobahn-check.py`.
 - Lefthook runs `lwpt format` pre-commit; markdownlint and the PR workflow are the blocking gates.
-- CI: `pr.yml` is the pre-merge gate (native Linux, macOS and win64), `ci.yml` (push to main) adds the per-arch platform matrix and the Autobahn suite.
+- CI: `pr.yml` is the pre-merge gate (native Linux, macOS and win64), `ci.yml` (push to main) adds the per-arch platform matrix and the Autobahn suite, and `release.yml` publishes the GitHub Release when a version tag is pushed.
 - Changelog generation is git-cliff from Conventional Commits (`cliff.toml`).
 
 ## Toolchain
@@ -113,8 +113,13 @@ LOAD_TEST=~/src/uWebSockets/benchmarks/load_test \
   Autobahn container needs Docker, which GitHub's macOS runners lack),
   giving the Network.framework transport the same Autobahn net as
   epoll; the client direction stays on the Linux job.
+- **`.github/workflows/release.yml`** — version tag push: checks the tag
+  against `version` in `lwpt.toml` and publishes the GitHub Release with
+  that version's `CHANGELOG.md` section as its notes. It builds nothing
+  and attaches no assets, because consumers resolve duetto from the tag
+  (see [deployment.md](deployment.md)).
 
-Both workflows install the lwpt release binary from a checksum-verified
+The test workflows install the lwpt release binary from a checksum-verified
 tarball (no sibling checkout, no bootstrap). Every leg — Windows
 included — verifies dependencies against the committed lockfile via
 `lwpt install --frozen`. duetto has no committed toolchain binaries.
