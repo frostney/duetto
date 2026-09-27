@@ -529,7 +529,7 @@ begin
     Prev := FInflater.OutSize;
     if not FInflater.Finish then
     begin
-      if FInflater.OutSize >= FMaxMessage then
+      if FInflater.OutSize > FMaxMessage then
         Exit(Fail(1009, 'message too big'))
       else
         Exit(Fail(1007, 'invalid deflate stream'));
@@ -599,7 +599,7 @@ begin
     Prev := FInflater.OutSize;
     if not FInflater.Feed(P, ALen) then
     begin
-      if FInflater.OutSize >= FMaxMessage then
+      if FInflater.OutSize > FMaxMessage then
         Exit(Fail(1009, 'message too big'))
       else
         Exit(Fail(1007, 'invalid deflate stream'));

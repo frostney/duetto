@@ -118,6 +118,7 @@ type
     procedure TestCompressedBitOnWire;
     procedure TestLargeCompressible;
     procedure TestByteByByteCompressed;
+    procedure TestCompressedExactCap;
   end;
 
 const
@@ -846,7 +847,8 @@ end;
 
 // Run the REAL handshake to get both sides' negotiated params, then build
 // the two protocols from them — no hand-assembled TWSDeflateParams.
-procedure NegotiatedPair(out C, S: TWSProtocol);
+procedure NegotiatedPair(out C, S: TWSProtocol;
+  AServerMax: NativeInt = 16 * 1024 * 1024);
 var
   Key, Req, Resp, Err: string;
   HS: TWSServerHandshake;
@@ -860,7 +862,7 @@ begin
   if not ClientParseResponse(Resp, Key, True, CD, Err) then
     raise Exception.Create('client parse failed: ' + Err);
   C := TWSProtocol.Create(wsrClient, CD);
-  S := TWSProtocol.Create(wsrServer, HS.Deflate);
+  S := TWSProtocol.Create(wsrServer, HS.Deflate, AServerMax);
 end;
 
 procedure TProtoDeflate.TestNegotiatedRoundTrip;
@@ -1229,6 +1231,54 @@ begin
   Test('RSV1 + mask verified on the wire',     TestCompressedBitOnWire);
   Test('512 KB compressible shrinks and echoes', TestLargeCompressible);
   Test('byte-by-byte compressed ingest',       TestByteByByteCompressed);
+  Test('inflated size exactly at cap ok, +1 -> 1009', TestCompressedExactCap);
+end;
+
+procedure TProtoDeflate.TestCompressedExactCap;
+const
+  Caps: array[0..1] of NativeInt = (64 * 1024, 50000);
+var
+  C, S: TWSProtocol;
+  SS: TSink;
+  Msg: TBytes;
+  I, J: Integer;
+begin
+  // The cap means "at most" on both paths: an uncompressed message of
+  // exactly the cap is accepted, so a compressed one must be too, and
+  // one inflated byte more fails 1009 just like the plain path.
+  for I := 0 to High(Caps) do
+  begin
+    SetLength(Msg, Caps[I]);
+    for J := 0 to High(Msg) do Msg[J] := Byte(Ord('A') + (J mod 7));
+
+    NegotiatedPair(C, S, Caps[I]);
+    SS := TSink.Create;
+    Hook(S, SS);
+    try
+      C.SendBinary(@Msg[0], Length(Msg));
+      Wire(C, S);
+      Expect<Boolean>(S.Failed).ToBe(False);
+      Expect<Integer>(SS.MsgCount).ToBe(1);
+      Expect<Boolean>(SameBytes(SS.LastMsg, Msg)).ToBe(True);
+    finally
+      C.Free; S.Free; SS.Free;
+    end;
+
+    SetLength(Msg, Caps[I] + 1);
+    Msg[Caps[I]] := Ord('A');
+    NegotiatedPair(C, S, Caps[I]);
+    SS := TSink.Create;
+    Hook(S, SS);
+    try
+      C.SendBinary(@Msg[0], Length(Msg));
+      Wire(C, S);
+      Expect<Boolean>(S.Failed).ToBe(True);
+      Expect<Integer>(SS.MsgCount).ToBe(0);
+      Expect<Integer>(Integer(WireCloseCode(S))).ToBe(1009);
+    finally
+      C.Free; S.Free; SS.Free;
+    end;
+  end;
 end;
 
 { ───────── direct (gather-write) send ───────── }
