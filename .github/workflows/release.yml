@@ -58,9 +58,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Extract release notes from CHANGELOG.md
+        # Through env, never ${{ }} in the script: the `-*` tag pattern
+        # admits characters Bash would otherwise parse as code.
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ steps.ver.outputs.version }}"
           # The section body only: its `## [x.y.z] - date` heading repeats
           # what the release title and date already say.
           awk -v version="$VERSION" '
