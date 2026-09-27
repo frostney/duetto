@@ -67,7 +67,7 @@ jobs:
             exe: .exe
     runs-on: ${{ matrix.runner }}
     # A wedged loopback battery would otherwise hold the runner for the
-    # six-hour default (issue #11 documents nw delivery stalls).
+    # six-hour default.
     timeout-minutes: 30
     defaults:
       run:

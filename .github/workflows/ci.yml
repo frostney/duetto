@@ -17,11 +17,7 @@ name: CI
 #             run wsinterop's live-socket battery and the crosscheck
 #             against the python `websockets` reference — the server
 #             rides the platform transport (epoll on Linux,
-#             Network.framework on macOS, IOCP on Windows). The
-#             x86_64-darwin leg is the carve-out: GH Intel-macOS VMs
-#             stall nw loopback traffic (issue #11), so it contributes
-#             compile + unit-suite coverage only (loopback-battery:
-#             skip).
+#             Network.framework on macOS, IOCP on Windows).
 #
 #   autobahn: The Autobahn fuzzing suite (crossbario/autobahn-testsuite
 #             via Docker) in both directions — fuzzingclient against
@@ -58,7 +54,7 @@ env:
 jobs:
   test:
     # Pin the display name to the target alone, so the matrix's extra
-    # per-leg keys (frozen-install: skip, loopback-battery: skip, …) do
+    # per-leg keys (frozen-install: skip, …) do
     # not append a ", skip" tail that shifts as the exceptions come and go.
     name: test (${{ matrix.target }})
     strategy:
@@ -82,11 +78,6 @@ jobs:
             runner: macos-15-intel
             lwpt-asset: macos-x64
             fpc-install: brew
-            # GH Intel-macOS VMs deliver nw loopback traffic on a ~60s
-            # timer (issue #11: transport hops <2ms, transit 12-60s),
-            # so the loopback batteries can't run here. Build + unit
-            # suites still give x86_64 compile and blocks-ABI coverage.
-            loopback-battery: skip
           - target: x86_64-win64
             runner: windows-latest
             lwpt-asset: windows-x64
@@ -234,7 +225,6 @@ jobs:
       # WSINTEROP_REQUIRE_TLS: the Linux legs carry the server's only
       # runtime TLS coverage; a missing OpenSSL must fail, not skip.
       - name: wsinterop (live-socket battery, own client vs own server)
-        if: matrix.loopback-battery != 'skip'
         env:
           WSINTEROP_REQUIRE_TLS: ${{ matrix.fpc-install == 'apt' && '1' || '' }}
         run: ./build/wsinterop${{ matrix.exe }}
@@ -246,7 +236,6 @@ jobs:
       # job, because the containerised suite needs Docker and GitHub's
       # macOS runners don't have it.
       - name: crosscheck vs python websockets (reference implementation)
-        if: matrix.loopback-battery != 'skip'
         run: |
           set -euo pipefail
           PY=python3

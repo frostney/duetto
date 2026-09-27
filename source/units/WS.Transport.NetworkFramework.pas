@@ -168,6 +168,11 @@ const
   NW_CONNECTION_STATE_FAILED = 4;
   NW_CONNECTION_STATE_CANCELLED = 5;
 
+// C `bool` (and CoreFoundation `Boolean`) crosses this boundary as
+// Pascal `Boolean`: one byte, True = 1. Never `ByteBool` — FPC passes
+// ByteBool(True) as $FF, which the C ABI leaves undefined; on x86_64
+// macOS nw_tcp_options_set_no_delay($FF) made the kernel hold every
+// queued send until a 5-60 s TCP timer fired (issue #11).
 function Dispatch_queue_create(ALabel: PAnsiChar; AAttr: Pointer): Pointer; cdecl; external name 'dispatch_queue_create';
 procedure Dispatch_async(AQueue, ABlock: Pointer); cdecl; external name 'dispatch_async';
 procedure Dispatch_release(AObj: Pointer); cdecl; external name 'dispatch_release';
@@ -188,12 +193,12 @@ procedure Nw_release(AObj: Pointer); cdecl; external name 'nw_release';
 
 function Nw_parameters_create_secure_tcp(ATls, ATcp: Pointer): Pointer; cdecl; external name 'nw_parameters_create_secure_tcp';
 procedure Nw_parameters_set_reuse_local_address(AParams: Pointer;
-  AReuse: ByteBool); cdecl; external name 'nw_parameters_set_reuse_local_address';
+  AReuse: Boolean); cdecl; external name 'nw_parameters_set_reuse_local_address';
 function Nw_tls_copy_sec_protocol_options(AOptions: Pointer): Pointer; cdecl; external name 'nw_tls_copy_sec_protocol_options';
 procedure Sec_protocol_options_set_local_identity(AOptions: Pointer;
   AIdentity: Pointer); cdecl; external name 'sec_protocol_options_set_local_identity';
 procedure Nw_tcp_options_set_no_delay(AOptions: Pointer;
-  ANoDelay: ByteBool); cdecl; external name 'nw_tcp_options_set_no_delay';
+  ANoDelay: Boolean); cdecl; external name 'nw_tcp_options_set_no_delay';
 
 function Nw_listener_create_with_port(APort: PAnsiChar;
   AParams: Pointer): Pointer; cdecl; external name 'nw_listener_create_with_port';
@@ -219,7 +224,7 @@ procedure Nw_connection_force_cancel(AConn: Pointer); cdecl; external name 'nw_c
 procedure Nw_connection_receive(AConn: Pointer; AMin, AMax: UInt32;
   ABlock: Pointer); cdecl; external name 'nw_connection_receive';
 procedure Nw_connection_send(AConn, AData, AContext: Pointer;
-  AComplete: ByteBool; ABlock: Pointer); cdecl; external name 'nw_connection_send';
+  AComplete: Boolean; ABlock: Pointer); cdecl; external name 'nw_connection_send';
 
 // Data symbols (extern variables) resolved at runtime via dlsym — FPC
 // 3.2.2's Delphi mode has no external-variable syntax. dlsym takes the
@@ -256,7 +261,7 @@ function SecPKCS12Import(AData, AOptions: Pointer;
   AItems: PPointer): Int32; cdecl; external name 'SecPKCS12Import';
 function Sec_identity_create(AIdentity: Pointer): Pointer; cdecl; external name 'sec_identity_create';
 function SecKeychainCreate(APath: PAnsiChar; APassLen: UInt32;
-  APass: Pointer; APromptUser: ByteBool; AInitialAccess: Pointer;
+  APass: Pointer; APromptUser: Boolean; AInitialAccess: Pointer;
   out AKeychain: Pointer): Int32; cdecl; external name 'SecKeychainCreate';
 function SecKeychainDelete(AKeychain: Pointer): Int32; cdecl; external name 'SecKeychainDelete';
 
@@ -425,7 +430,7 @@ begin
 end;
 
 procedure RecvInvoke(ABlock: PWSBlock; AContent, AContext: Pointer;
-  AComplete: ByteBool; AError: Pointer); cdecl;
+  AComplete: Boolean; AError: Pointer); cdecl;
 var
   C: TWSNwConn;
   Map, Buf: Pointer;

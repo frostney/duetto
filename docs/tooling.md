@@ -106,15 +106,13 @@ LOAD_TEST=~/src/uWebSockets/benchmarks/load_test \
 - **`.github/workflows/ci.yml`** — push to main: native test matrix
   (x86_64/aarch64 Linux and macOS, x86_64/i386 Windows) plus the full
   Autobahn suite with report artifacts. Every leg builds the full program set and runs the
-  unit suites; all legs except x86_64 macOS also run wsinterop and
-  `tools/crosscheck.py` against the python `websockets` reference. On
+  unit suites, then runs wsinterop and `tools/crosscheck.py` against the
+  python `websockets` reference. On
   arm64 macOS the `autobahn-macos` job additionally runs the full
   fuzzingclient battery natively (Intel python-2.7 under Rosetta — the
   Autobahn container needs Docker, which GitHub's macOS runners lack),
   giving the Network.framework transport the same Autobahn net as
-  epoll; the client direction stays on the Linux job. The x86_64 macOS
-  leg skips the loopback batteries entirely: GitHub's Intel VMs deliver
-  Network.framework loopback traffic on a ~60 s timer (duetto#11).
+  epoll; the client direction stays on the Linux job.
 
 Both workflows install the lwpt release binary from a checksum-verified
 tarball (no sibling checkout, no bootstrap). Every leg — Windows

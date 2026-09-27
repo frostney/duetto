@@ -34,6 +34,10 @@ Changing a project-wide flag means editing the include, not every file.
 - `const` parameters by default; `var`/`out` only when mutated.
 - No magic literals — extract named constants, in `interface` when shared.
 - Performance-sensitive small routines are marked `inline`.
+- C `bool` / CoreFoundation `Boolean` parameters in `external`
+  declarations and callbacks are Pascal `Boolean` (True = 1), never
+  `ByteBool`: FPC passes `ByteBool(True)` as `$FF`, which the C ABI
+  leaves undefined (issue #11).
 
 ## RTL policy
 
