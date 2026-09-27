@@ -49,6 +49,7 @@ uses
 
   TransportSecurity,
   WinSock2,
+  WS.Clock,
   WS.Transport,
   WS.Transport.PostQueue,
   WS.Transport.TlsServer;
@@ -603,7 +604,7 @@ begin
   FClosing := True;
   FCloseRequested := False;
   UserData := nil;
-  FDeadline := SysUtils.GetTickCount64 +
+  FDeadline := WSMonotonicMs +
     QWord(FTransport.FTlsPolicy.HandshakeDeadlineMs);
   SetTimed(True);
   // A suppressed connection has no receive to notice the peer's EOF
@@ -842,7 +843,7 @@ begin
       nil, 0, WSA_FLAG_OVERLAPPED);
     if FAcceptSocket = INVALID_SOCKET then
     begin
-      FAcceptBackoffUntil := SysUtils.GetTickCount64 + QWord(AcceptBackoffMs);
+      FAcceptBackoffUntil := WSMonotonicMs + QWord(AcceptBackoffMs);
       Exit;
     end;
     FillChar(FAcceptOverlapped, SizeOf(FAcceptOverlapped), 0);
@@ -867,7 +868,7 @@ begin
       // Out of a resource (WSAENOBUFS, WSAEMFILE, ...) or something
       // stranger: leave the listener unarmed for a beat rather than
       // for good, and let Run try again.
-      FAcceptBackoffUntil := SysUtils.GetTickCount64 + QWord(AcceptBackoffMs);
+      FAcceptBackoffUntil := WSMonotonicMs + QWord(AcceptBackoffMs);
       Exit;
     end;
   until False;
@@ -1283,7 +1284,7 @@ var
   NowTick: QWord;
 begin
   if FTimedCount <= 0 then Exit;
-  NowTick := SysUtils.GetTickCount64;
+  NowTick := WSMonotonicMs;
   if NowTick < FNextSweepTick then Exit;
   FNextSweepTick := NowTick + QWord(TlsDeadlinePollMs);
   SweepTlsDeadlines(NowTick);
@@ -1466,7 +1467,7 @@ end;
 procedure TWSIocpTransport.MaybeRearmAccept;
 begin
   if (FAcceptBackoffUntil = 0) or FStopping or FAcceptPending then Exit;
-  if SysUtils.GetTickCount64 < FAcceptBackoffUntil then Exit;
+  if WSMonotonicMs < FAcceptBackoffUntil then Exit;
   ArmAccept;
 end;
 

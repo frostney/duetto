@@ -35,6 +35,7 @@ uses
   syncobjs,
   SysUtils,
 
+  WS.Clock,
   WS.Handshake,
   WS.Protocol,
   WS.Transport;
@@ -68,7 +69,7 @@ type
     FInDelivery: Boolean;      // inside Ingest/OnOpen delivery — drops defer
     FDropping: Boolean;        // teardown running; re-entrant drops no-op
     FDropDeferred: Boolean;    // dropped mid-delivery; freed on unwind
-    // Clock state, all in GetTickCount64 milliseconds, written only on
+    // Clock state, all in WSMonotonicMs milliseconds, written only on
     // this connection's execution context. FDeadline is when the peer
     // must have done what the current state is waiting for (finished
     // the handshake, answered a close, read a draining response, sent
@@ -479,7 +480,7 @@ end;
 procedure TWSConnection.ArmDeadline(AMs: Integer);
 begin
   if AMs > 0 then
-    FDeadline := GetTickCount64 + QWord(AMs)
+    FDeadline := WSMonotonicMs + QWord(AMs)
   else
     FDeadline := 0;
   Reschedule;
@@ -520,7 +521,7 @@ begin
     end;
     Exit;
   end;
-  Now_ := GetTickCount64;
+  Now_ := WSMonotonicMs;
   if FServer.FIdleTimeoutMs > 0 then
     FDeadline := Now_ + QWord(FServer.FIdleTimeoutMs)
   else
@@ -540,7 +541,7 @@ var
 begin
   FSweepPosted := False;
   if FDropping then Exit;
-  Now_ := GetTickCount64;
+  Now_ := WSMonotonicMs;
   if (FDeadline <> 0) and (Now_ >= FDeadline) then
   begin
     FDeadline := 0;
@@ -771,7 +772,7 @@ var
   Now_: QWord;
   Conn: TWSConnection;
 begin
-  Now_ := GetTickCount64;
+  Now_ := WSMonotonicMs;
   FLock.Acquire;
   try
     for I := 0 to FRegistryCount - 1 do

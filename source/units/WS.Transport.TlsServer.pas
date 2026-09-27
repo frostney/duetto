@@ -84,6 +84,7 @@ uses
   SysUtils,
 
   TransportSecurity,
+  WS.Clock,
   WS.Transport;
 
 const
@@ -458,7 +459,7 @@ begin
   FOnPlaintext := AOnPlaintext;
   FOnCiphertext := AOnCiphertext;
   SetLength(FPlain, WSTlsPlaintextBufferSize);
-  FDeadline := GetTickCount64 + QWord(APolicy.HandshakeDeadlineMs);
+  FDeadline := WSMonotonicMs + QWord(APolicy.HandshakeDeadlineMs);
   BeginTransportSecurityServer(FConn, AContext);
 end;
 
@@ -487,7 +488,7 @@ end;
 function TWSTlsServerSession.DeadlineExpired: Boolean;
 begin
   Result := (not FHandshakeDone) and (not FDead) and
-    (GetTickCount64 >= FDeadline);
+    (WSMonotonicMs >= FDeadline);
 end;
 
 function TWSTlsServerSession.WriteParked: Boolean;

@@ -59,6 +59,7 @@ uses
   Sockets,
   Syscall,
   TransportSecurity,
+  WS.Clock,
   WS.Transport,
   WS.Transport.PostQueue,
   WS.Transport.TlsServer;
@@ -536,7 +537,7 @@ begin
   // the shutdown orderly; the IOCP transport learned the same lesson
   // against a Windows peer.
   FPaused := False;
-  FDeadline := GetTickCount64 +
+  FDeadline := WSMonotonicMs +
     QWord(FTransport.FTlsPolicy.HandshakeDeadlineMs);
   SetTimed(True);
   StepDeferredClose;
@@ -896,12 +897,12 @@ begin
     if epoll_ctl(FEpFd, EPOLL_CTL_ADD, FListenFd, @Ev) = 0 then
       FAcceptBackoffUntil := 0
     else
-      FAcceptBackoffUntil := GetTickCount64 + QWord(AcceptBackoffMs);
+      FAcceptBackoffUntil := WSMonotonicMs + QWord(AcceptBackoffMs);
   end
   else
   begin
     epoll_ctl(FEpFd, EPOLL_CTL_DEL, FListenFd, nil);
-    FAcceptBackoffUntil := GetTickCount64 + QWord(AcceptBackoffMs);
+    FAcceptBackoffUntil := WSMonotonicMs + QWord(AcceptBackoffMs);
   end;
 end;
 
@@ -1291,7 +1292,7 @@ var
   NowTick: QWord;
 begin
   if FTimedCount <= 0 then Exit;
-  NowTick := GetTickCount64;
+  NowTick := WSMonotonicMs;
   if NowTick < FNextSweepTick then Exit;
   FNextSweepTick := NowTick + QWord(TlsDeadlinePollMs);
   SweepTlsDeadlines(NowTick);
@@ -1319,7 +1320,7 @@ begin
     if FAcceptBackoffUntil <> 0 then
       if (Wait < 0) or (Wait > AcceptBackoffMs) then Wait := AcceptBackoffMs;
     N := epoll_wait(FEpFd, @Evs[0], Length(Evs), Wait);
-    if (FAcceptBackoffUntil <> 0) and (GetTickCount64 >= FAcceptBackoffUntil) then
+    if (FAcceptBackoffUntil <> 0) and (WSMonotonicMs >= FAcceptBackoffUntil) then
       ListenerArm(True);
     for I := 0 to N - 1 do
     begin

@@ -44,6 +44,12 @@ shows the RTL costs — the inlined base64 and stack-buffer handshake builders (
 `docs/comparison.md`) set the precedent. RTL use is fine off the hot
 path; replacing it is justified by a `wsbench` number, not by taste.
 
+Correctness is the other justification. `WS.Clock` replaces
+`SysUtils.GetTickCount64` for every deadline because FPC 3.2.2 only
+reads a monotonic clock on Linux and FreeBSD and falls back to
+`gettimeofday` on macOS, where a wall-clock step would move every armed
+deadline. It is not a hot-path change, so no `wsbench` number is involved.
+
 ## Formatter
 
 `lwpt format` rewrites sources in place (uses-clause grouping, identifier

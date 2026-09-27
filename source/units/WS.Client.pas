@@ -22,7 +22,7 @@ uses
   WinSock2,
   {$endif}
   TransportSecurity,
-  WS.Handshake, WS.Protocol;
+  WS.Clock, WS.Handshake, WS.Protocol;
 
 type
   EWSClient = class(Exception);
@@ -107,9 +107,8 @@ type
     // this call reports wrrTimeout. lwpt's TransportSecurity exposes no
     // pending-plaintext query to close that gap yet.
     //
-    // The deadline comes from GetTickCount64 — monotonic on Linux and
-    // Windows, but a wall-clock fallback on macOS under FPC 3.2.2,
-    // where a clock step during the wait shortens or extends it.
+    // The deadline comes from WSMonotonicMs, so a wall-clock step
+    // during the wait neither shortens nor extends it.
     //
     // Control replies owed to the peer (a pong for a ping that arrived
     // mid-wait) are flushed on a blocking socket, so peer backpressure
@@ -570,7 +569,7 @@ begin
     Exit(wrrTimeout);
   end;
 
-  Deadline := GetTickCount64 + QWord(ATimeoutMs);
+  Deadline := WSMonotonicMs + QWord(ATimeoutMs);
   Remaining := ATimeoutMs;
   // Remaining is re-derived at the foot of the loop, so a wait cut short
   // (EINTR, a partial frame) resumes with what is left and a wait that
@@ -585,7 +584,7 @@ begin
       Exit(wrrMessage);
     end;
     if not FOpen then Exit(wrrClosed);
-    Remaining := Int64(Deadline) - Int64(GetTickCount64);
+    Remaining := Int64(Deadline) - Int64(WSMonotonicMs);
   end;
   Result := wrrTimeout;
 end;
