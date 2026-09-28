@@ -1,8 +1,10 @@
 ---
 name: codebase-audit
 description: >-
-  Audit a repository or subsystem for systemic engineering risks and
-  actionable improvements. Assessment only unless follow-up fixes are selected.
+  Audits a repository or subsystem for systemic engineering risks and
+  actionable improvements; assessment only unless follow-up fixes are
+  selected. Use when asked to audit a codebase, assess its health or technical
+  debt, or find systemic risks.
 license: Unlicense OR MIT
 compatibility: >-
   Requires the project's declared build and test tools plus network access for
@@ -28,18 +30,21 @@ restoration is not safe. The audit must not leave any edit to repository content
 or create persistent or externally visible side effects. Clean up disposable
 artifacts and report anything retained.
 
-`subagents` is an additive execution input. Without it, do not delegate any part
-of the audit.
+Delegate audit lanes by default when the host supports subagents and the scope
+spans more than one independent capability area; a small subsystem stays local.
+`no-subagents` or an equivalent user instruction keeps the whole audit local.
 
 A request to save JSON authorizes only the named findings artifact; it does not
 authorize remediation. Read
 [references/findings-json.md](references/findings-json.md) only when JSON output
 is requested.
 
-There is no `fix-all` mode. After reporting, offer remediation batches. A fix
+There is no `fix-all` mode. The report lists remediation batches; a fix
 follow-up begins only when the user selects a coherent batch or finding IDs. It
 authorizes focused local edits and validation on a focused branch, not commits,
 pushes, publication, issue creation, deployments, or shared-state mutation.
+Read [references/fix-follow-up.md](references/fix-follow-up.md) when the user
+makes that selection.
 
 ## Map before judging
 
@@ -59,7 +64,9 @@ pushes, publication, issue creation, deployments, or shared-state mutation.
      analysis for stateful paths;
    - add API, CLI, library, packaging, compatibility, deployment, rollback,
      observability, performance, and discoverability analysis only where those
-     surfaces exist; activate discoverability for a public web surface.
+     surfaces exist. When the scope includes a public web surface, read
+     [references/discoverability.md](references/discoverability.md) and apply
+     the discoverability perspective.
 4. For a shallow subsystem, trace its complete path and direct interactions. For
    a layered codebase, partition work by capability and perspective so later
    areas do not receive progressively thinner analysis.
@@ -72,8 +79,9 @@ pushes, publication, issue creation, deployments, or shared-state mutation.
 
 ## Sub-agent lanes
 
-Read [references/subagent-lanes.md](references/subagent-lanes.md) only when
-`subagents` is requested. The coordinator retains coverage and final judgment.
+Read [references/subagent-lanes.md](references/subagent-lanes.md) whenever the
+audit delegates lanes. The coordinator retains coverage and final judgment and
+continues its own lane-independent work while lanes run.
 
 ## Establish current evidence
 
@@ -146,16 +154,6 @@ the external impact part of the repository finding.
   alternative. Every best-practice finding must cite current project and
   authoritative-source evidence plus the concrete simplification or risk.
 
-### Discoverability
-
-For a public web surface, verify crawl and index controls, canonical and
-descriptive metadata, internal discovery paths, structured data that matches
-visible content, semantic content structure, rendering, and material web
-performance. Assess conventional search and AI-assisted discovery together,
-while keeping crawler access, search inclusion, and model-training controls
-distinct. Use current official search-engine and publisher guidance; do not
-invent special AEO markup, keywords, or guarantees.
-
 ## Report
 
 Search the complete mapped scope for evidence-backed candidates before
@@ -166,9 +164,9 @@ Lead with the highest-value current conclusion. Include:
 - a coverage map of inspected, executed, sampled, static-only, and unreached
   capabilities;
 - active and skipped perspectives with reasons;
-- when `subagents` was supplied, the capability-and-perspective lane map,
-  completed and incomplete lanes, and every coordinator-completed fallback with
-  its reason;
+- when the audit delegated lanes, the capability-and-perspective lane map, each
+  lane's `complete` or `incomplete` status, and every coordinator-completed
+  fallback with its reason, or that none was needed;
 - the churn window, symbol/file coverage, and architectural-risk hotspots;
 - exact probes and project gates with observed results;
 - de-duplication coverage across implementation, work, evidence, and output,
@@ -185,14 +183,3 @@ Lead with the highest-value current conclusion. Include:
 maintainability, simplification, or comprehension cost. `IMPROVEMENT` is a
 verified worthwhile simplification or current-practice alignment. Omit praise,
 inventory narration, style nits, and findings without concrete impact.
-
-## Fix follow-up
-
-After the user selects a batch or IDs, create or reuse a focused branch and
-implement the smallest complete remedies. Do not absorb unrelated findings.
-Promote useful probes into regression tests, remove disposable artifacts, run
-affected behavioral probes and project gates, and report fixed and unresolved
-IDs with observed evidence. The coordinator makes every edit. Do not redispatch
-completed lanes after fixes; re-engage a worker only to resolve incomplete or
-contradictory evidence. Use the repository's separate git and PR workflows only
-when the user requests publication.

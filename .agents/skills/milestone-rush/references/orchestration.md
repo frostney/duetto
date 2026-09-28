@@ -52,6 +52,14 @@ the required structured transition output. Include a small recent-turn slice
 only when immediately relevant. Full-history inheritance requires a recorded,
 scoped exception.
 
+Before starting a worker, identify its actual model from host metadata. Deliver
+the applicable role, scope, authority, completion condition, and required skill
+contents or reachable reference paths; naming a skill is not proof of delivery.
+Record the resources the worker actually loaded and any missing capability in
+its result. An isolated worker must not assume parent conversation or loaded
+skills are inherited. Keep model-specific settings at the host boundary and
+apply them only to the actual worker when supported by evidence.
+
 ## Delivery integration recommendation
 
 During reconciliation inspect current workflows, required checks, review
@@ -84,11 +92,3 @@ orchestrators. Wake the coordinator only on changed, terminal, or exceptional
 state; use an exact known timestamp for time-based wakes. If the host cannot
 passively await the foreground command, report the capability as unsupported.
 Never substitute repeated model inferences for waiting.
-
-Before starting a worker, identify its actual model from host metadata. Deliver
-the applicable role, scope, authority, completion condition, and required skill
-contents or reachable reference paths; naming a skill is not proof of delivery.
-Record the resources the worker actually loaded and any missing capability in
-its result. An isolated worker must not assume parent conversation or loaded
-skills are inherited. Keep model-specific settings at the host boundary and
-apply them only to the actual worker when supported by evidence.
