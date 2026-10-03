@@ -15,8 +15,17 @@ unit WS.Client;
 // Failure contract: a dead peer, a reset, a failed send or a TLS error
 // never raises out of a send, a read or Close. It ends the connection
 // (Open goes False), and the next ReadMessage reports it (False /
-// wrrClosed, CloseCode 1006 unless a close frame arrived). Connect is the
-// one call that raises, always EWSClient, TLS failures included.
+// wrrClosed, CloseCode 1006 unless a close frame arrived). Connect raises
+// on a failure to connect, always EWSClient, TLS failures included.
+// Otherwise only misuse raises (EWSClient: a send on a connection that
+// has already ended, a read from inside OnMessage), plus whatever an
+// OnMessage handler raises, which propagates out of the call that was
+// reading.
+//
+// EINTR (a signal landing in a blocking call) is retried on plaintext
+// sockets and, inside OpenSSL, on Linux wss://. lwpt's SecureTransport
+// (macOS) and Schannel (Windows) paths do not retry it, so a signal can
+// still end a wss:// connection there.
 //
 // SIGPIPE: plaintext sends carry MSG_NOSIGNAL on Linux, and Darwin
 // sockets set SO_NOSIGPIPE, which also covers lwpt's SecureTransport
@@ -171,7 +180,9 @@ type
       ATimeoutMs: Integer): TWSReadResult; overload;
 
     // Initiate the closing handshake, wait at most CloseTimeoutMs for the
-    // echo, then drop TCP regardless. Never raises on a dead connection.
+    // echo, then drop TCP regardless. Never raises on a dead connection;
+    // an exception from OnMessage during the wait propagates, after the
+    // socket and TLS session have been released.
     procedure Close(ACode: Word = 1000; const AReason: string = '');
 
     // Optional synchronous delivery, the client's counterpart of the
@@ -207,16 +218,18 @@ type
     // Linux against a host that drops SYNs).
     //
     // HandshakeTimeoutMs (default 10 s) starts once TCP is connected and
-    // bounds the opening handshake: sending the upgrade request and
-    // waiting for the 101. <= 0 waits indefinitely. Over wss:// it is
-    // weaker. The TLS handshake counts against the budget but is not cut
-    // short by it: lwpt's TransportSecurity keeps a handshake deadline
-    // armed for the life of the session, so a long-lived connection would
-    // fail once it had passed, and the TLS handshake runs without one
-    // until lwpt can disarm it. The wait for the 101 is then bounded only
-    // until TLS bytes arrive, as in the bounded ReadMessage: once a
-    // record starts arriving the read blocks until an application record
-    // completes. A server that stalls inside TLS is not bounded.
+    // bounds the wait for the 101 (the upgrade request itself is a plain
+    // blocking send). <= 0 waits indefinitely. Over wss:// it is weaker.
+    // The TLS handshake counts against the budget but is not cut short by
+    // it: lwpt's TransportSecurity keeps a handshake deadline armed for
+    // the life of the session, so a long-lived connection would fail once
+    // it had passed, and the deadline only fires on a non-blocking socket
+    // anyway. Bounding the TLS handshake needs both: the socket kept
+    // non-blocking through it, and an lwpt call that disarms the deadline
+    // afterwards. Until then it runs without one. The wait for the 101 is
+    // bounded only until the first TLS bytes arrive, as in the bounded
+    // ReadMessage: from then on the read blocks until a whole application
+    // record completes. A server that stalls inside TLS is not bounded.
     //
     // CloseTimeoutMs (default 5 s) bounds Close's wait for the peer's
     // close echo; TCP is dropped when it runs out. <= 0 skips the wait:
@@ -277,7 +290,8 @@ begin
   if Colon > 0 then
   begin
     APort := StrToIntDef(Copy(Rest, Colon + 1, MaxInt), -1);
-    if APort <= 0 then raise EWSClient.Create('bad port in URL');
+    if (APort <= 0) or (APort > 65535) then
+      raise EWSClient.Create('bad port in URL');
     AHost := Copy(Rest, 1, Colon - 1);
   end
   else
@@ -730,8 +744,9 @@ begin
   end;
 end;
 
-// A signal landing while the call blocks (EINTR) is retried: it says
-// nothing about the connection.
+// On a plaintext socket a signal landing while the call blocks (EINTR)
+// is retried: it says nothing about the connection. TLS calls leave it
+// to lwpt (see the unit header).
 function TWSClient.RawRead(P: PByte; ALen: Integer): Integer;
 begin
   if FUseTls then Exit(TlsRead(P, ALen));
@@ -813,7 +828,10 @@ end;
 // deadline it is given armed on the session for good, and every later
 // read or write that has to wait re-checks it — on macOS that is any
 // record split across TCP segments — so a long-lived connection would
-// fail once the handshake budget had passed. See HandshakeTimeoutMs.
+// fail once the handshake budget had passed. The deadline also fires
+// only when a call would block, and this socket blocks, so a bounded TLS
+// handshake needs the socket non-blocking through it as well as a way to
+// disarm the deadline afterwards. See HandshakeTimeoutMs.
 procedure TWSClient.StartTls(const AHost: string);
 begin
   try
@@ -839,7 +857,10 @@ begin
   Result := '';
   AHeaderEnd := 0;
   repeat
-    if ADeadline <> WSNoDeadline then
+    // Over TLS only the first read waits on the raw socket: a 101 spread
+    // over several records can already sit decrypted or buffered inside
+    // the TLS layer, where a readiness poll cannot see it.
+    if (ADeadline <> WSNoDeadline) and not (FUseTls and (Result <> '')) then
     begin
       Ready := RemainingMs(ADeadline);
       if Ready > 0 then Ready := WaitSocket(FSock, False, Ready);
@@ -1071,15 +1092,15 @@ end;
 procedure TWSClient.AwaitCloseEcho;
 var
   Deadline: QWord;
-  Remaining: Int64;
+  Remaining: Integer;
 begin
-  if FCloseTimeoutMs <= 0 then Exit;
-  Deadline := WSMonotonicMs + QWord(FCloseTimeoutMs);
-  Remaining := FCloseTimeoutMs;
+  Deadline := DeadlineAfter(FCloseTimeoutMs);
+  if Deadline = WSNoDeadline then Exit;
+  Remaining := RemainingMs(Deadline);
   while FOpen and not FProto.CloseDone and (Remaining > 0) do
   begin
-    if WaitReadable(Integer(Remaining)) then PumpOnce;
-    Remaining := Int64(Deadline) - Int64(WSMonotonicMs);
+    if WaitReadable(Remaining) then PumpOnce;
+    Remaining := RemainingMs(Deadline);
   end;
 end;
 
@@ -1104,14 +1125,17 @@ begin
   end;
   // CloseDone, not CloseSent: a close sent from inside OnMessage still
   // gets its bounded wait for the echo here.
-  if FOpen and not FProto.CloseDone then
-  begin
-    FProto.SendClose(ACode, AReason); // no-op once a close went out
-    FlushOut;
-    AwaitCloseEcho;
+  try
+    if FOpen and not FProto.CloseDone then
+    begin
+      FProto.SendClose(ACode, AReason); // no-op once a close went out
+      FlushOut;
+      AwaitCloseEcho; // an OnMessage raise unwinds through here
+    end;
+  finally
+    FOpen := False;
+    ReleaseTransport;
   end;
-  FOpen := False;
-  ReleaseTransport;
 end;
 
 function TWSClient.CloseCode: Word;

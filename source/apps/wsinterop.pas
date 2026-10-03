@@ -2230,15 +2230,19 @@ type
   // A one-shot raw peer. It accepts one connection and, except in
   // rpmHangUpAtOnce, answers the upgrade; then rpmHangUp closes,
   // rpmSilent says nothing more, rpmMessage sends one text message after
-  // DelayMs. Every mode but the hang-ups then reads until the client
-  // goes away, so Finished says the client released its socket.
-  TRobustPeerMode = (rpmHangUpAtOnce, rpmHangUp, rpmSilent, rpmMessage);
+  // DelayMs (and, with Gate set, once Gate^ > 0), rpmAnswerClose sends
+  // one when the client's close frame arrives instead of echoing it.
+  // Every mode but the hang-ups then reads until the client goes away,
+  // so Finished says the client released its socket.
+  TRobustPeerMode = (rpmHangUpAtOnce, rpmHangUp, rpmSilent, rpmMessage,
+    rpmAnswerClose);
 
   TRobustPeer = class(TThread)
   public
     Listener: Tsocket;
     Mode: TRobustPeerMode;
     DelayMs: Integer;
+    Gate: PLongInt;
     Failure: string;
     procedure Execute; override;
   end;
@@ -2299,8 +2303,17 @@ begin
     if Mode = rpmMessage then
     begin
       Sleep(DelayMs);
+      Got := 0;
+      while (Gate <> nil) and (Gate^ = 0) and (Got < RobustPeerReadMs) do
+      begin
+        Sleep(10);
+        Inc(Got, 10);
+      end;
       RawSendFrame(Fd, WS_OP_TEXT, RobustPeerMessage, False);
     end;
+    if (Mode = rpmAnswerClose) and
+       (fpRecv(Fd, @Buf[0], SizeOf(Buf), 0) > 0) then
+      RawSendFrame(Fd, WS_OP_TEXT, RobustPeerMessage, False);
     RawReadToEof(Fd, Eof);
   finally
     CloseSocket(Fd);
@@ -2448,6 +2461,11 @@ var
   Full: Boolean;
 begin
   Listener := OpenLoopbackListener(ListenPort);
+  if Listener < 0 then
+  begin
+    Check(False, 'client: connect timeout (no loopback listener)');
+    Exit;
+  end;
   Url := Format('ws://127.0.0.1:%d/', [ListenPort]);
   Full := False;
   for I := 1 to RobustBacklogFillers do
@@ -2471,7 +2489,7 @@ begin
     Client.Free;
   end;
   CloseSocket(Listener);
-  WriteLn('       connect: ', Error, ' after ', Elapsed, ' ms');
+  WriteLn('       connect: ', Error, ' (', Elapsed, ' ms)');
   Check(Full and (Pos('EWSClient', Error) = 1) and
     (Pos('timed out', Error) > 0) and (Pos('connect to', Error) > 0) and
     WithinTimeout(Elapsed, RobustTimeoutMs),
@@ -2489,6 +2507,11 @@ var
   Elapsed: Integer;
 begin
   Listener := OpenLoopbackListener(ListenPort);
+  if Listener < 0 then
+  begin
+    Check(False, 'client: handshake timeout (no loopback listener)');
+    Exit;
+  end;
   Client := TWSClient.Create;
   try
     Client.HandshakeTimeoutMs := RobustTimeoutMs;
@@ -2498,7 +2521,7 @@ begin
     Client.Free;
   end;
   CloseSocket(Listener);
-  WriteLn('       connect: ', Error, ' after ', Elapsed, ' ms');
+  WriteLn('       connect: ', Error, ' (', Elapsed, ' ms)');
   Check((Pos('EWSClient', Error) = 1) and (Pos('timed out', Error) > 0) and
     WithinTimeout(Elapsed, RobustTimeoutMs),
     Format('client: HandshakeTimeoutMs %d bounds the wait for a 101 from a ' +
@@ -2563,6 +2586,41 @@ begin
       'never echoes, and the socket is released', [RobustTimeoutMs]));
   finally
     Client.Free;
+  end;
+end;
+
+// OnMessage raising while Close waits for the echo: the exception comes
+// out of Close, but only after the socket has been released.
+procedure RunClientCloseRaiseCase;
+var
+  Peer: TRobustPeer;
+  Listener: Tsocket;
+  PeerPort: Word;
+  Handler: TRaisingHandler;
+  Client: TWSClient;
+  Error: string;
+  Raised, Released: Boolean;
+begin
+  Peer := StartRobustPeer(rpmAnswerClose, Listener, PeerPort);
+  Handler := TRaisingHandler.Create;
+  Client := TWSClient.Create;
+  Raised := False;
+  try
+    Client.OnMessage := Handler.Fail;
+    TimedConnect(Client, Format('ws://127.0.0.1:%d/', [PeerPort]), Error);
+    try
+      Client.Close;
+    except
+      on EInteropHandlerRaise do Raised := True;
+    end;
+    Released := FinishRobustPeer(Peer, Listener, PeerPort, RobustPeerEndMs);
+    if Error <> '' then WriteLn('       connect: ', Error);
+    Check((Error = '') and Raised and Released and (not Client.Open),
+      'client: OnMessage raising during Close propagates only after the ' +
+      'socket is released');
+  finally
+    Client.Free;
+    Handler.Free;
   end;
 end;
 
@@ -2697,6 +2755,9 @@ begin
   RobustSignals := 0;
   Got := False;
   Peer := StartRobustPeer(rpmMessage, Listener, PeerPort);
+  // The message waits for a delivered signal, so the read it ends is
+  // one a signal has already interrupted.
+  Peer.Gate := @RobustSignals;
   Client := TWSClient.Create;
   try
     TimedConnect(Client, Format('ws://127.0.0.1:%d/', [PeerPort]), Error);
@@ -2734,6 +2795,7 @@ begin
   RunClientHandshakeTimeoutCase;
   RunClientTlsHandshakeFailureCase;
   RunClientCloseTimeoutCase;
+  RunClientCloseRaiseCase;
   RunClientReconnectQueueCase(AUrl);
   RunClientReconnectAfterRaiseCase(AUrl);
   {$ifdef UNIX}
