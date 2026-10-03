@@ -335,7 +335,12 @@ type
     // pong (or any other byte) resets the quiet clock. Default 0 =
     // never ping. Meaningful mostly together with IdleTimeoutMs, where
     // it turns "no traffic" into "no pong": IdleTimeoutMs should then
-    // exceed PingIntervalMs by a round trip.
+    // exceed PingIntervalMs by a round trip. The peer always gets
+    // IdleTimeoutMs - PingIntervalMs from the ping leaving to answer:
+    // a server running behind its own schedule (a handler holding the
+    // connection's context, a late sweep) pings before it closes as
+    // idle, and the idle close moves back by as much as the ping was
+    // late.
     property PingIntervalMs: Integer
       read FPingIntervalMs write FPingIntervalMs;
 
@@ -537,11 +542,37 @@ end;
 // AConn is Self (the Post signature), kept for the method-pointer shape.
 procedure TWSConnection.CheckClock(AConn: TWSConnection);
 var
-  Now_: QWord;
+  Now_, AnswerBy: QWord;
 begin
   FSweepPosted := False;
   if FDropping then Exit;
   Now_ := WSMonotonicMs;
+  if (FPingDue <> 0) and (Now_ >= FPingDue) then
+  begin
+    // One ping per quiet period: the next is scheduled by the peer's
+    // reply (NoteActivity), not by the clock, so an unanswered ping
+    // simply lets the idle deadline run out. The ping is judged before
+    // that deadline, and the deadline is never sooner than IdleTimeoutMs
+    // - PingIntervalMs after the ping actually leaves: a check that runs
+    // late (a handler holding this context, a sweep behind schedule)
+    // finds both clocks lapsed, and judging idle first closed a live
+    // peer the server had never asked.
+    FPingDue := 0;
+    if (FState = wcsOpen) and (FDeadline <> 0) and
+      (FServer.FIdleTimeoutMs > FServer.FPingIntervalMs) then
+    begin
+      AnswerBy := Now_ + QWord(FServer.FIdleTimeoutMs -
+        FServer.FPingIntervalMs);
+      if AnswerBy > FDeadline then FDeadline := AnswerBy;
+    end;
+    Reschedule;
+    if (FState = wcsOpen) and ((FDeadline = 0) or (Now_ < FDeadline)) then
+    begin
+      FProto.SendPing(nil, 0);
+      FServer.FlushConn(Self);
+      Exit;
+    end;
+  end;
   if (FDeadline <> 0) and (Now_ >= FDeadline) then
   begin
     FDeadline := 0;
@@ -559,20 +590,6 @@ begin
         end;
       wcsClosing:
         FServer.DropConn(Self);
-    end;
-    Exit;
-  end;
-  if (FPingDue <> 0) and (Now_ >= FPingDue) then
-  begin
-    // One ping per quiet period: the next is scheduled by the peer's
-    // reply (NoteActivity), not by the clock, so an unanswered ping
-    // simply lets the idle deadline run out.
-    FPingDue := 0;
-    Reschedule;
-    if FState = wcsOpen then
-    begin
-      FProto.SendPing(nil, 0);
-      FServer.FlushConn(Self);
     end;
   end;
 end;
