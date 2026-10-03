@@ -8,8 +8,9 @@ program wsinterop;
 // upgrade-hook section (a server bound to 127.0.0.1 explicitly whose
 // OnUpgradeRequest vetoes one Origin with a 403 and treats a raising
 // hook the same way), a handler-fault section (a raising OnMessage,
-// OnOpen, Post proc or OnClientClose costs only its connection: 1011,
-// one OnError, the rest keep being served), and a
+// OnOpen or Post proc costs only its connection: 1011, reported to
+// OnError, the rest keep being served; a raising OnClientClose or an
+// OnError rethrowing is only reported), and a
 // concurrent-connections stress section — 33 client threads (28 echo,
 // 4 abrupt-drop, 1 pusher) of echo/burst/clean-close cycles racing
 // abrupt raw-socket drops and server-initiated pushes, ended by a
@@ -164,12 +165,14 @@ type
   // handler a cue names. A connection is marked (UserData) just before
   // its handler raises, so OnError can show it was handed exactly that
   // connection and that exception. Counters are interlocked (handlers
-  // run on Network.framework's connection queues); the flag is set only
-  // between checks.
+  // run on Network.framework's connection queues); the flags are set
+  // only between checks.
   TFaultHost = class
   public
     Opens, Closes, Errors, Matched: LongInt;
     RaiseOnOpen: Boolean;
+    // OnError rethrows the exception it was handed ("log and rethrow").
+    ReraiseOnError: Boolean;
     procedure OnMsg(AConn: TWSConnection; AText: Boolean; P: PByte;
       Len: NativeInt);
     procedure RaiseFromPost(AConn: TWSConnection);
@@ -535,6 +538,7 @@ begin
   if (AConn.UserData = @FaultMark) and (AError <> nil) and
     (AError.Message = FaultText) then
     InterLockedIncrement(Matched);
+  if ReraiseOnError and (AError <> nil) then raise AError;
 end;
 
 procedure TCatchingServerThread.Execute;
@@ -1989,12 +1993,15 @@ begin
 end;
 
 // --- handler faults ---------------------------------------------------------
-// One raising handler costs only its connection: its peer sees 1011,
-// OnError is handed that connection and that exception, a bystander
-// connection keeps echoing throughout, and nothing escapes Run.
+// One raising handler costs only its connection: its peer sees 1011
+// (OnClientClose has nothing left to close), OnError is handed that
+// connection and that exception, a bystander connection still echoes
+// afterwards, and nothing escapes Run — not even an OnError that
+// rethrows what it was handed.
 const
-  // OnMessage, OnOpen, a Post proc, OnClientClose.
-  FaultSectionCases = 4;
+  // OnMessage, OnMessage with OnError rethrowing, OnOpen, a Post proc,
+  // OnClientClose.
+  FaultSectionCases = 5;
   // The bystander plus one connection per case.
   FaultSectionOpens = FaultSectionCases + 1;
 
@@ -2028,7 +2035,7 @@ var
   SrvT: TCatchingServerThread;
   Port: Word;
   Bystander, Cli: TWSClient;
-  OpenOk, IsText: Boolean;
+  CaseOk, IsText: Boolean;
   Data: TBytes;
   Deadline: QWord;
 begin
@@ -2049,10 +2056,17 @@ begin
   Check(FaultCase(Host, Port, FaultCueMessage),
     'raising OnMessage: its peer sees 1011, OnError gets that connection ' +
     'and exception');
+  // A rethrown AError rides a second raise frame with the same object:
+  // it must be swallowed without a double free.
+  Host.ReraiseOnError := True;
+  CaseOk := FaultCase(Host, Port, FaultCueMessage);
+  Host.ReraiseOnError := False;
+  Check(CaseOk and (SrvT.Escaped = 0), 'OnError rethrowing its exception: ' +
+    'swallowed, the peer still sees 1011');
   Host.RaiseOnOpen := True;
-  OpenOk := FaultCase(Host, Port, '');
+  CaseOk := FaultCase(Host, Port, '');
   Host.RaiseOnOpen := False;
-  Check(OpenOk, 'raising OnOpen: its peer sees 1011, OnError gets that ' +
+  Check(CaseOk, 'raising OnOpen: its peer sees 1011, OnError gets that ' +
     'connection and exception');
   Check(FaultCase(Host, Port, FaultCuePost),
     'raising Post proc: its peer sees 1011, OnError gets that connection ' +
@@ -2067,7 +2081,9 @@ begin
   Cli.ReadMessage(IsText, Data);
   Cli.Close(1000, 'done');
   Deadline := GetTickCount64 + 5000;
-  while (Host.Errors < FaultSectionCases) and (GetTickCount64 < Deadline) do
+  // Matched, not Errors: OnError counts Errors first, so waiting on it
+  // could read Matched a step early.
+  while (Host.Matched < FaultSectionCases) and (GetTickCount64 < Deadline) do
     Sleep(10);
   Check((Cli.CloseCode = 1000) and (Host.Matched = FaultSectionCases),
     'raising OnClientClose: the close completes, OnError gets that ' +
@@ -2078,7 +2094,7 @@ begin
   Check(Bystander.ReadMessage(IsText, Data) and
     (Length(Data) = Length(HelloProbe)) and
     (Host.Errors = FaultSectionCases) and (SrvT.Escaped = 0),
-    'a bystander keeps echoing through every raise; none escaped Run');
+    'a bystander still echoes after every raise; none escaped Run');
   Bystander.Close(1000, 'done');
   Bystander.Free;
   Deadline := GetTickCount64 + 5000;

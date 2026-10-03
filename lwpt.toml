@@ -40,7 +40,7 @@ wsautobahn = { source = "source/apps/wsautobahn.pas", output = "build/wsautobahn
 # file's cyclomatic figure is the sum of its routines, so splitting the
 # battery into section procedures (as it now is) keeps its routines small
 # but cannot lower the file figure; the file cyclomatic ceiling therefore
-# follows the battery (2026-10-03: 317 with the handler-fault section,
+# follows the battery (2026-10-03: 318 with the handler-fault section,
 # ceiling 330). Regression ratchets — CI fails when a change pushes a
 # metric past its ceiling.
 [health]

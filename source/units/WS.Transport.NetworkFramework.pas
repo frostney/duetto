@@ -555,7 +555,9 @@ begin
   C.Id := T.FNextId;
   InterLockedIncrement(T.FActive);
   // Contained (see the trampolines' header): an accept the session
-  // could not take is refused like one over the connection cap.
+  // could not take is refused like one over the connection cap. Only
+  // out of memory reaches here, and a session object it had already
+  // allocated is not reclaimed — the process is in trouble anyway.
   try
     if Assigned(T.OnAccept) then T.OnAccept(C);
   except

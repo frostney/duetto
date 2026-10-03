@@ -399,9 +399,14 @@ type
     // frame is on the wire (within CloseTimeoutMs when the peer is not
     // reading), without waiting for the peer's echo. It gets no further
     // OnMessage — what the peer still sends is discarded — and its
-    // OnClientClose fires as for any drop. Every other connection keeps
-    // being served. A raising OnClientClose has nothing left to close
-    // and is only reported.
+    // OnClientClose fires as for any drop. A Post proc already queued
+    // for it still runs while the close frame drains (its sends queue
+    // nothing); should it raise as well, OnError hears of that too.
+    // Every other connection keeps being served. A raising
+    // OnClientClose has nothing left to close and is only reported.
+    // The containment covers the whole delivery run, so an exception
+    // raised by the server itself during one (out of memory, say) is
+    // contained and reported the same way.
     //
     // OnError reports the exception: it is the place to log it or to
     // escalate (Stop the server, raise an alarm on another thread). It
@@ -414,8 +419,8 @@ type
     // OnError returns, so copy what you need (ClassName, Message)
     // rather than keeping it; it is nil when the raised object is not
     // an Exception. Unset, the exception is dropped once the connection
-    // has been closed. An exception escaping OnError itself is
-    // swallowed. OnUpgradeRequest and OnPlainRequest are not covered:
+    // has been closed. An exception escaping OnError itself — AError
+    // rethrown included — is swallowed. OnUpgradeRequest and OnPlainRequest are not covered:
     // a raising hook there is a refusal, as documented on each, and
     // does not reach OnError.
     property OnError: TWSServerError read FOnError write FOnError;
@@ -902,10 +907,12 @@ end;
 
 procedure TWSServer.HandlerRaised(AConn: TWSConnection);
 var
+  Raised: TObject;
   E: Exception;
 begin
-  if ExceptObject is Exception then
-    E := Exception(ExceptObject)
+  Raised := ExceptObject;
+  if Raised is Exception then
+    E := Exception(Raised)
   else
     E := nil;
   // Already being dropped (OnClientClose): nothing left to close.
@@ -924,7 +931,11 @@ begin
       FOnError(AConn, E);
     except
       // The last stop for this exception: OnError escalates by acting,
-      // never by raising.
+      // never by raising. A re-raised AError rides a second raise frame
+      // with the same object; FPC frees it at the end of each except
+      // block, so keep this frame from freeing it — the caller's frees
+      // it once.
+      if ExceptObject = Raised then AcquireExceptionObject;
     end;
 end;
 
