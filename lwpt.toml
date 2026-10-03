@@ -33,10 +33,10 @@ wsprobe   = { source = "source/apps/wsprobe.pas",   output = "build/wsprobe" }
 wsautobahn = { source = "source/apps/wsautobahn.pas", output = "build/wsautobahn" }
 
 # Analysis gates. Ceilings sit above the measured 2026-10-03 baseline
-# (lwpt health / lwpt duplication): file cyclomatic 328 and file
-# cognitive 387 (both wsinterop, the E2E battery — it grows with every
+# (lwpt health / lwpt duplication): file cyclomatic 333 and file
+# cognitive 390 (both wsinterop, the E2E battery — it grows with every
 # observed bound), routine cyclomatic 58 and routine cognitive 126
-# (TWSProtocol.Ingest), duplication 0.60%. A file's cyclomatic figure is
+# (TWSProtocol.Ingest), duplication 0.59%. A file's cyclomatic figure is
 # the sum of its routines, so splitting the battery into section
 # procedures (as it now is) keeps its routines small but cannot lower the
 # file figure; the file ceilings therefore follow the battery. Regression
