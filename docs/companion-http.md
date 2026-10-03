@@ -219,7 +219,8 @@ The contract is deliberately narrow:
   is not a WebSocket upgrade attempt. Everything else — requests
   advertising a body, malformed noise, broken upgrade attempts — keeps
   the standard refusal, as does every request while the property is
-  unset.
+  unset. A header block past the server's 16 KiB cap gets `431 Request
+  Header Fields Too Large` before any classification.
 - **Single-shot.** Return `True` with a complete HTTP/1.1 response in
   `AResponse` (status line, headers, body; include `Connection: close`
   so clients expect what follows): the bytes are written verbatim and

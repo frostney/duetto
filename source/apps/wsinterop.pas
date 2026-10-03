@@ -2498,13 +2498,43 @@ begin
   Gate.Free;
 end;
 
+// An upgrade request whose header block is exactly ABlockBytes long,
+// padded by one extra header line.
+function PaddedUpgradeRequest(ABlockBytes: Integer): RawByteString;
+const
+  PadName = 'X-Pad: ';
+begin
+  Result := ClientBuildRequest('127.0.0.1', '/', ClientGenerateKey, False);
+  Insert(PadName + StringOfChar('p', ABlockBytes - Length(Result) -
+    Length(PadName) - 2) + #13#10, Result, Length(Result) - 1);
+end;
+
+// Send AReq on a fresh socket and read the answer through to EOF; True
+// when it is a 431 whose Content-Length matches the body behind it.
+function RawGetsTooLarge(APort: Word; const AReq: RawByteString): Boolean;
+var
+  Sock: Tsocket;
+  Got: RawByteString;
+  SawEof: Boolean;
+  HdrEnd: Integer;
+begin
+  Sock := RawConnect(APort);
+  fpSend(Sock, @AReq[1], Length(AReq), 0);
+  Got := RawReadToEof(Sock, SawEof);
+  CloseSocket(Sock);
+  HdrEnd := HandshakeFindEnd(Got);
+  Result := (Copy(Got, 1, 44) = 'HTTP/1.1 431 Request Header Fields Too Large')
+    and SawEof and (HdrEnd > 0) and
+    (HeaderValue(Got, 'Content-Length') = IntToStr(Length(Got) - HdrEnd));
+end;
+
 procedure RunHandshakeSizeSection;
 const
-  // WS.Server's HandshakeMaxBytes, plus one: the cap trips on the very
-  // read that brings the last byte, so the server has consumed the whole
-  // request and closes with a FIN, never an RST that could discard the
-  // 431 still sitting in our receive buffer.
-  OversizedRequestBytes = 16 * 1024 + 1;
+  // The cap plus one: it trips on the very read that brings the last
+  // byte, so the server has consumed the whole request and closes with a
+  // FIN, never an RST that could discard the 431 still sitting in our
+  // receive buffer.
+  OversizedRequestBytes = WS_MAX_HANDSHAKE + 1;
   LongPathBytes = 5000;
 var
   Sizes: TLimitsHost;
@@ -2528,16 +2558,32 @@ begin
 
   // A request line that never ends, one byte past the cap: 431 with a
   // truthful Content-Length, then EOF.
+  Check(RawGetsTooLarge(SizePort,
+    'GET /' + StringOfChar('a', OversizedRequestBytes - 5)),
+    'oversized request -> 431 with a truthful Content-Length, then EOF');
+  // A complete header block one byte past the cap is refused the same way.
+  Check(RawGetsTooLarge(SizePort, PaddedUpgradeRequest(OversizedRequestBytes)),
+    'terminated header block past the cap -> 431, then EOF');
+  // Counted before any connection opens, so a legitimate close later in
+  // the section cannot mask a stray callback from the refusals.
+  Sizes.Snapshot(Opens, Closes);
+  Check((Opens = 0) and (Closes = 0),
+    Format('431 refusals fired no OnOpen / OnClientClose (%d/%d)',
+    [Opens, Closes]));
+
+  // The cap bounds the header block, not the frames pipelined behind it:
+  // a block exactly at the cap with frames in the same write upgrades.
   Fd := RawConnect(SizePort);
-  Req := 'GET /' + StringOfChar('a', OversizedRequestBytes - 5);
+  Req := PaddedUpgradeRequest(WS_MAX_HANDSHAKE) +
+    BuildFrameBytes(WS_OP_TEXT, HelloProbe, True) +
+    BuildFrameBytes(WS_OP_CLOSE, #$03#$E8, True);
   fpSend(Fd, @Req[1], Length(Req), 0);
   Got := RawReadToEof(Fd, Eof);
   CloseSocket(Fd);
   HdrEnd := HandshakeFindEnd(Got);
-  Check((Copy(Got, 1, 44) = 'HTTP/1.1 431 Request Header Fields Too Large')
-    and Eof and (HdrEnd > 0) and
-    (HeaderValue(Got, 'Content-Length') = IntToStr(Length(Got) - HdrEnd)),
-    'oversized request -> 431 with a truthful Content-Length, then EOF');
+  Check((Copy(Got, 1, 12) = 'HTTP/1.1 101') and Eof and (HdrEnd > 0) and
+    (Pos(HelloProbe, Copy(Got, HdrEnd + 1, MaxInt)) > 0),
+    'header block at the cap with pipelined frames -> 101, echo');
 
   // The issue's reproduction: a path past the builders' 2 KiB stack
   // buffer used to go out without its blank line and hang both sides.
@@ -2552,14 +2598,15 @@ begin
   Cli.Close(1000, 'done');
   Cli.Free;
 
+  // Only the two upgrades opened and closed.
   Deadline := GetTickCount64 + 3000;
   repeat
     Sizes.Snapshot(Opens, Closes);
-    if Closes >= 1 then Break;
+    if Closes >= 2 then Break;
     Sleep(10);
   until GetTickCount64 > Deadline;
-  Check((Opens = 1) and (Closes = 1),
-    Format('431 refusal fired no OnOpen / OnClientClose (%d/%d)',
+  Check((Opens = 2) and (Closes = 2),
+    Format('handshake-size section: two opens, two closes (%d/%d)',
     [Opens, Closes]));
 
   StressPhase := 'handshake-size section: teardown';

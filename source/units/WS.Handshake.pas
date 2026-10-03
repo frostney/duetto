@@ -10,7 +10,9 @@ interface
 
 const
   WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-  WS_MAX_HANDSHAKE = 8192; // cap on accumulated request headers
+  // Cap on an inbound request's header block; WS.Server answers 431
+  // Request Header Fields Too Large past it.
+  WS_MAX_HANDSHAKE = 16 * 1024;
 
 type
   TWSDeflateParams = record
@@ -173,19 +175,21 @@ type
     Len: Integer;
     procedure Init; inline;
     procedure App(const S: string); inline;
-    procedure Grow(ANeed: Integer);
+    procedure Grow(ANeed: SizeInt);
     function Done: string;
   end;
 
 procedure TWSStrBuilder.Init;
 begin
+  // Done hands Heap out shared; a reused builder must not write into it.
+  Heap := '';
   Len := 0;
   Cap := BuilderStackBytes;
 end;
 
 procedure TWSStrBuilder.App(const S: string);
 var
-  N: Integer;
+  N: SizeInt;
 begin
   N := Length(S);
   if N = 0 then Exit;
@@ -198,10 +202,12 @@ begin
 end;
 
 // Out of line: only content past BuilderStackBytes reaches it.
-procedure TWSStrBuilder.Grow(ANeed: Integer);
+procedure TWSStrBuilder.Grow(ANeed: SizeInt);
 var
   NewCap: Integer;
 begin
+  // Len and Cap are Integer: content past 2 GiB cannot be represented.
+  if ANeed > MaxInt then Error(reOutOfMemory);
   NewCap := Cap;
   while NewCap < ANeed do
     if NewCap > MaxInt div 2 then

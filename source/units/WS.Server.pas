@@ -404,7 +404,6 @@ uses
   {$endif}
 
 const
-  HandshakeMaxBytes = 16 * 1024;
   HandshakeTooLargeReason = 'request header block too large';
   // Smallest payload worth a gather write over a copy into the queue.
   // Set from load_test on epoll (separate cores): with no threshold the
@@ -1172,15 +1171,18 @@ begin
         SetLength(Conn.FHsBuf, Off + ALen);
         Move(P^, Conn.FHsBuf[Off + 1], ALen);
         // The first Off bytes were searched on earlier reads: resume
-        // there, so a peer trickling its request costs linear time.
+        // there, so the scan of a trickled request costs linear time.
         HdrEnd := HandshakeFindEnd(PByte(Conn.FHsBuf), Length(Conn.FHsBuf),
           Off);
         // The cap bounds the header block, not the frames a client may
         // pipeline behind a complete one. Past it, say why (RFC 6585 §5)
-        // before dropping, best effort like the 400 refusal. The
-        // connection never opened: no OnOpen, no OnClientClose.
-        if ((HdrEnd = 0) and (Length(Conn.FHsBuf) > HandshakeMaxBytes)) or
-          (HdrEnd > HandshakeMaxBytes) then
+        // before dropping, best effort like the 400 refusal: nothing has
+        // been sent on this connection yet, so unlike the 403 the reply
+        // cannot queue behind earlier output. A peer still sending may
+        // see a reset instead. The connection never opened: no OnOpen,
+        // no OnClientClose.
+        if ((HdrEnd = 0) and (Length(Conn.FHsBuf) > WS_MAX_HANDSHAKE)) or
+          (HdrEnd > WS_MAX_HANDSHAKE) then
         begin
           Resp := ServerBuildReject(431, HandshakeTooLargeReason);
           ATConn.SubmitSend(@Resp[1], Length(Resp));
