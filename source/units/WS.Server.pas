@@ -23,6 +23,10 @@ unit WS.Server;
 // TWSConnection.Post is the one cross-thread hand-off: it schedules a
 // proc onto the connection's callback context via the transport seam,
 // so server-driven pushes need no locks of their own.
+//
+// Containment: an exception escaping a user handler (OnOpen, OnMessage,
+// OnClientClose, a Post proc) is caught where this unit called it and
+// costs only that connection — see TWSServer.OnError.
 
 {$I Shared.inc}
 
@@ -66,9 +70,14 @@ type
     // die) and by the successful single-shot plain-HTTP response (write
     // the body, then close — there is no keep-alive).
     FDropPending: Boolean;
-    FInDelivery: Boolean;      // inside Ingest/OnOpen delivery — drops defer
+    FInDelivery: Boolean;      // inside Ingest/OnOpen/Post delivery — drops defer
     FDropping: Boolean;        // teardown running; re-entrant drops no-op
     FDropDeferred: Boolean;    // dropped mid-delivery; freed on unwind
+    // A handler raised on this connection: 1011 is queued, the drop
+    // follows once it is on the wire, and peer bytes are no longer
+    // ingested (the raise may have abandoned the machine's frame loop
+    // mid-read, so its input state is not trusted again).
+    FFaulted: Boolean;
     // Clock state, all in WSMonotonicMs milliseconds, written only on
     // this connection's execution context. FDeadline is when the peer
     // must have done what the current state is waiting for (finished
@@ -111,7 +120,7 @@ type
     // flush: the connection was dropped and the reference must not be
     // touched again. OnClientClose fires as part of that drop —
     // nested inside this call when the drop is immediate, or after the
-    // current OnMessage/OnOpen delivery unwinds when it is deferred
+    // current OnMessage/OnOpen/Post delivery unwinds when it is deferred
     // (the free is deferred there so pipelined frames cannot be parsed
     // in freed memory). True = the connection is still alive,
     // including the no-op cases (not yet open, already closing). This
@@ -132,7 +141,7 @@ type
     // Same contract as SendText/SendBinary: False = the transport
     // declared the connection dead while the close frame flushed and
     // the connection was dropped (freed before Close returns, or right
-    // after the current OnMessage/OnOpen delivery unwinds) — do not
+    // after the current OnMessage/OnOpen/Post delivery unwinds) — do not
     // touch the reference again. True = still alive, including the
     // no-op case where the connection was not open to begin with.
     function Close(ACode: Word = 1000; const AReason: string = ''): Boolean;
@@ -154,7 +163,9 @@ type
     // Network.framework backend such a race can still deliver AProc
     // mid-teardown rather than discarding it).
     //
-    // A nil AProc is a no-op: nothing is scheduled and nothing runs.
+    // A nil AProc is a no-op: nothing is scheduled and nothing runs. An
+    // exception escaping AProc is contained like one from OnMessage
+    // (see TWSServer.OnError): the connection closes with 1011.
     procedure Post(AProc: TWSConnProc);
     property Proto: TWSProtocol read FProto;
     property Id: NativeUInt read GetId;
@@ -167,6 +178,10 @@ type
   TWSServerMessage = procedure(AConn: TWSConnection; AText: Boolean;
     P: PByte; Len: NativeInt) of object;
   TWSServerNotify = procedure(AConn: TWSConnection) of object;
+  // See TWSServer.OnError. AError is the exception that escaped a
+  // handler on AConn, or nil when the raised object is not an Exception.
+  TWSServerError = procedure(AConn: TWSConnection;
+    AError: Exception) of object;
 
   // Answer a plain HTTP request on the WebSocket port (see
   // TWSServer.OnPlainRequest). AHS carries the request as parsed by
@@ -226,6 +241,7 @@ type
     FLock: TCriticalSection;
     FOnMessage: TWSServerMessage;
     FOnOpen, FOnClose: TWSServerNotify;
+    FOnError: TWSServerError;
     FOnPlainRequest: TWSPlainRequestEvent;
     FOnUpgradeRequest: TWSUpgradeRequestEvent;
     FMaxPendingOutput: NativeInt;
@@ -241,6 +257,14 @@ type
     procedure SweepClocks;
     procedure RegistryRemove(AConn: TWSConnection);
     procedure ReleaseConn(AConn: TWSConnection);
+    // The except-block half of handler containment: marks AConn faulted,
+    // queues 1011 when it is open, reports to OnError. Called while AConn
+    // is still allocated; never raises.
+    procedure HandlerRaised(AConn: TWSConnection);
+    // Get the queued close frame out, then drop: at once when it is on
+    // the wire, once it drains otherwise. Shared by protocol failures
+    // and handler faults.
+    procedure FailConn(AConn: TWSConnection);
     // Caller-initiated teardown; returns False so drop sites can chain
     // "Exit(DropConn(...))". The connection is freed on return — or,
     // mid-delivery, as soon as the delivery site unwinds (deferred).
@@ -350,15 +374,42 @@ type
     // and they arrive earlier, as ordinary remote closes on their own
     // queues. Sends inside the handler report False (the connection is
     // already being torn down). An exception escaping the handler is
-    // treated like one from OnOpen or OnMessage, but only after the
-    // session connection has been released (and, on a plaintext
-    // listener, closed at the transport: on epoll its socket closed, on
-    // IOCP its FIN sent — once Run resumes if a send is still in
-    // flight): on the epoll and IOCP transports it propagates out
-    // of Run; on Network.framework, where callbacks run on GCD threads,
-    // an escaping exception terminates the process, as it does from any
-    // callback. During Destroy it is swallowed so shutdown completes.
+    // contained like one from any other handler (see OnError): the
+    // connection is still released and closed at the transport, and the
+    // server keeps serving every other connection — Destroy included,
+    // which always finishes. This reverses the 0.5 contract, under which
+    // it propagated out of Run on epoll and IOCP and terminated the
+    // process on Network.framework.
     property OnClientClose: TWSServerNotify read FOnClose write FOnClose;
+    // Handler containment. An exception escaping OnOpen, OnMessage,
+    // OnClientClose or a Post proc is caught where the server called
+    // the handler, on every transport: it never unwinds Run (epoll,
+    // IOCP) and never reaches a GCD queue (Network.framework). The
+    // connection it escaped from is closed with 1011, best effort: the
+    // close frame is queued and the connection dropped as soon as the
+    // frame is on the wire (within CloseTimeoutMs when the peer is not
+    // reading), without waiting for the peer's echo. It gets no further
+    // OnMessage — what the peer still sends is discarded — and its
+    // OnClientClose fires as for any drop. Every other connection keeps
+    // being served. A raising OnClientClose has nothing left to close
+    // and is only reported.
+    //
+    // OnError reports the exception: it is the place to log it or to
+    // escalate (Stop the server, raise an alarm on another thread). It
+    // fires on the failing handler's execution context — the Run thread
+    // on Linux/Windows, the connection's dispatch queue on macOS, the
+    // thread calling Destroy for an OnClientClose fired there — with
+    // AConn still allocated: Id and UserData are readable, sends and
+    // Close queue nothing (the connection is closing or already being
+    // dropped). AError is the escaping exception and is freed when
+    // OnError returns, so copy what you need (ClassName, Message)
+    // rather than keeping it; it is nil when the raised object is not
+    // an Exception. Unset, the exception is dropped once the connection
+    // has been closed. An exception escaping OnError itself is
+    // swallowed. OnUpgradeRequest and OnPlainRequest are not covered:
+    // a raising hook there is a refusal, as documented on each, and
+    // does not reach OnError.
+    property OnError: TWSServerError read FOnError write FOnError;
     // Opt-in single-port fallback: fired for a well-formed, body-less
     // HTTP request (GET or HEAD without Content-Length or
     // Transfer-Encoding) that is not a WebSocket upgrade attempt.
@@ -739,14 +790,10 @@ begin
       Open[I].FDropping := True;
       Open[I].FTConn := nil;
     end;
+    // A raising OnClientClose is contained in ReleaseConn (reported to
+    // OnError on this thread), so the destructor always finishes.
     for I := 0 to High(Open) do
-      try
-        ReleaseConn(Open[I]);
-      except
-        // A destructor has to finish: the connection was released by
-        // ReleaseConn's finally; the handler's exception is dropped.
-        on Exception do;
-      end;
+      ReleaseConn(Open[I]);
     FTransport.Free;
   end;
   FSweepWake.Free;
@@ -833,13 +880,62 @@ end;
 procedure TWSServer.ReleaseConn(AConn: TWSConnection);
 begin
   RegistryRemove(AConn);
-  // A raising OnClientClose still releases the connection; the
-  // exception carries on to the caller.
-  try
-    if (AConn.FState <> wcsHandshake) and Assigned(FOnClose) then
+  // A raising OnClientClose is contained here, so the connection is
+  // always released and every caller's transport-side close still runs.
+  if (AConn.FState <> wcsHandshake) and Assigned(FOnClose) then
+    try
       FOnClose(AConn);
-  finally
-    AConn.Free;
+    except
+      HandlerRaised(AConn);
+    end;
+  AConn.Free;
+end;
+
+procedure TWSServer.HandlerRaised(AConn: TWSConnection);
+var
+  E: Exception;
+begin
+  if ExceptObject is Exception then
+    E := Exception(ExceptObject)
+  else
+    E := nil;
+  // Already being dropped (OnClientClose): nothing left to close.
+  if not AConn.FDropping then
+  begin
+    AConn.FFaulted := True;
+    if AConn.FState = wcsOpen then
+    begin
+      // 1011: the server met an unexpected condition (RFC 6455 §7.4.1).
+      AConn.FProto.SendClose(1011, 'internal error');
+      AConn.FState := wcsClosing;
+    end;
+  end;
+  if Assigned(FOnError) then
+    try
+      FOnError(AConn, E);
+    except
+      // The last stop for this exception: OnError escalates by acting,
+      // never by raising.
+    end;
+end;
+
+procedure TWSServer.FailConn(AConn: TWSConnection);
+begin
+  // No protocol object yet, so no out queue to drain.
+  if AConn.FProto = nil then
+  begin
+    DropConn(AConn);
+    Exit;
+  end;
+  // If a prior send is still in flight the transport takes nothing now —
+  // defer the drop until OnSendReady has drained the close frame, or it
+  // never reaches the wire (races the 101 on fast loopback).
+  if FlushConn(AConn) then
+  begin
+    if AConn.FProto.OutPending = 0 then
+      DropConn(AConn)
+    else
+      AConn.BeginDrain;
   end;
 end;
 
@@ -896,8 +992,9 @@ var
   TConn: TWSTransportConn;
 begin
   Result := False;
-  // Mid-delivery (Ingest's frame loop, or OnOpen with the caller still
-  // reading conn state afterwards) the object must not be freed under
+  // Mid-delivery (Ingest's frame loop, OnOpen with the caller still
+  // reading conn state afterwards, or a Post proc with the containment
+  // still ahead of it) the object must not be freed under
   // its own stack — the use-after-free the win64 stress battery
   // caught. Defer: the callers' contract (False = do not touch the
   // reference again) already covers it, and the delivery site performs
@@ -914,13 +1011,10 @@ begin
   AConn.FDropping := True;
   TConn := AConn.FTConn;
   TConn.UserData := nil;
-  // The transport side is closed even if OnClientClose raises: the
-  // socket must not outlive the session object that owned it.
-  try
-    ReleaseConn(AConn);
-  finally
-    TConn.SubmitClose;
-  end;
+  // ReleaseConn contains a raising OnClientClose, so the transport side
+  // is always closed behind the session object that owned it.
+  ReleaseConn(AConn);
+  TConn.SubmitClose;
 end;
 
 function TWSServer.FlushConn(AConn: TWSConnection): Boolean;
@@ -1057,15 +1151,24 @@ begin
   // find the peer dead, and the caller still reads Conn state after we
   // return — the drop must not free the object under it.
   AConn.FInDelivery := True;
-  try
-    if Assigned(FOnOpen) then FOnOpen(AConn);
-  finally
-    AConn.FInDelivery := False;
-  end;
+  if Assigned(FOnOpen) then
+    try
+      FOnOpen(AConn);
+    except
+      HandlerRaised(AConn);
+    end;
+  AConn.FInDelivery := False;
   if AConn.FDropDeferred then
   begin
     AConn.FDropDeferred := False;
     Exit(DropConn(AConn)); // False: the caller must not touch Conn
+  end;
+  if AConn.FFaulted then
+  begin
+    // False as well: frames pipelined behind the request are not
+    // replayed into a connection that is closing with 1011.
+    FailConn(AConn);
+    Exit;
   end;
   Result := True;
 end;
@@ -1081,11 +1184,16 @@ begin
   // pipelined frames still unparsed); the deferred teardown runs here,
   // with Ingest unwound and the object safe to free.
   AConn.FInDelivery := True;
+  // One exception frame per read, not one per message: a raising
+  // OnMessage abandons the rest of this run mid-loop, and FFaulted keeps
+  // the abandoned machine from ever being fed again (HandleData).
   try
     IngestOk := AConn.FProto.Ingest(P, ALen);
-  finally
-    AConn.FInDelivery := False;
+  except
+    HandlerRaised(AConn);
+    IngestOk := False;
   end;
+  AConn.FInDelivery := False;
   if AConn.FDropDeferred then
   begin
     AConn.FDropDeferred := False;
@@ -1093,17 +1201,9 @@ begin
   end;
   if not IngestOk then
   begin
-    // Get the close frame out, then die. If a prior send is still in
-    // flight the transport takes nothing now — defer the drop until
-    // OnSendReady has drained the close frame, or it never reaches the
-    // wire (races the 101 on fast loopback).
-    if FlushConn(AConn) then
-    begin
-      if AConn.FProto.OutPending = 0 then
-        DropConn(AConn)
-      else
-        AConn.BeginDrain;
-    end;
+    // Protocol failure or handler fault: get the close frame out, then
+    // die.
+    FailConn(AConn);
     Exit;
   end;
   if not FlushConn(AConn) then Exit;
@@ -1189,6 +1289,9 @@ begin
       end;
     wcsOpen, wcsClosing:
       begin
+        // Faulted: closing with 1011, its machine's input abandoned; what
+        // the peer still sends is discarded until the drop.
+        if Conn.FFaulted then Exit;
         Conn.NoteActivity;
         IngestAndFlush(Conn, P, ALen);
       end;
@@ -1240,12 +1343,26 @@ begin
     if ATConn = nil then Exit; // dropped in transit (conn gone/shutdown)
     Conn := TWSConnection(ATConn.UserData);
     if Conn = nil then Exit;   // session already let go of it
-    // AProc may legitimately end with the connection dropped and freed
-    // (a Send returning False); nothing below touches Conn again.
     // PostToConn already refuses a nil proc; re-check here so a stray
     // envelope can never turn into a call through a nil code pointer.
-    if Assigned(Env^.Proc) then
+    if not Assigned(Env^.Proc) then Exit;
+    // Delivered like OnMessage: a drop inside AProc (a Send returning
+    // False) is deferred until it returns, so Conn is still allocated
+    // for the containment below and is freed only after it.
+    Conn.FInDelivery := True;
+    try
       Env^.Proc(Conn);
+    except
+      HandlerRaised(Conn);
+    end;
+    Conn.FInDelivery := False;
+    if Conn.FDropDeferred then
+    begin
+      Conn.FDropDeferred := False;
+      DropConn(Conn);
+    end
+    else if Conn.FFaulted then
+      FailConn(Conn);
   finally
     Dispose(Env);
   end;
