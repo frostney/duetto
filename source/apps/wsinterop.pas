@@ -361,10 +361,24 @@ end;
 const
   // Sessions the limits section opens; each must see one OnClientClose.
   // Linux adds the close-budget case that needs a closed socket's RST.
-  LimitsOpens = {$ifdef LINUX}8{$else}7{$endif};
+  LimitsOpens = {$ifdef LINUX}9{$else}8{$endif};
 
 const
   CloseCue = 'close-me';
+  // The keepalive cases' idle bound: 4x the section's 200 ms ping
+  // interval, so a pong has 600 ms from its ping leaving (#80).
+  KeepaliveIdleMs = 800;
+  // Echoed, then holds the connection's execution context past
+  // KeepaliveIdleMs, so the check posted when the 200 ms keepalive ping
+  // fell due runs only after the idle deadline has lapsed too. The echo
+  // marks the stall's start in the stream: a ping behind it was sent
+  // after the stall began.
+  StallCue = 'stall-past-idle';
+  StallMs = 1000;
+  // How long the host-busy peer holds its pong: past the next 100 ms
+  // sweep (which would close a connection whose deadline was not moved),
+  // well inside the 600 ms answer window the late ping must open.
+  PongDelayMs = 200;
 
 constructor TLimitsHost.Create;
 begin
@@ -384,6 +398,12 @@ begin
   if AText and (Len = Length(CloseCue)) and
     CompareMem(P, @CloseCue[1], Len) then
     AConn.Close(1000, 'bye')
+  else if AText and (Len = Length(StallCue)) and
+    CompareMem(P, @StallCue[1], Len) then
+  begin
+    AConn.SendText(P, Len);
+    Sleep(StallMs);
+  end
   else if AText then
     AConn.SendText(P, Len)
   else
@@ -625,10 +645,13 @@ end;
 // simply waits for the bytes or the hangup (the battery watchdog is the
 // backstop). ARecvBuf > 0 shrinks SO_RCVBUF before the connect, which
 // is how the backpressure probe forces the SERVER's egress to stall.
+// TCP_NODELAY, like WS.Client: a frame sent behind an unacknowledged
+// one (a probe right after a pong) must not wait out a delayed ACK.
 function RawConnectEx(APort: Word; AReadTimeout: Boolean;
   ARecvBuf: Integer = 0): Tsocket;
 var
   SA: TInetSockAddr;
+  One: LongInt;
   {$ifdef WINDOWS}
   TimeoutMs: Cardinal;
   {$else}
@@ -636,6 +659,8 @@ var
   {$endif}
 begin
   Result := fpSocket(AF_INET, SOCK_STREAM, 0);
+  One := 1;
+  fpSetSockOpt(Result, IPPROTO_TCP, TCP_NODELAY, @One, SizeOf(One));
   if ARecvBuf > 0 then
     fpSetSockOpt(Result, SOL_SOCKET, SO_RCVBUF, @ARecvBuf, SizeOf(ARecvBuf));
   if AReadTimeout then
@@ -729,52 +754,65 @@ end;
 type
   PTlsSession = ^TTransportSecurityConnection;
 
+// The next whole frame: its opcode and its (server-sent, so unmasked)
+// payload. ATls = nil reads the raw socket AFd; otherwise the TLS
+// session (AFd is then unused) — one frame walk for both, so the two
+// cannot drift. ABuf carries bytes read past the frame into the next
+// call. False, with AOpcode 0, on EOF, a read error or timeout, or a
+// malformed header.
+function ReadFrame(AFd: Tsocket; ATls: PTlsSession; var ABuf: TBytes;
+  out AOpcode: Byte; out APayload: RawByteString): Boolean;
+var
+  Len, Got: NativeInt;
+  H: TWSFrameHeader;
+  R: TWSParseResult;
+begin
+  Result := False;
+  AOpcode := 0;
+  APayload := '';
+  repeat
+    Len := Length(ABuf);
+    R := ParseFrameHeader(PByte(ABuf), Len, H);
+    if R = wprProtocolError then Exit;
+    if (R = wprOK) and (Len - H.HeaderLen >= H.PayloadLen) then
+    begin
+      AOpcode := H.Opcode;
+      SetLength(APayload, H.PayloadLen);
+      if H.PayloadLen > 0 then
+        Move(ABuf[H.HeaderLen], APayload[1], H.PayloadLen);
+      Delete(ABuf, 0, H.HeaderLen + H.PayloadLen);
+      Exit(True);
+    end;
+    SetLength(ABuf, Len + 4096);
+    if ATls = nil then
+      Got := fpRecv(AFd, @ABuf[Len], 4096, 0)
+    else
+      Got := TransportSecurityRead(ATls^, PWSByteSpan(@ABuf[Len])^, 4096);
+    if Got < 0 then Got := 0;
+    SetLength(ABuf, Len + Got);
+    if Got = 0 then Exit;
+  until False;
+end;
+
 // Read frames until a close frame arrives; return its status code (0 if
-// the peer hung up without one). ATls = nil reads the raw socket AFd;
-// otherwise the TLS session (AFd is then unused) — one frame walk for
-// both, so the two cannot drift.
+// the peer hung up without one, or sent a close frame without a code).
+// Frames before it (an echo, a ping) are skipped.
 function ReadCloseCode(AFd: Tsocket; ATls: PTlsSession;
   const ALeftover: TBytes): Word;
 var
   Buf: TBytes;
-  Len, Got, Used: NativeInt;
-  H: TWSFrameHeader;
-  R: TWSParseResult;
+  Op: Byte;
+  Payload: RawByteString;
 begin
   Result := 0;
   Buf := Copy(ALeftover);
-  Len := Length(Buf);
-  repeat
-    R := ParseFrameHeader(PByte(Buf), Len, H);
-    if R = wprOK then
+  while ReadFrame(AFd, ATls, Buf, Op, Payload) do
+    if Op = WS_OP_CLOSE then
     begin
-      Used := H.HeaderLen;
-      if Len - Used < H.PayloadLen then
-        R := wprNeedMore // payload still in flight
-      else if H.Opcode = WS_OP_CLOSE then
-      begin
-        if H.PayloadLen >= 2 then
-          Exit((Buf[Used] shl 8) or Buf[Used + 1])
-        else
-          Exit(0);
-      end
-      else
-      begin // skip non-close frame (e.g. an echo) and continue
-        Delete(Buf, 0, Used + H.PayloadLen);
-        Dec(Len, Used + H.PayloadLen);
-        Continue;
-      end;
+      if Length(Payload) >= 2 then
+        Result := (Ord(Payload[1]) shl 8) or Ord(Payload[2]);
+      Exit;
     end;
-    if R = wprProtocolError then Exit(0);
-    SetLength(Buf, Len + 4096);
-    if ATls = nil then
-      Got := fpRecv(AFd, @Buf[Len], 4096, 0)
-    else
-      Got := TransportSecurityRead(ATls^, PWSByteSpan(@Buf[Len])^, 4096);
-    if Got <= 0 then Exit(0); // EOF/timeout without close frame
-    Len := Len + Got;
-    SetLength(Buf, Len);
-  until False;
 end;
 
 // One complete frame as bytes — the wire form both the raw-socket and
@@ -882,6 +920,47 @@ begin
     if Got <= 0 then Exit(Integer(GetTickCount64 - Start));
   until GetTickCount64 - Start > QWord(ABoundMs);
   Result := -1;
+end;
+
+// What ReadFrame returned, for a check message (opcode 0: no frame — the
+// server never sends a continuation here).
+function DescribeFrame(AOpcode: Byte; const APayload: RawByteString): string;
+begin
+  if AOpcode = 0 then
+    Result := 'no frame (EOF, error, 5 s timeout or bad header)'
+  else if AOpcode = WS_OP_PING then
+    Result := 'ping'
+  else if (AOpcode = WS_OP_CLOSE) and (Length(APayload) >= 2) then
+    Result := Format('close %d', [(Ord(APayload[1]) shl 8) or
+      Ord(APayload[2])])
+  else
+    Result := Format('opcode %d', [AOpcode]);
+end;
+
+// Play the quiet-but-live peer on a raw socket until ASpanMs after
+// AStart: answer every ping, send nothing else. True when the span
+// passed on pings alone; False on the first other frame (left in
+// AOpcode/APayload) or when no frame comes (AOpcode 0). ALog gets
+// each frame read, in ms since AStart; a ping's pong leaves at once. The
+// server arms its one ping per quiet period only on crediting a pong, so
+// each next ping lands one ping interval (plus up to one 100 ms sweep)
+// after the previous pong was credited.
+function RawAnswerPings(AFd: Tsocket; var ABuf: TBytes; AStart: QWord;
+  ASpanMs: Integer; var APings: Integer; var ALog: string;
+  out AOpcode: Byte; out APayload: RawByteString): Boolean;
+begin
+  AOpcode := 0;
+  APayload := '';
+  while GetTickCount64 - AStart < QWord(ASpanMs) do
+  begin
+    ReadFrame(AFd, nil, ABuf, AOpcode, APayload);
+    ALog := ALog + Format(' %s@%d', [DescribeFrame(AOpcode, APayload),
+      GetTickCount64 - AStart]);
+    if AOpcode <> WS_OP_PING then Exit(False);
+    Inc(APings);
+    RawSendFrame(AFd, WS_OP_PONG, APayload, True);
+  end;
+  Result := True;
 end;
 
 // ---------------------------------------------------------------------------
@@ -2134,13 +2213,13 @@ var
   LimSrvT: TServerThread;
   LimPort: Word;
   Fd, FdA, FdB, FdC: Tsocket;
-  Elapsed, Rounds, SentBytes, I, Opens, Closes: Integer;
-  Chunk, Got: RawByteString;
-  Cli: TWSClient;
-  IsText, Ok, Eof: Boolean;
-  Data: TBytes;
-  ReadRes: TWSReadResult;
-  Deadline: QWord;
+  Elapsed, Pings, SentBytes, I, Opens, Closes: Integer;
+  Chunk, Got, Payload: RawByteString;
+  Ok, Eof: Boolean;
+  Op: Byte;
+  KBuf: TBytes;
+  Log: string;
+  Deadline, Start: QWord;
 begin
   AStressPhase := 'limits section';
   Limits := TLimitsHost.Create;
@@ -2198,30 +2277,74 @@ begin
     Format('silent open peer closed 1001 by the 600 ms idle bound ' +
     '(after %d ms), then dropped', [Elapsed]));
 
-  // A live peer that merely has nothing to say: the client's pump
-  // answers the keepalive pings, so it outlives several idle bounds.
-  Cli := TWSClient.Create;
-  Cli.Connect(Format('ws://127.0.0.1:%d/', [LimPort]));
-  Rounds := 0;
-  LastTick := GetTickCount64;
-  while GetTickCount64 - LastTick < 1500 do
-  begin
-    ReadRes := Cli.ReadMessage(IsText, Data, 100);
-    if ReadRes = wrrClosed then Break;
-    Inc(Rounds);
-  end;
-  Ok := Cli.Open;
+  // A host busy past the idle bound: the handler holds the connection's
+  // execution context for StallMs, so the check the sweeper posted when
+  // the ping fell due runs only after the idle deadline has lapsed too.
+  // The owed ping must go out first, with a fresh 600 ms answer window —
+  // a live peer the server never asked is not idle. The cue's echo comes
+  // first, so the ping behind it is the one owed across the stall (a
+  // ping ahead of it means the cue reached the handler too late to test
+  // anything). The pong is held PongDelayMs so the window itself is
+  // pinned, then the close handshake must be a clean 1000, not the idle
+  // 1001.
+  LimSrvT.Srv.IdleTimeoutMs := KeepaliveIdleMs;
+  Fd := RawConnect(LimPort);
+  KBuf := RawHandshake(Fd); // a ping may ride in behind the 101
+  Start := GetTickCount64;
+  RawSendFrame(Fd, WS_OP_TEXT, StallCue, True);
+  ReadFrame(Fd, nil, KBuf, Op, Payload);
+  Ok := (Op = WS_OP_TEXT) and (Payload = StallCue);
+  Log := Format('first frame: %s', [DescribeFrame(Op, Payload)]);
   if Ok then
   begin
-    Cli.SendText(HelloProbe);
-    Ok := Cli.ReadMessage(IsText, Data) and IsText and
-      (Length(Data) = Length(HelloProbe)) and
-      CompareMem(@Data[0], @HelloProbe[1], Length(HelloProbe));
-    Cli.Close(1000, 'done');
+    ReadFrame(Fd, nil, KBuf, Op, Payload);
+    Ok := Op = WS_OP_PING;
+    Log := Format('frame after the stall began: %s after %d ms',
+      [DescribeFrame(Op, Payload), GetTickCount64 - Start]);
   end;
-  Cli.Free;
-  Check(Ok, 'quiet but live peer kept open by the 200 ms keepalive ' +
-    'for 1.5 s, then echoes');
+  if Ok then
+  begin
+    Sleep(PongDelayMs);
+    RawSendFrame(Fd, WS_OP_PONG, Payload, True);
+    RawSendFrame(Fd, WS_OP_CLOSE, #$03#$E8, True);
+    I := ReadCloseCode(Fd, nil, KBuf);
+    Ok := I = 1000;
+    Log := Log + Format(', close %d after %d ms', [I, GetTickCount64 - Start]);
+  end;
+  CloseSocket(Fd);
+  Check(Ok, Format('host busy %d ms past the idle bound pings the peer ' +
+    'and waits for a pong held %d ms (%s)', [StallMs - KeepaliveIdleMs,
+    PongDelayMs, Log]));
+
+  // A live peer that merely has nothing to say outlives three idle
+  // bounds by answering the keepalive pings, then echoes. The idle bound
+  // is 4x the ping interval here, so each pong has 600 ms from its ping
+  // leaving to be credited, where loopback needs well under 1 ms: the
+  // margin absorbs a shared CI runner descheduling either side (#80).
+  // A raw peer, so a failure prints when each ping arrived.
+  Fd := RawConnect(LimPort);
+  KBuf := RawHandshake(Fd); // a ping may ride in behind the 101
+  Log := '';
+  Pings := 0;
+  Start := GetTickCount64;
+  Ok := RawAnswerPings(Fd, KBuf, Start, 3 * KeepaliveIdleMs, Pings, Log, Op,
+    Payload);
+  if Ok then
+  begin
+    RawSendFrame(Fd, WS_OP_TEXT, HelloProbe, True);
+    // A ping may still cross the echo; it gets a full idle bound.
+    RawAnswerPings(Fd, KBuf, Start, Integer(GetTickCount64 - Start) +
+      KeepaliveIdleMs, Pings, Log, Op, Payload);
+    Ok := (Op = WS_OP_TEXT) and (Payload = HelloProbe);
+    RawSendFrame(Fd, WS_OP_CLOSE, #$03#$E8, True);
+    ReadCloseCode(Fd, nil, KBuf);
+  end;
+  CloseSocket(Fd);
+  LimSrvT.Srv.IdleTimeoutMs := 600;
+  if Ok then Log := '' else Log := '; frames, ms since upgrade:' + Log;
+  Check(Ok, Format('quiet but live peer outlives three %d ms idle bounds ' +
+    'on the 200 ms keepalive (%d pings answered), then echoes%s',
+    [KeepaliveIdleMs, Pings, Log]));
 
   // A peer that floods echo requests and never reads: with a 4 KiB
   // receive window on its side the server's egress stalls, and the
