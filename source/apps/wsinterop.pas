@@ -7,7 +7,8 @@ program wsinterop;
 // section covering the single-port OnPlainRequest fallback, an
 // upgrade-hook section (a server bound to 127.0.0.1 explicitly whose
 // OnUpgradeRequest vetoes one Origin with a 403 and treats a raising
-// hook the same way), and a
+// hook the same way), a handshake-size section (an oversized request
+// header block answered 431, a client path past 2 KiB upgraded), and a
 // concurrent-connections stress section — 33 client threads (28 echo,
 // 4 abrupt-drop, 1 pusher) of echo/burst/clean-close cycles racing
 // abrupt raw-socket drops and server-initiated pushes, ended by a
@@ -2497,6 +2498,79 @@ begin
   Gate.Free;
 end;
 
+procedure RunHandshakeSizeSection;
+const
+  // WS.Server's HandshakeMaxBytes, plus one: the cap trips on the very
+  // read that brings the last byte, so the server has consumed the whole
+  // request and closes with a FIN, never an RST that could discard the
+  // 431 still sitting in our receive buffer.
+  OversizedRequestBytes = 16 * 1024 + 1;
+  LongPathBytes = 5000;
+var
+  Sizes: TLimitsHost;
+  SizeSrvT: TServerThread;
+  SizePort: Word;
+  Req, Got: RawByteString;
+  HdrEnd, Opens, Closes: Integer;
+begin
+  // --- handshake size: no silent truncation, no silent drop --------------
+  // Its own server with open/close counters: the oversized request must
+  // reach neither OnOpen nor OnClientClose.
+  StressPhase := 'handshake-size section';
+  Sizes := TLimitsHost.Create;
+  SizeSrvT := TServerThread.Create(True);
+  SizeSrvT.Srv := TWSServer.Create(0, True);
+  SizeSrvT.Srv.OnMessage := Sizes.OnMsg;
+  SizeSrvT.Srv.OnOpen := Sizes.HandleOpen;
+  SizeSrvT.Srv.OnClientClose := Sizes.HandleClose;
+  SizePort := SizeSrvT.Srv.Port;
+  SizeSrvT.Start;
+
+  // A request line that never ends, one byte past the cap: 431 with a
+  // truthful Content-Length, then EOF.
+  Fd := RawConnect(SizePort);
+  Req := 'GET /' + StringOfChar('a', OversizedRequestBytes - 5);
+  fpSend(Fd, @Req[1], Length(Req), 0);
+  Got := RawReadToEof(Fd, Eof);
+  CloseSocket(Fd);
+  HdrEnd := HandshakeFindEnd(Got);
+  Check((Copy(Got, 1, 44) = 'HTTP/1.1 431 Request Header Fields Too Large')
+    and Eof and (HdrEnd > 0) and
+    (HeaderValue(Got, 'Content-Length') = IntToStr(Length(Got) - HdrEnd)),
+    'oversized request -> 431 with a truthful Content-Length, then EOF');
+
+  // The issue's reproduction: a path past the builders' 2 KiB stack
+  // buffer used to go out without its blank line and hang both sides.
+  Cli := TWSClient.Create;
+  Cli.Connect(Format('ws://127.0.0.1:%d/?token=%s',
+    [SizePort, StringOfChar('t', LongPathBytes)]));
+  Cli.SendText(HelloProbe);
+  Check(Cli.ReadMessage(IsText, Data) and IsText and
+    (Length(Data) = Length(HelloProbe)) and
+    CompareMem(@Data[0], @HelloProbe[1], Length(HelloProbe)),
+    'client path longer than 2 KiB -> 101, echo');
+  Cli.Close(1000, 'done');
+  Cli.Free;
+
+  Deadline := GetTickCount64 + 3000;
+  repeat
+    Sizes.Snapshot(Opens, Closes);
+    if Closes >= 1 then Break;
+    Sleep(10);
+  until GetTickCount64 > Deadline;
+  Check((Opens = 1) and (Closes = 1),
+    Format('431 refusal fired no OnOpen / OnClientClose (%d/%d)',
+    [Opens, Closes]));
+
+  StressPhase := 'handshake-size section: teardown';
+  SizeSrvT.Terminate;
+  SizeSrvT.Srv.Stop;
+  SizeSrvT.WaitFor;
+  SizeSrvT.Srv.Free;
+  SizeSrvT.Free;
+  Sizes.Free;
+end;
+
 procedure RunServerTlsSection;
 {$ifdef LINUX}
 var
@@ -3173,6 +3247,7 @@ begin
   RunEgressSection(Port, StressPhase);
   RunPlainRequestSection;
   RunUpgradeHookSection;
+  RunHandshakeSizeSection;
   RunLimitsSection(StressPhase);
   RunCloseHandlerSection(StressPhase);
   RunServerTlsSection;

@@ -271,8 +271,9 @@ The contract mirrors `OnPlainRequest`:
   same 403 goes out, so one misbehaving handler cannot leak the
   connection or take down the transport's execution context.
 - **Malformed requests never reach it** — they keep the standard 400 (or
-  `OnPlainRequest`, when eligible). Unset, every well-formed upgrade is
-  accepted, exactly as before the hook existed.
+  `OnPlainRequest`, when eligible), and a header block past the server's
+  16 KiB cap gets `431 Request Header Fields Too Large`. Unset, every
+  well-formed upgrade is accepted, exactly as before the hook existed.
 - **Threading.** Same as every other callback: the connection's
   execution context (ADR-0003).
 

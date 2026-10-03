@@ -68,7 +68,10 @@ Four nets, from innermost to outermost:
    ping → 1002, invalid UTF-8 → 1007), an upgrade-hook section (a server
    bound to `127.0.0.1` explicitly whose `OnUpgradeRequest` refuses one
    `Origin` with a 403 — no `OnOpen`, no `OnClientClose` — and treats a
-   raising hook the same way), a plaintext egress-backpressure probe
+   raising hook the same way), a handshake-size section (a request
+   header block past the 16 KiB cap gets `431 Request Header Fields Too
+   Large`, and a client path longer than 2 KiB still upgrades), a
+   plaintext egress-backpressure probe
    (a stalled reader backs the server's egress up — on Linux forcing the
    epoll gather write short mid-message; eight 1 MiB echoes must still
    arrive intact and in order), and — on Linux — a `wss://` section
