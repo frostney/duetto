@@ -33,6 +33,12 @@ uses
   WS.Handshake,
   WS.Utf8;
 
+const
+  // Default cap on one reassembled (and inflated) message, in bytes; a
+  // peer that exceeds it is failed with 1009. TWSProtocol, TWSClient and
+  // TWSServer all default to it.
+  WS_DEFAULT_MAX_MESSAGE = 16 * 1024 * 1024;
+
 type
   TWSRole = (wsrServer, wsrClient);
 
@@ -109,7 +115,7 @@ type
     function DeliverMessage(P: PByte; ALen: NativeInt): Boolean;
   public
     constructor Create(ARole: TWSRole; const ADeflate: TWSDeflateParams;
-      AMaxMessage: NativeInt = 16 * 1024 * 1024);
+      AMaxMessage: NativeInt = WS_DEFAULT_MAX_MESSAGE);
     destructor Destroy; override;
 
     // Feed bytes read from the socket. Mutates the buffer (see the unit

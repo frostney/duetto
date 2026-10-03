@@ -38,8 +38,17 @@ Echo server (Linux, macOS, Windows) and probe, from the shipped programs:
 lwpt build
 ./build/wsecho --port=9001                       # echo server
 ./build/wsprobe ws://localhost:9001/ --deflate   # client probe vs any server
-./build/wsecho --pkcs12=id.p12 --pkcs12-pass=x   # wss:// (native on every platform)
+./build/wsecho --pkcs12=id.p12 --pkcs12-pass-file=id.pass   # wss:// (native on every platform)
 ```
+
+`wsecho --bind=127.0.0.1` (or `::1`) listens on one interface instead of
+all of them. The passphrase comes from a file or from `WSECHO_PKCS12_PASS`,
+so it stays out of the command line `ps` shows every local user. Set the
+variable from a supervisor: typed inline at an interactive shell, it lands
+in shell history. `--pkcs12-pass=SECRET` still works but is the insecure
+form.
+See
+[docs/deployment.md](docs/deployment.md#serving-wss-with-wsecho).
 
 For the full program set (`wsinterop`, `wsbench`, `wsautobahn`) and every
 development command, see [docs/quick-start.md](docs/quick-start.md) and
