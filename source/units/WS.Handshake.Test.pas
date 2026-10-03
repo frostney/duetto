@@ -18,7 +18,10 @@
   helpers the hook contract exposes: HeaderValue's list join and
   blank-line stop, and the byte-exact standard refusal. Plus what
   TWSServer.OnUpgradeRequest adds: the Origin header parsed alongside
-  Host (empty when absent) and the byte-exact 403 refusal. }
+  Host (empty when absent) and the byte-exact 403 refusal. Plus the
+  builders past their 2 KiB stack buffer: a long request path and a long
+  refusal reason come out whole, with a truthful Content-Length, and the
+  incremental end-of-headers scan the server runs per read. }
 
 program WS.Handshake.Test;
 
@@ -57,6 +60,7 @@ type
     procedure TestCaseAndTokenLists;
     procedure TestRejectionMatrix;
     procedure TestFindEnd;
+    procedure TestFindEndIncremental;
   end;
 
   TClientRole = class(TTestSuite)
@@ -105,6 +109,15 @@ type
     procedure TestOriginParsed;
     procedure TestOriginAbsent;
     procedure TestForbiddenGoldenBytes;
+    procedure TestTooLargeGoldenBytes;
+  end;
+
+  TLongContent = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestLongPathRequest;
+    procedure TestLongReasonReject;
+    procedure TestBuilderBoundary;
   end;
 
   TDeflateNegotiation = class(TTestSuite)
@@ -217,6 +230,34 @@ begin
   S := S + 'EXTRA BYTES AFTER';
   Expect<Integer>(HandshakeFindEnd(PByte(PAnsiChar(S)), Length(S)))
     .ToBe(Length(S) - Length('EXTRA BYTES AFTER'));
+end;
+
+// The server's per-read form: feeding the request one byte at a time
+// (AScanned = what the previous read left) must land on the same offset
+// as a whole-buffer scan, wherever the CRLFCRLF straddles a read.
+procedure TServerParse.TestFindEndIncremental;
+var
+  S: AnsiString;
+  I, Found: Integer;
+begin
+  S := RFCRequest + 'FRAME BYTES';
+  Found := 0;
+  for I := 1 to Length(S) do
+  begin
+    Found := HandshakeFindEnd(PByte(PAnsiChar(S)), I, I - 1);
+    if Found > 0 then Break;
+  end;
+  Expect<Integer>(Found).ToBe(Length(RFCRequest));
+  // Two reads, split at every offset of the terminator and around it.
+  for I := Length(RFCRequest) - 5 to Length(RFCRequest) + 1 do
+  begin
+    Found := HandshakeFindEnd(PByte(PAnsiChar(S)), I, 0);
+    if Found = 0 then
+      Found := HandshakeFindEnd(PByte(PAnsiChar(S)), Length(S), I);
+    Expect<Integer>(Found).ToBe(Length(RFCRequest));
+  end;
+  // Nothing new past what was scanned: no match, no read past ALen.
+  Expect<Integer>(HandshakeFindEnd(PByte(PAnsiChar(S)), 10, 20)).ToBe(0);
 end;
 
 { ───────── client role ───────── }
@@ -654,6 +695,79 @@ begin
     'origin not allowed');
 end;
 
+// RFC 6585 §5: the server's answer to a header block over its cap.
+procedure TRawBlockHelpers.TestTooLargeGoldenBytes;
+begin
+  Expect<string>(string(ServerBuildReject(431, 'too large'))).ToBe(
+    'HTTP/1.1 431 Request Header Fields Too Large' + CRLF +
+    'Connection: close' + CRLF +
+    'Content-Length: 9' + CRLF +
+    'Content-Type: text/plain' + CRLF + CRLF +
+    'too large');
+end;
+
+{ ───────── content past the builder's stack buffer ───────── }
+
+// A JWT in the query string is the everyday long path. The request used
+// to be clamped at 2 KiB, losing its terminating blank line, so both
+// sides waited forever.
+procedure TLongContent.TestLongPathRequest;
+var
+  Path, Req: string;
+  HS: TWSServerHandshake;
+begin
+  Path := '/socket?token=' + StringOfChar('a', 5000);
+  Req := ClientBuildRequest('localhost:9001', Path,
+    'dGhlIHNhbXBsZSBub25jZQ==', True);
+  Expect<Boolean>(Length(Req) > 5000).ToBe(True);
+  Expect<string>(Copy(Req, Length(Req) - 3, 4)).ToBe(CRLF + CRLF);
+  Expect<Integer>(HandshakeFindEnd(Req)).ToBe(Length(Req));
+  Expect<Boolean>(ServerParseRequest(Req, True, HS)).ToBe(True);
+  Expect<string>(HS.Path).ToBe(Path);
+  Expect<string>(HS.Host).ToBe('localhost:9001');
+  Expect<Boolean>(HS.Deflate.Enabled).ToBe(True);
+end;
+
+// A long OnUpgradeRequest reason: the body arrives whole, and
+// Content-Length counts exactly the bytes that follow the blank line.
+procedure TLongContent.TestLongReasonReject;
+var
+  Reason, Resp, Body: string;
+  HdrEnd: Integer;
+begin
+  Reason := StringOfChar('r', 3000) + ' denied';
+  Resp := string(ServerBuildReject(403, Reason));
+  HdrEnd := HandshakeFindEnd(Resp);
+  Expect<Boolean>(HdrEnd > 0).ToBe(True);
+  Body := Copy(Resp, HdrEnd + 1, MaxInt);
+  Expect<string>(Body).ToBe(Reason);
+  Expect<string>(HeaderValue(Resp, 'Content-Length'))
+    .ToBe(IntToStr(Length(Body)));
+end;
+
+// Every length across the 2048-byte stack buffer and the first doubling
+// must equal plain concatenation byte for byte: an off-by-one at the
+// spill would drop or duplicate a byte right at the boundary.
+procedure TLongContent.TestBuilderBoundary;
+var
+  N: Integer;
+  Reason, Expected: string;
+  Mismatches: Integer;
+begin
+  Mismatches := 0;
+  for N := 1900 to 4200 do
+  begin
+    Reason := StringOfChar('x', N);
+    Expected := 'HTTP/1.1 400 Bad Request' + CRLF +
+      'Connection: close' + CRLF +
+      'Content-Length: ' + IntToStr(N) + CRLF +
+      'Content-Type: text/plain' + CRLF + CRLF + Reason;
+    if string(ServerBuildReject(400, Reason)) <> Expected then
+      Inc(Mismatches);
+  end;
+  Expect<Integer>(Mismatches).ToBe(0);
+end;
+
 { ───────── deflate negotiation ───────── }
 
 procedure TDeflateNegotiation.TestPlainOffer;
@@ -724,6 +838,7 @@ begin
   Test('header case + Connection token list',    TestCaseAndTokenLists);
   Test('rejection matrix',                       TestRejectionMatrix);
   Test('HandshakeFindEnd partial/exact/overrun', TestFindEnd);
+  Test('HandshakeFindEnd resumes per read',      TestFindEndIncremental);
 end;
 
 procedure TClientRole.SetupTests;
@@ -769,6 +884,14 @@ begin
   Test('Origin parsed alongside Host',          TestOriginParsed);
   Test('absent Origin is the empty string',      TestOriginAbsent);
   Test('403 refusal is byte-identical',          TestForbiddenGoldenBytes);
+  Test('431 refusal is byte-identical',          TestTooLargeGoldenBytes);
+end;
+
+procedure TLongContent.SetupTests;
+begin
+  Test('long request path built whole',         TestLongPathRequest);
+  Test('long reason: truthful Content-Length',   TestLongReasonReject);
+  Test('builder exact across the 2 KiB spill',   TestBuilderBoundary);
 end;
 
 procedure TDeflateNegotiation.SetupTests;
@@ -787,6 +910,7 @@ begin
   TestRunnerProgram.AddSuite(TPlainClassification.Create('Handshake: plain classification'));
   TestRunnerProgram.AddSuite(TRawBlockHelpers.Create('Handshake: raw-block helpers'));
   TestRunnerProgram.AddSuite(TDeflateNegotiation.Create('Handshake: deflate negotiation'));
+  TestRunnerProgram.AddSuite(TLongContent.Create('Handshake: long content'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.
