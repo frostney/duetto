@@ -420,9 +420,9 @@ type
     // rather than keeping it; it is nil when the raised object is not
     // an Exception. Unset, the exception is dropped once the connection
     // has been closed. An exception escaping OnError itself — AError
-    // rethrown included — is swallowed. OnUpgradeRequest and OnPlainRequest are not covered:
-    // a raising hook there is a refusal, as documented on each, and
-    // does not reach OnError.
+    // rethrown included — is swallowed. OnUpgradeRequest and
+    // OnPlainRequest are not covered: a raising hook there is a
+    // refusal, as documented on each, and does not reach OnError.
     property OnError: TWSServerError read FOnError write FOnError;
     // Opt-in single-port fallback: fired for a well-formed, body-less
     // HTTP request (GET or HEAD without Content-Length or
@@ -941,6 +941,13 @@ end;
 
 procedure TWSServer.DrainThenDrop(AConn: TWSConnection);
 begin
+  // No protocol object yet (a sweeper post faulting mid-handshake):
+  // nothing queued to drain.
+  if AConn.FProto = nil then
+  begin
+    DropConn(AConn);
+    Exit;
+  end;
   // If a prior send is still in flight the transport takes nothing now —
   // the drop waits for OnSendReady to drain the queue, or the final
   // bytes never reach the wire (races the 101 on fast loopback).
