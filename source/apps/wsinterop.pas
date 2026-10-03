@@ -2016,9 +2016,6 @@ begin
   Result := True;
 end;
 
-// One TWSClient with OnMessage against one TFailingPeer. The client must
-// echo the valid message ahead of the 1002 close the RSV2 frame provokes,
-// and answer nothing after it (no pong for the trailing ping).
 // A listening socket on 127.0.0.1 at a kernel-assigned port; -1 when
 // any step fails (the socket is then already closed).
 function OpenLoopbackListener(out APort: Word): Tsocket;
@@ -2041,6 +2038,9 @@ begin
   APort := ntohs(SA.sin_port);
 end;
 
+// One TWSClient with OnMessage against one TFailingPeer. The client must
+// echo the valid message ahead of the 1002 close the RSV2 frame provokes,
+// and answer nothing after it (no pong for the trailing ping).
 procedure RunFailingPeerCase(APipelined: Boolean; const ALabel: string);
 var
   Listener: Tsocket;
