@@ -5,7 +5,8 @@ program wsinterop;
 // violations a conforming client cannot produce and asserts the close
 // codes RFC 6455 (and Autobahn cases 4.x/7.x) require, a client-delivery
 // section (a raw peer playing Autobahn 3.2 at TWSClient: the OnMessage
-// echo must leave ahead of the 1002 close), a plain-request
+// echo must leave ahead of the 1002 close; Close from the handler
+// completes and ReadMessage from it raises), a plain-request
 // section covering the single-port OnPlainRequest fallback, an
 // upgrade-hook section (a server bound to 127.0.0.1 explicitly whose
 // OnUpgradeRequest vetoes one Origin with a 403 and treats a raising
@@ -1825,7 +1826,9 @@ var
 begin
   Inc(Calls);
   if ReadInside then
-    AClient.ReadMessage(IsText, Data) // must raise: the read is in progress
+    // Must raise: the read is in progress. The bounded form with nothing
+    // queued or readable is the case that would otherwise return quietly.
+    AClient.ReadMessage(IsText, Data, 0)
   else if CloseInside then
     AClient.Close(1000, 'handler done')
   else
@@ -1843,6 +1846,7 @@ var
   HS: TWSServerHandshake;
   Buf: array[0..4095] of Byte;
   Got: Integer;
+  Eof: Boolean;
 begin
   Fd := fpAccept(Listener, nil, nil);
   if Fd < 0 then
@@ -1884,15 +1888,7 @@ begin
     fpSend(Fd, @Raw[1], Length(Raw), 0);
 
     // Everything the client answers, up to its hang-up.
-    Received := '';
-    repeat
-      Got := fpRecv(Fd, @Buf[0], SizeOf(Buf), 0);
-      if Got > 0 then
-      begin
-        SetLength(Received, Length(Received) + Got);
-        Move(Buf[0], Received[Length(Received) - Got + 1], Got);
-      end;
-    until Got <= 0;
+    Received := RawReadToEof(Fd, Eof);
   finally
     CloseSocket(Fd);
   end;
@@ -1933,11 +1929,32 @@ end;
 // One TWSClient with OnMessage against one TFailingPeer. The client must
 // echo the valid message ahead of the 1002 close the RSV2 frame provokes,
 // and answer nothing after it (no pong for the trailing ping).
+// A listening socket on 127.0.0.1 at a kernel-assigned port; -1 when
+// any step fails (the socket is then already closed).
+function OpenLoopbackListener(out APort: Word): Tsocket;
+var
+  SA: TInetSockAddr;
+  Len: LongInt; // socklen_t on POSIX, int on WinSock: 32 bits on both
+begin
+  Result := fpSocket(AF_INET, SOCK_STREAM, 0);
+  if Result < 0 then Exit(-1);
+  FillChar(SA, SizeOf(SA), 0);
+  SA.sin_family := AF_INET;
+  SA.sin_addr.s_addr := htonl($7F000001);
+  Len := SizeOf(SA);
+  if (fpBind(Result, @SA, SizeOf(SA)) <> 0) or (fpListen(Result, 1) <> 0) or
+     (fpGetSockName(Result, @SA, @Len) <> 0) then
+  begin
+    CloseSocket(Result);
+    Exit(-1);
+  end;
+  APort := ntohs(SA.sin_port);
+end;
+
 procedure RunFailingPeerCase(APipelined: Boolean; const ALabel: string);
 var
   Listener: Tsocket;
-  SA: TInetSockAddr;
-  Len: LongInt;
+  PeerPort: Word;
   Peer: TFailingPeer;
   Handler: TClientEcho;
   Client: TWSClient;
@@ -1947,39 +1964,54 @@ var
   Payloads: array[0..3] of RawByteString;
   Count: Integer;
   Split: Boolean;
+  ClientError: string;
 begin
-  Listener := fpSocket(AF_INET, SOCK_STREAM, 0);
-  FillChar(SA, SizeOf(SA), 0);
-  SA.sin_family := AF_INET;
-  SA.sin_port := 0; // kernel-assigned
-  SA.sin_addr.s_addr := htonl($7F000001);
-  fpBind(Listener, @SA, SizeOf(SA));
-  fpListen(Listener, 1);
-  Len := SizeOf(SA);
-  fpGetSockName(Listener, @SA, @Len);
-
+  Listener := OpenLoopbackListener(PeerPort);
+  if Listener < 0 then
+  begin
+    Check(False, ALabel + ' (no loopback listener)');
+    Exit;
+  end;
   Peer := TFailingPeer.Create(True);
   Peer.Listener := Listener;
   Peer.Pipelined := APipelined;
   Peer.Start;
   Handler := TClientEcho.Create;
+  ClientError := '';
   Client := TWSClient.Create;
   try
-    Client.OnMessage := Handler.Echo;
-    Client.Connect(Format('ws://127.0.0.1:%d/', [ntohs(SA.sin_port)]));
-    // With the handler set ReadMessage only pumps, until the failure.
-    while Client.ReadMessage(IsText, Data) do ;
-    Client.Close; // releases the socket: the peer sees its hang-up
+    try
+      Client.OnMessage := Handler.Echo;
+      Client.Connect(Format('ws://127.0.0.1:%d/', [PeerPort]));
+      // With the handler set ReadMessage only pumps, until the failure.
+      while Client.ReadMessage(IsText, Data) do ;
+      Client.Close; // releases the socket: the peer sees its hang-up
+    except
+      on E: Exception do
+        ClientError := E.ClassName + ': ' + E.Message;
+    end;
   finally
     Client.Free;
-    Peer.WaitFor;
-    CloseSocket(Listener);
   end;
+  if ClientError <> '' then
+  begin
+    // The check below fails on it. A client that died before the peer
+    // accepted would leave the peer in accept: a throwaway connection
+    // releases it (it then fails on the empty request).
+    WriteLn('       client: ', ClientError);
+    try
+      CloseSocket(RawConnectEx(PeerPort, False));
+    except
+      // the peer accepted earlier; nothing to release
+    end;
+  end;
+  Peer.WaitFor;
+  CloseSocket(Listener);
 
   Split := SplitClientFrames(Peer.Received, Opcodes, Payloads, Count);
   if Peer.Failure <> '' then
     WriteLn('       peer: ', Peer.Failure);
-  Check((Peer.Failure = '') and Split and (Count = 2) and
+  Check((ClientError = '') and (Peer.Failure = '') and Split and (Count = 2) and
     (Handler.Calls = 1) and
     (Opcodes[0] = WS_OP_TEXT) and (Payloads[0] = FailingPeerMessage) and
     (Opcodes[1] = WS_OP_CLOSE) and (Length(Payloads[1]) >= 2) and
@@ -1990,8 +2022,9 @@ begin
 end;
 
 // What the handler may do besides sending, against the echo server at
-// AUrl: Close starts the handshake and the pumping ReadMessage finishes
-// it; ReadMessage raises and ends the connection.
+// AUrl: Close sends the close frame and the pumping ReadMessage sees the
+// handshake through; ReadMessage (here the bounded form) raises and ends
+// the connection.
 procedure RunClientHandlerCalls(const AUrl: string);
 var
   Handler: TClientEcho;
@@ -2024,7 +2057,9 @@ begin
     Client.SendText('read from the handler');
     Raised := False;
     try
-      Client.ReadMessage(IsText, Data);
+      // Bounded, so a handler that returned quietly fails the check
+      // below instead of parking the battery on the idle connection.
+      Client.ReadMessage(IsText, Data, 2000);
     except
       on EWSClient do Raised := True;
     end;

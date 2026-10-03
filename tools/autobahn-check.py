@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Judge an Autobahn testsuite run from its index.json.
 
-usage: autobahn-check.py [--direction {client,server}] <reports-dir>/index.json
-
 --direction names which side of duetto the report judges: `client` for
 the fuzzingserver run against wsautobahn, `server` for the fuzzingclient
 run against wsecho. It is printed with the verdict, so a log says which
@@ -34,7 +32,8 @@ OK_CLOSE = {"OK", "INFORMATIONAL", "UNIMPLEMENTED"}
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Judge an Autobahn testsuite run from its index.json.")
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--direction", choices=("client", "server"),
                         help="which side of duetto the report judges")
     parser.add_argument("index", help="<reports-dir>/index.json")

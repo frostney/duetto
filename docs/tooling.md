@@ -65,8 +65,10 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
   plus NON-STRICT in the server direction only — and `behaviorClose`
   OK / INFORMATIONAL / UNIMPLEMENTED; anything else fails the run.
   `tools/autobahn.sh` passes the direction it ran, and the verdict line
-  names it. Neither direction currently has a NON-STRICT case; the client
-  direction fails on one so the gap closed by duetto#72 cannot reopen.
+  names it; without `--direction` the server-direction rules apply and
+  the verdict line says `unspecified`. Neither direction currently has a
+  NON-STRICT case; the client direction fails on one so the gap closed by
+  duetto#72 cannot reopen.
 
 ## Benchmarks
 

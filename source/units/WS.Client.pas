@@ -82,6 +82,7 @@ type
     function PumpOnce: Boolean;
     function WaitReadable(ATimeoutMs: Integer): Boolean;
     procedure PopMessage(out AText: Boolean; out AData: TBytes); inline;
+    procedure RefuseReadInHandler; inline;
   public
     constructor Create;
     destructor Destroy; override;
@@ -143,8 +144,9 @@ type
     // Connect so messages pipelined behind the 101 take this path too.
     //
     // SendText, SendBinary and Ping work from inside the handler. Close
-    // there only starts the closing handshake; the call that is reading
-    // finishes it. ReadMessage raises EWSClient there (the read in
+    // there only sends the close frame; the echo is awaited by the reads
+    // that follow, or by a later Close, which waits for it (bounded) as
+    // usual. Either ReadMessage raises EWSClient there (the read in
     // progress cannot be re-entered). An exception escaping the handler
     // propagates out of the call that was reading (ReadMessage, Connect
     // or Close) and ends the connection: the rest of that read is lost.
@@ -500,10 +502,6 @@ function TWSClient.PumpOnce: Boolean;
 var
   Got: Integer;
 begin
-  // Ingest is not re-entrant, and FRecvBuf is what the running handler
-  // may be looking at.
-  if FDelivering then
-    raise EWSClient.Create('cannot read from inside OnMessage');
   Result := False;
   Got := RawRead(@FRecvBuf[0], Length(FRecvBuf));
   if Got <= 0 then
@@ -587,8 +585,17 @@ begin
   end;
 end;
 
+procedure TWSClient.RefuseReadInHandler;
+begin
+  // Ingest is not re-entrant, and FRecvBuf is what the running handler
+  // may be looking at.
+  if FDelivering then
+    raise EWSClient.Create('cannot read from inside OnMessage');
+end;
+
 function TWSClient.ReadMessage(out AText: Boolean; out AData: TBytes): Boolean;
 begin
+  RefuseReadInHandler;
   while FQHead = FQTail do
   begin
     if not FOpen then Exit(False);
@@ -604,6 +611,7 @@ var
   Deadline: QWord;
   Remaining: Int64;
 begin
+  RefuseReadInHandler;
   // Already queued: no clock, no poll, no syscall.
   if FQHead <> FQTail then
   begin
@@ -681,8 +689,8 @@ begin
   if FDelivering then
   begin
     // Inside OnMessage the read below us is still running and cannot be
-    // re-entered to wait for the echo: start the handshake and let that
-    // read's caller finish it.
+    // re-entered to wait for the echo: send the close frame and leave the
+    // echo to the reads that follow, or to a later Close.
     if FOpen then
     begin
       FProto.SendClose(ACode, AReason);
@@ -690,9 +698,11 @@ begin
     end;
     Exit;
   end;
-  if FOpen and not FProto.CloseSent then
+  // CloseDone, not CloseSent: a close sent from inside OnMessage still
+  // gets its bounded wait for the echo here.
+  if FOpen and not FProto.CloseDone then
   begin
-    FProto.SendClose(ACode, AReason);
+    FProto.SendClose(ACode, AReason); // no-op once a close went out
     FlushOut;
     // Bounded wait for the peer's close echo; then drop TCP regardless.
     Spins := 0;

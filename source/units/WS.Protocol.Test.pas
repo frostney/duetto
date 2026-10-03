@@ -1234,9 +1234,9 @@ end;
 
 // Autobahn 3.2 in the client role: a valid message, an RSV2 frame and a
 // ping in one read. A reply made from inside OnMessage is queued ahead of
-// the 1002 close the violation provokes, and nothing follows the close
-// (duetto#72: the client used to queue the message and send the close
-// before its application could answer).
+// the 1002 close the violation provokes, and nothing follows the close.
+// This pins the ordering TWSClient.OnMessage relies on (duetto#72); the
+// client-level regression check is wsinterop's client-delivery section.
 procedure TProtoDelivery.TestReplyBeforeFailClose;
 var
   C: TWSProtocol;
