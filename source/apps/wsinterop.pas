@@ -366,9 +366,12 @@ end;
 { TLimitsHost }
 
 const
+  // The limits section's close-budget case runs where the peer sees the
+  // drop through the server's RST: epoll (Linux) and IOCP (Windows).
+  LimitsCloseBudgetCase = {$if defined(LINUX) or defined(WINDOWS)}True
+    {$else}False{$endif};
   // Sessions the limits section opens; each must see one OnClientClose.
-  // Linux adds the close-budget case that needs a closed socket's RST.
-  LimitsOpens = {$ifdef LINUX}8{$else}7{$endif};
+  LimitsOpens = 7 + Ord(LimitsCloseBudgetCase);
 
 const
   CloseCue = 'close-me';
@@ -3300,10 +3303,10 @@ begin
   // come back than went in, and the connection ends. How the flood's
   // own sends fare differs — epoll resets at once so they fail
   // part-way, Network.framework stops reading so they block (hence the
-  // send bound), IOCP keeps draining input behind its FIN so they all
-  // land — and the transport's 300 ms close drain (a close deferred
-  // behind a send the peer never takes) bounds the end on the transports
-  // that defer.
+  // send bound), IOCP reads and drops input behind its close so they
+  // land until its drain ends — and the transport's 300 ms close drain
+  // (a close deferred behind a send the peer never takes, or a FIN the
+  // peer never answers) bounds the end on the transports that defer.
   // Idle and ping off for this case, so only the cap (and the close
   // drain behind it) can end the connection: the idle bound must not be
   // what passes it.
@@ -3329,13 +3332,17 @@ begin
     'after the flood)', [SentBytes div 1024, Length(Got) div 1024,
     Elapsed]));
 
-{$ifdef LINUX}
   // A peer that sends Close, never reads the echo, and keeps sending:
   // the echo is stuck behind megabytes of queued output (the cap is off
   // here so the queue can build), so the server drains it under the
   // 300 ms CloseTimeoutMs — and the peer's later bytes must not restart
-  // that budget. Linux only: the peer sees the drop through the RST a
-  // closed Linux socket answers further data with.
+  // that budget. Linux and Windows: the peer sees the drop through the
+  // RST the server's socket answers further data with — at once on
+  // epoll, which closes outright; on IOCP only when the transport's own
+  // 300 ms close drain resets a close the peer never lets finish (it
+  // waits behind a send the peer is not taking, then for a FIN), so
+  // here the case also pins that drain deadline.
+{$if LimitsCloseBudgetCase}
   LimSrvT.Srv.MaxPendingOutput := 0;
   Fd := RawUpgraded(LimPort, 4096);
   RawSetSendTimeout(Fd, 1000);

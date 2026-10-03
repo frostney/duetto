@@ -181,7 +181,8 @@ toolchain built from the checksum-verified source tarball, ~2 minutes;
 pre-created). It is the fast pre-push loop for anything touching
 `WS.Transport.Iocp`, and it reproduces IOCP-specific behaviour the
 other transports do not show (a dropped connection keeps draining
-input behind its FIN, for one). It is not a substitute for the CI legs:
+input behind its FIN until its close-drain deadline, for one). It is
+not a substitute for the CI legs:
 real kernel, SChannel, and win64 only run there — Wine's SChannel is
 absent, so `wss://` stays untested locally, and win32 is the only Wine
 target because Wine's win64 needs a 64-bit userland the i386 image
