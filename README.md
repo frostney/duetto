@@ -43,8 +43,10 @@ lwpt build
 
 `wsecho --bind=127.0.0.1` (or `::1`) listens on one interface instead of
 all of them. The passphrase comes from a file or from `WSECHO_PKCS12_PASS`,
-so it stays out of the command line `ps` shows every local user and out of
-shell history; `--pkcs12-pass=SECRET` still works but is the insecure form.
+so it stays out of the command line `ps` shows every local user. Set the
+variable from a supervisor: typed inline at an interactive shell, it lands
+in shell history. `--pkcs12-pass=SECRET` still works but is the insecure
+form.
 See
 [docs/deployment.md](docs/deployment.md#serving-wss-with-wsecho).
 

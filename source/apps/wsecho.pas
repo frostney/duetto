@@ -6,7 +6,7 @@ program wsecho;
 //
 //   wsecho [--port=9001] [--bind=ADDRESS] [--no-deflate] [--quiet]
 //          [--pkcs12=FILE [--pkcs12-pass-file=PATH]]
-//   WSECHO_PKCS12_PASS=SECRET wsecho --pkcs12=FILE
+//   wsecho --pkcs12=FILE   (WSECHO_PKCS12_PASS set by a supervisor)
 //   wsecho --pkcs12=FILE --pkcs12-pass=SECRET   (insecure, see below)
 //
 // Prints "listening on <port>" once ready so harnesses can wait for it
@@ -24,10 +24,11 @@ program wsecho;
 // The PKCS#12 passphrase has three sources. --pkcs12-pass-file reads
 // it from a file or a pipe such as `<(pass show x)` (at most 4096 bytes,
 // one trailing newline stripped, so `echo secret > file` works) and
-// WSECHO_PKCS12_PASS from the environment; neither
-// lands in the argument list `ps` shows every local user, nor in shell
-// history. --pkcs12-pass=SECRET still works
-// but is the insecure form: every local user can read it in `ps`.
+// WSECHO_PKCS12_PASS from the environment; neither lands in the argument
+// list `ps` shows every local user. The variable belongs to a
+// supervisor: typed inline at an interactive shell it lands in shell
+// history. --pkcs12-pass=SECRET still works but is the insecure form:
+// every local user can read it in `ps`.
 // The two flags are mutually exclusive; either one overrides the
 // environment variable, and an empty variable counts as unset. Each
 // source names TLS intent, so without --pkcs12 every one of them is

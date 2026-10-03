@@ -85,10 +85,17 @@ safe shape:
   leaves a window in which other users can read it. The path can also be
   a pipe, such as `--pkcs12-pass-file=<(pass show wsecho)`, which keeps
   the secret off disk. The file may hold at most 4096 bytes.
-- `WSECHO_PKCS12_PASS` in the environment is the other safe source, for
-  a supervisor that injects secrets as variables (systemd's
-  `EnvironmentFile=`, a container runtime). An empty value counts as
-  unset.
+- `WSECHO_PKCS12_PASS` in the environment is the other source, for a
+  supervisor or container runtime that injects secrets as variables. It
+  stays out of `ps`, but the environment passes to child processes and
+  the same user and root can read it through `/proc/<pid>/environ`, so
+  systemd advises against variables for secrets. Under systemd, load the
+  file as a credential instead:
+  `LoadCredential=wsecho.pass:/etc/wsecho/id.pass` with
+  `--pkcs12-pass-file=${CREDENTIALS_DIRECTORY}/wsecho.pass` in
+  `ExecStart=`. Set the variable from the supervisor, not inline at an
+  interactive shell, where it lands in shell history. An empty value
+  counts as unset.
 - `--pkcs12-pass=SECRET` is the insecure form: every local user can read
   it in `ps`, and it lands in shell history. It remains for throwaway
   test identities.
