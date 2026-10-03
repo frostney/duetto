@@ -41,6 +41,66 @@ Browser-facing consumers also need to serve the page that opens the
 WebSocket — duetto deliberately doesn't do that; see the
 [companion HTTP recipe](companion-http.md).
 
+## Server limits for production hosts
+
+`TWSServer`'s defaults keep connections, idle time and keepalive
+unbounded, because idle connections are legitimate for many hosts. A
+server that untrusted peers can reach should set its limits explicitly.
+[Server resource bounds](architecture.md#server-resource-bounds) describes
+what each one does; this section says which to set. The values in the
+example are illustrations, not recommendations for every host:
+
+```pascal
+// A 1 MiB message cap instead of the 16 MiB default.
+Server := TWSServer.Create(9001, True, 1024 * 1024);
+Server.MaxConnections := 10000;
+Server.MaxPendingOutput := 4 * 1024 * 1024;
+Server.PingIntervalMs := 30000;
+Server.IdleTimeoutMs := 60000;
+Server.Run;
+```
+
+- **Message cap (`AMaxMessage`, constructor).** Set it to the largest
+  message your protocol needs. It bounds inbound messages, and
+  `MaxPendingOutput` defaults to four times it, so the 16 MiB default
+  allows 64 MiB of unsent output per connection.
+- **`MaxConnections`.** Set it. Unset, the process descriptor limit is the
+  only ceiling. Keep the limit (`ulimit -n`, or `LimitNOFILE=` under
+  systemd) above `MaxConnections` with headroom: connections still in a
+  transport close drain hold a descriptor but no longer count towards the
+  cap, and the transport holds a few descriptors of its own. Past the cap,
+  an accept is closed at once without a handshake.
+- **`MaxPendingOutput`.** Set it to how far a slow but healthy client may
+  fall behind. A non-reading peer can hold this much queued output, so
+  `MaxConnections × MaxPendingOutput` is the worst case for the session
+  out queues alone, before transport and TLS buffers.
+- **`PingIntervalMs` and `IdleTimeoutMs`.** Set both. Without them, a peer
+  that vanishes without closing TCP is noticed only when a send to it
+  fails, and a quiet connection can be cut by a proxy, load balancer or
+  NAT on the path. Keep `PingIntervalMs` below the shortest idle timeout
+  on that path. A pong has to arrive within `IdleTimeoutMs -
+  PingIntervalMs` of the ping falling due, so make that gap cover a worst
+  case round trip, the 100 ms sweep interval, and any time your handlers
+  hold the connection's execution context.
+- **`HandshakeTimeoutMs` and `CloseTimeoutMs`.** The 10 s defaults suit
+  most hosts. Lower them on a listener facing untrusted networks to
+  release stalled handshakes and non-reading peers sooner. Keep
+  `HandshakeTimeoutMs` above your slowest legitimate client's TLS
+  handshake plus HTTP upgrade, since on a TLS listener it covers both.
+- **`TWSTransportTls.HandshakeDeadlineMs`.** Defaults to 10 s. It bounds
+  the TLS handshake on epoll and IOCP and, on every transport, the
+  transport's close drain after the session has dropped a connection. A
+  peer that stops reading can therefore hold a descriptor for up to
+  `CloseTimeoutMs` plus this value. A plaintext listener on macOS sets it
+  by passing a record with `Enabled = False` to the TLS constructor
+  overload. The other `TWSTransportTls` fields bound per-connection TLS
+  buffers on epoll and IOCP; their defaults are documented in
+  `source/units/WS.Transport.pas`.
+
+The 16 KiB request header cap is fixed. A client whose upgrade request
+carries a larger header block, for example through large cookies a proxy
+forwards, gets `431 Request Header Fields Too Large`.
+
 ## Runtime dependencies
 
 Plain `ws://` deployments have none beyond the C runtime — the epoll,
