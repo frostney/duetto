@@ -233,9 +233,11 @@ above.
   the measured build (CI runs it via Docker on every push to main):
   fuzzingclient vs `wsecho` — 1034 cases, 812 OK, 6 informational,
   216 unimplemented (the deflate cases of the no-deflate agent);
-  fuzzingserver vs `wsautobahn` — 1034 cases, 798 OK, 14 non-strict,
-  6 informational, 216 unimplemented. Every case acceptable under
-  `tools/autobahn-check.py`.
+  fuzzingserver vs `wsautobahn` — 1034 cases, 812 OK, 6 informational,
+  216 unimplemented, re-run via Docker after duetto#72 removed the last
+  14 non-strict results. Every case acceptable under
+  `tools/autobahn-check.py`, which now rejects non-strict in the client
+  direction.
 
 ## Analytical comparison (not run locally — documentation and published numbers)
 

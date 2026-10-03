@@ -6,8 +6,9 @@ program wsautobahn;
 //
 // Speaks the fuzzingserver control protocol: fetch the case count from
 // /getCaseCount, run every case via /runCase?case=N&agent=A (echo each
-// data message verbatim until the server ends the connection), then ask
-// the server to write its report via /updateReports?agent=A.
+// data message verbatim, from the client's OnMessage handler, until the
+// server ends the connection), then ask the server to write its report
+// via /updateReports?agent=A.
 //
 // Exit 0 means the run completed; pass/fail per case is judged from the
 // generated report by tools/autobahn-check.py, not here — a protocol
@@ -42,13 +43,15 @@ end;
 // a full run. Retry with a fresh client per attempt — a failed Connect
 // leaves the instance unusable.
 function ConnectRetry(const AUrl: string; AOfferDeflate: Boolean;
-  AMaxMessage: NativeInt; AAttempts: Integer): TWSClient;
+  AMaxMessage: NativeInt; AAttempts: Integer;
+  AOnMessage: TWSClientMessage = nil): TWSClient;
 var
   Attempt: Integer;
 begin
   for Attempt := 1 to AAttempts do
   begin
     Result := TWSClient.Create;
+    Result.OnMessage := AOnMessage;
     try
       Result.Connect(AUrl, AOfferDeflate, AMaxMessage);
       Exit;
@@ -83,24 +86,50 @@ begin
   end;
 end;
 
+type
+  TCaseEcho = class
+    // Echoes from inside the read that completed the message, so the echo
+    // leaves ahead of the close a later frame in the same read provokes
+    // (cases 3.2, 4.1.3, 5.15 and friends send the valid message and the
+    // violating frame back to back).
+    procedure Echo(AClient: TWSClient; AText: Boolean; P: PByte;
+      Len: NativeInt);
+  end;
+
+procedure TCaseEcho.Echo(AClient: TWSClient; AText: Boolean; P: PByte;
+  Len: NativeInt);
+var
+  S: RawByteString;
+begin
+  if AText then
+  begin
+    SetLength(S, Len);
+    if Len > 0 then
+      Move(P^, S[1], Len);
+    AClient.SendText(S);
+  end
+  else
+    AClient.SendBinary(P, Len);
+end;
+
 procedure RunCase(const AServer, AAgent: string; ACase: Integer;
-  ADeflate: Boolean);
+  ADeflate: Boolean; AEcho: TCaseEcho);
 var
   Cli: TWSClient;
   IsText: Boolean;
   Data: TBytes;
 begin
+  // The handler must be in place before the handshake completes: the
+  // server may pipeline a case's first frames behind its 101, and
+  // ConnectRetry builds a fresh client per attempt, so it is wired there.
   Cli := ConnectRetry(Format('%s/runCase?case=%d&agent=%s', [AServer, ACase,
-    AAgent]), ADeflate, MaxCaseMessage, 15);
+    AAgent]), ADeflate, MaxCaseMessage, 15, AEcho.Echo);
   try
     try
+      // With OnMessage assigned ReadMessage only pumps; every message is
+      // echoed by the handler, so it returns once the case ends.
       while Cli.ReadMessage(IsText, Data) do
-        if IsText then
-          Cli.SendText(BytesToRaw(Data))
-        else if Length(Data) > 0 then
-          Cli.SendBinary(@Data[0], Length(Data))
-        else
-          Cli.SendBinary(nil, 0);
+        { unreachable: no message is queued while the handler is set };
       if Cli.Open then
         Cli.Close(1000);
     except
@@ -145,6 +174,7 @@ var
   Server, Agent: string;
   Deflate: Boolean;
   CaseCount, I: Integer;
+  CaseEcho: TCaseEcho;
 begin
   ServerOpt := TStringOption.Create('server',
     'Fuzzingserver control endpoint (default ws://127.0.0.1:9001)');
@@ -189,6 +219,7 @@ begin
   WriteLn('agent=', Agent, ' deflate=', Deflate, ' cases=', CaseCount);
   Flush(Output);
 
+  CaseEcho := TCaseEcho.Create;
   for I := 1 to CaseCount do
   begin
     if (I = 1) or (I mod 25 = 0) or (I = CaseCount) then
@@ -196,8 +227,9 @@ begin
       WriteLn('case ', I, '/', CaseCount);
       Flush(Output);
     end;
-    RunCase(Server, Agent, I, Deflate);
+    RunCase(Server, Agent, I, Deflate, CaseEcho);
   end;
+  CaseEcho.Free;
 
   UpdateReports(Server, Agent);
   WriteLn('done; reports updated for agent ', Agent);

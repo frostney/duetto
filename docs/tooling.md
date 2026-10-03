@@ -60,9 +60,15 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
   (agent `duetto`) and without (agent `duetto-nodeflate`).
 - The client direction runs `wsautobahn` twice: agent `duetto` and agent
   `duetto-deflate` (permessage-deflate offered).
-- `tools/autobahn-check.py` judges `index.json`: `behavior` must be
-  OK / NON-STRICT / INFORMATIONAL / UNIMPLEMENTED and `behaviorClose`
+- `tools/autobahn-check.py --direction={client|server}` judges
+  `index.json`: `behavior` must be OK / INFORMATIONAL / UNIMPLEMENTED —
+  plus NON-STRICT in the server direction only — and `behaviorClose`
   OK / INFORMATIONAL / UNIMPLEMENTED; anything else fails the run.
+  `tools/autobahn.sh` passes the direction it ran, and the verdict line
+  names it; without `--direction` the server-direction rules apply and
+  the verdict line says `unspecified`. Neither direction currently has a
+  NON-STRICT case; the client direction fails on one so the gap closed by
+  duetto#72 cannot reopen.
 
 ## Benchmarks
 
@@ -175,7 +181,8 @@ toolchain built from the checksum-verified source tarball, ~2 minutes;
 pre-created). It is the fast pre-push loop for anything touching
 `WS.Transport.Iocp`, and it reproduces IOCP-specific behaviour the
 other transports do not show (a dropped connection keeps draining
-input behind its FIN, for one). It is not a substitute for the CI legs:
+input behind its FIN until its close-drain deadline, for one). It is
+not a substitute for the CI legs:
 real kernel, SChannel, and win64 only run there — Wine's SChannel is
 absent, so `wss://` stays untested locally, and win32 is the only Wine
 target because Wine's win64 needs a 64-bit userland the i386 image
