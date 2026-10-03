@@ -87,14 +87,16 @@ Server.Run;
   release stalled handshakes and non-reading peers sooner. Keep
   `HandshakeTimeoutMs` above your slowest legitimate client's TLS
   handshake plus HTTP upgrade, since on a TLS listener it covers both.
+  Do not set `CloseTimeoutMs` to 0 on such a listener: a non-reading
+  peer would then hold its connection in the session indefinitely.
 - **`TWSTransportTls.HandshakeDeadlineMs`.** Defaults to 10 s. It bounds
   the TLS handshake on epoll and IOCP, and the transport's close drain
   after the session has dropped a connection: TLS connections on epoll and
   IOCP, any close deferred behind a send on macOS. A peer that stops
   reading can therefore hold a descriptor for up to `CloseTimeoutMs` plus
-  this value. A plaintext listener on macOS sets it
-  by passing a record with `Enabled = False` to the TLS constructor
-  overload. The other `TWSTransportTls` fields bound per-connection TLS
+  this value, since this budget starts only once the session has dropped
+  the connection. A plaintext listener on macOS sets it by passing a
+  record with `Enabled = False` to the TLS constructor overload. The other `TWSTransportTls` fields bound per-connection TLS
   buffers on epoll and IOCP; their defaults are documented in
   `source/units/WS.Transport.pas`.
 

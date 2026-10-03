@@ -83,7 +83,9 @@ session has dropped a connection it holds no object to post a check to.
   with `Enabled = False` to the TLS constructor overload.
 - A peer that stops reading can hold a descriptor for up to
   `CloseTimeoutMs` in the session, then up to `HandshakeDeadlineMs` in the
-  transport's close drain.
+  transport's close drain, which starts only once the session has dropped
+  the connection. With `CloseTimeoutMs = 0` the session stage, and so the
+  whole hold, has no bound.
 - The IOCP plaintext graceful close is not covered by the shared budget
   yet; a peer that never closes holds the socket until `Shutdown`
   ([#46](https://github.com/frostney/duetto/issues/46)).

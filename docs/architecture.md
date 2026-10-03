@@ -53,7 +53,7 @@ says which ones a production host should set.
 
 | Property | Default | What it bounds | When it trips |
 |---|---|---|---|
-| `MaxPendingOutput` | 4 × the constructor's message cap `AMaxMessage` (16 MiB, so 64 MiB), at least 1 MiB; 0 = unbounded | protocol output one connection holds unsent because the peer is not reading | Judged on every flush. Crossing it drops the connection without a close frame. A connection already draining towards its drop is exempt, because `CloseTimeoutMs` bounds it. |
+| `MaxPendingOutput` | 4 × the constructor's message cap `AMaxMessage` (16 MiB, so 64 MiB), at least 1 MiB; 0 = unbounded | protocol output one connection holds unsent because the peer is not reading | Judged on every flush. Crossing it drops the connection without a close frame. A connection already draining towards its drop is exempt: `CloseTimeoutMs` bounds that drain, and with `CloseTimeoutMs = 0` nothing in the session does. |
 | `MaxConnections` | 0 = unbounded | live session connections, handshaking ones included | An accept past the cap is closed at once, before any session state exists: no handshake, no `OnOpen`, no `OnClientClose`. |
 | `HandshakeTimeoutMs` | 10 s; 0 = never | time from accept until the 101 is handed to the transport | Silent drop; `OnOpen` never fired. On a TLS listener this clock also starts at accept, so it bounds TLS handshake and HTTP upgrade together. |
 | `CloseTimeoutMs` | 10 s; 0 = never | time a peer gets to answer a Close, or to read what drains ahead of a drop (a 403, an `OnPlainRequest` answer, a protocol-error or 1011 close frame) | Drop. The budget is armed once per drain; peer traffic does not extend it. |
@@ -140,9 +140,11 @@ any clock is armed.
   dispatch timer on the connection's queue cancels the connection when it
   lapses, and the field applies with `Enabled = False` too.
 
-The transport budget starts where the session's ends. A peer that stops
-reading can hold a descriptor for up to `CloseTimeoutMs` in the session and
-then up to `HandshakeDeadlineMs` in the transport's close drain. Connections
+The transport budget starts only after the session drops the connection.
+A peer that stops reading can hold a descriptor for up to `CloseTimeoutMs`
+in the session and then up to `HandshakeDeadlineMs` in the transport's
+close drain. With `CloseTimeoutMs = 0` the session stage has no bound, so
+the transport budget never starts for a peer that never reads. Connections
 in that transport drain are already out of the session registry, so
 `MaxConnections` no longer counts them.
 
