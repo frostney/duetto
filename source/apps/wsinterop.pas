@@ -2056,26 +2056,25 @@ begin
   // 300 ms close drain resets a close the peer never lets finish (it
   // waits behind a send the peer is not taking, then for a FIN), so
   // here the case also pins that drain deadline.
-  if LimitsCloseBudgetCase then
-  begin
-    LimSrvT.Srv.MaxPendingOutput := 0;
-    Fd := RawUpgraded(LimPort, 4096);
-    RawSetSendTimeout(Fd, 1000);
-    for I := 1 to 160 do
-      if not RawSendFrame(Fd, WS_OP_BINARY, Chunk, True) then Break;
-    Ok := RawSendFrame(Fd, WS_OP_CLOSE, #$03#$E8, True);
-    LastTick := GetTickCount64;
-    repeat
-      Sleep(50);
-      if not RawSendFrame(Fd, WS_OP_TEXT, 'x', True) then Break;
-    until GetTickCount64 - LastTick > 4000;
-    Elapsed := Integer(GetTickCount64 - LastTick);
-    CloseSocket(Fd);
-    LimSrvT.Srv.MaxPendingOutput := 1024 * 1024;
-    Check(Ok and (Elapsed < 2500),
-      Format('peer traffic after its Close does not extend the 300 ms ' +
-      'close budget (dropped %d ms after the Close)', [Elapsed]));
-  end;
+{$if LimitsCloseBudgetCase}
+  LimSrvT.Srv.MaxPendingOutput := 0;
+  Fd := RawUpgraded(LimPort, 4096);
+  RawSetSendTimeout(Fd, 1000);
+  for I := 1 to 160 do
+    if not RawSendFrame(Fd, WS_OP_BINARY, Chunk, True) then Break;
+  Ok := RawSendFrame(Fd, WS_OP_CLOSE, #$03#$E8, True);
+  LastTick := GetTickCount64;
+  repeat
+    Sleep(50);
+    if not RawSendFrame(Fd, WS_OP_TEXT, 'x', True) then Break;
+  until GetTickCount64 - LastTick > 4000;
+  Elapsed := Integer(GetTickCount64 - LastTick);
+  CloseSocket(Fd);
+  LimSrvT.Srv.MaxPendingOutput := 1024 * 1024;
+  Check(Ok and (Elapsed < 2500),
+    Format('peer traffic after its Close does not extend the 300 ms ' +
+    'close budget (dropped %d ms after the Close)', [Elapsed]));
+{$endif}
   LimSrvT.Srv.IdleTimeoutMs := 600;
   LimSrvT.Srv.PingIntervalMs := 200;
 
