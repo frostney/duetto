@@ -355,9 +355,11 @@ const
   // The keepalive cases' idle bound: 4x the section's 200 ms ping
   // interval, so a pong has 600 ms from its ping leaving (#80).
   KeepaliveIdleMs = 800;
-  // Holds the connection's execution context past KeepaliveIdleMs, so
-  // the check posted when the 200 ms keepalive ping fell due runs only
-  // after the idle deadline has lapsed too.
+  // Echoed, then holds the connection's execution context past
+  // KeepaliveIdleMs, so the check posted when the 200 ms keepalive ping
+  // fell due runs only after the idle deadline has lapsed too. The echo
+  // marks the stall's start in the stream: a ping behind it was sent
+  // after the stall began.
   StallCue = 'stall-past-idle';
   StallMs = 1000;
   // How long the host-busy peer holds its pong: past the next 100 ms
@@ -385,7 +387,10 @@ begin
     AConn.Close(1000, 'bye')
   else if AText and (Len = Length(StallCue)) and
     CompareMem(P, @StallCue[1], Len) then
-    Sleep(StallMs)
+  begin
+    AConn.SendText(P, Len);
+    Sleep(StallMs);
+  end
   else if AText then
     AConn.SendText(P, Len)
   else
@@ -2263,18 +2268,27 @@ begin
   // execution context for StallMs, so the check the sweeper posted when
   // the ping fell due runs only after the idle deadline has lapsed too.
   // The owed ping must go out first, with a fresh 600 ms answer window —
-  // a live peer the server never asked is not idle. The pong is held
-  // PongDelayMs so the window itself is pinned, then the close handshake
-  // must be a clean 1000, not the idle 1001.
+  // a live peer the server never asked is not idle. The cue's echo comes
+  // first, so the ping behind it is the one owed across the stall (a
+  // ping ahead of it means the cue reached the handler too late to test
+  // anything). The pong is held PongDelayMs so the window itself is
+  // pinned, then the close handshake must be a clean 1000, not the idle
+  // 1001.
   LimSrvT.Srv.IdleTimeoutMs := KeepaliveIdleMs;
   Fd := RawConnect(LimPort);
   KBuf := RawHandshake(Fd); // a ping may ride in behind the 101
   Start := GetTickCount64;
   RawSendFrame(Fd, WS_OP_TEXT, StallCue, True);
   ReadFrame(Fd, nil, KBuf, Op, Payload);
-  Log := Format('first frame: %s after %d ms', [DescribeFrame(Op, Payload),
-    GetTickCount64 - Start]);
-  Ok := Op = WS_OP_PING;
+  Ok := (Op = WS_OP_TEXT) and (Payload = StallCue);
+  Log := Format('first frame: %s', [DescribeFrame(Op, Payload)]);
+  if Ok then
+  begin
+    ReadFrame(Fd, nil, KBuf, Op, Payload);
+    Ok := Op = WS_OP_PING;
+    Log := Format('frame after the stall began: %s after %d ms',
+      [DescribeFrame(Op, Payload), GetTickCount64 - Start]);
+  end;
   if Ok then
   begin
     Sleep(PongDelayMs);
