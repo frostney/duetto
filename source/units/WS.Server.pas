@@ -327,20 +327,23 @@ type
     // Milliseconds without a single byte from the peer after which an
     // open connection is closed (1001 is queued best-effort, then it is
     // dropped; OnClientClose fires). Pongs count as bytes, so pair this
-    // with PingIntervalMs to keep a live-but-quiet peer open. Default
-    // 0 = never: idle connections are legitimate for many hosts.
+    // with PingIntervalMs to keep a live-but-quiet peer open (the close
+    // can then come later than IdleTimeoutMs; see PingIntervalMs).
+    // Default 0 = never: idle connections are legitimate for many hosts.
     property IdleTimeoutMs: Integer
       read FIdleTimeoutMs write FIdleTimeoutMs;
     // Milliseconds of quiet after which the server pings the peer; the
     // pong (or any other byte) resets the quiet clock. Default 0 =
     // never ping. Meaningful mostly together with IdleTimeoutMs, where
     // it turns "no traffic" into "no pong": IdleTimeoutMs should then
-    // exceed PingIntervalMs by a round trip. The peer always gets
-    // IdleTimeoutMs - PingIntervalMs from the ping leaving to answer:
-    // a server running behind its own schedule (a handler holding the
-    // connection's context, a late sweep) pings before it closes as
-    // idle, and the idle close moves back by as much as the ping was
-    // late.
+    // exceed PingIntervalMs by a round trip. The idle deadline is never
+    // sooner than IdleTimeoutMs - PingIntervalMs after the ping is
+    // queued: a server running behind its own schedule (a handler
+    // holding the connection's context, a late sweep) pings before it
+    // closes as idle, and the idle close moves back by as much as the
+    // ping was late. A pong is credited when the connection's context
+    // processes it, so a context still held past that later deadline
+    // can close a peer that answered in time.
     property PingIntervalMs: Integer
       read FPingIntervalMs write FPingIntervalMs;
 
@@ -553,12 +556,13 @@ begin
     // reply (NoteActivity), not by the clock, so an unanswered ping
     // simply lets the idle deadline run out. The ping is judged before
     // that deadline, and the deadline is never sooner than IdleTimeoutMs
-    // - PingIntervalMs after the ping actually leaves: a check that runs
+    // - PingIntervalMs after the ping is queued: a check that runs
     // late (a handler holding this context, a sweep behind schedule)
     // finds both clocks lapsed, and judging idle first closed a live
     // peer the server had never asked.
     FPingDue := 0;
     if (FState = wcsOpen) and (FDeadline <> 0) and
+      (FServer.FPingIntervalMs > 0) and
       (FServer.FIdleTimeoutMs > FServer.FPingIntervalMs) then
     begin
       AnswerBy := Now_ + QWord(FServer.FIdleTimeoutMs -
