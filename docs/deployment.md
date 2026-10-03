@@ -64,3 +64,30 @@ Network.framework and IOCP transports are self-contained. Server-side
 Where the Linux OpenSSL libraries are absent, a TLS-terminating reverse
 proxy in front of a plain listener remains a valid deployment shape; see
 [companion-http.md](companion-http.md).
+
+## Serving wss:// with wsecho
+
+`wsecho` is the shipped example of a listener, and its flags show the
+safe shape:
+
+```bash
+./build/wsecho --bind=127.0.0.1 --port=9443 \
+  --pkcs12=/etc/wsecho/id.p12 --pkcs12-pass-file=/etc/wsecho/id.pass
+```
+
+- `--bind` takes one IPv4 or IPv6 literal (`127.0.0.1`, `::1`, no
+  brackets) and listens only there; without it `wsecho` listens on every
+  interface. Hostnames are refused, never resolved.
+- `--pkcs12-pass-file` reads the passphrase from a file, minus one
+  trailing newline, so `echo "$SECRET" > id.pass` works. Keep the file
+  readable by the service user only (`chmod 600`).
+- `WSECHO_PKCS12_PASS` in the environment is the other safe source, for
+  a supervisor that injects secrets as variables (systemd's
+  `EnvironmentFile=`, a container runtime). An empty value counts as
+  unset.
+- `--pkcs12-pass=SECRET` is the insecure form: every local user can read
+  it in `ps`, and it lands in shell history. It remains for throwaway
+  test identities.
+- The two passphrase flags are mutually exclusive, and either one
+  overrides `WSECHO_PKCS12_PASS`. Any passphrase source without
+  `--pkcs12` is refused rather than served as plaintext.
