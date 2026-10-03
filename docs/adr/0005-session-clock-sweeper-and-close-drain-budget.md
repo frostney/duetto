@@ -40,7 +40,8 @@ lock and compares each live connection's earliest due time with
 it posts a check through `SubmitPost`. The check re-reads the clocks on
 the connection's own context and does the dropping, closing or pinging
 there. The sweeper reads one due time per connection, racily by design (a
-stale value costs a spare post), and changes no connection state.
+stale value costs a spare post or defers the check to a later sweep). The
+only connection field it writes is the flag that marks a check as queued.
 
 This keeps every clock action inside ADR-0003's per-connection
 serialization on all three transports, with no transport change and no

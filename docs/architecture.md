@@ -91,17 +91,19 @@ one's earliest due time with the clock. For a connection that is due and
 has no check queued, it posts `CheckClock` onto that connection's execution
 context through the transport's `SubmitPost`, the cross-thread hand-off
 behind `TWSConnection.Post`. The sweeper reads the due time without
-synchronizing with the connection and may see a stale value; that costs
-at most a spare check. `CheckClock` re-reads the clocks on the connection's own
-context and does the work there: it drops a lapsed handshake, closes an
+synchronizing with the connection and may see a stale value: a stale
+earlier value costs a spare check, and a stale later one defers the check
+to a following sweep. `CheckClock` re-reads the clocks on the
+connection's own context and does the work there: it drops a lapsed handshake, closes an
 idle connection with 1001, drops a lapsed close or drain, or sends a due
 ping. Clock events therefore keep ADR-0003's per-connection serialization
 on every transport. [ADR-0005](adr/0005-session-clock-sweeper-and-close-drain-budget.md)
 records this decision.
 
-Two consequences follow. A clock acts up to one sweep interval late, plus
-however long the connection's execution context is busy; on epoll and IOCP
-that context is the one `Run` thread every connection shares. And the
+Two consequences follow. A clock acts up to one sweep interval late, or
+later when a stale read defers its check, plus however long the
+connection's execution context is busy; on epoll and IOCP that context is
+the one `Run` thread every connection shares. And the
 registry lock, otherwise taken on accept, on close and by each `Post`, is
 also held for one walk of the live connections every 100 ms, whether or not
 any clock is armed.
