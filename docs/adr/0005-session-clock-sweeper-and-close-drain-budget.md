@@ -55,7 +55,9 @@ transports.** `TWSTransportTls.HandshakeDeadlineMs` (default 10 s) bounds
 how long a close that is still delivering its final bytes may hold a
 connection after the session dropped it:
 
-- epoll and IOCP: the TLS close drain;
+- epoll: the TLS close drain;
+- IOCP: every graceful close, TLS or plaintext, with `Enabled = False`
+  too (the plaintext half landed with #84);
 - Network.framework: any close deferred behind an in-flight send, with
   `Enabled = False` too.
 
@@ -79,13 +81,11 @@ session has dropped a connection it holds no object to post a check to.
 - Each server costs one more thread, which runs from construction to
   destruction even when every clock is off.
 - The close-drain budget lives in the TLS record under a handshake name.
-  A plaintext listener on macOS sets it by passing a `TWSTransportTls`
-  with `Enabled = False` to the TLS constructor overload.
+  A plaintext listener on Windows or macOS sets it by passing a
+  `TWSTransportTls` with `Enabled = False` to the TLS constructor
+  overload.
 - A peer that stops reading can hold a descriptor for up to
   `CloseTimeoutMs` in the session, then up to `HandshakeDeadlineMs` in the
   transport's close drain, which starts only once the session has dropped
   the connection. With `CloseTimeoutMs = 0` the session stage, and so the
   whole hold, has no bound.
-- The IOCP plaintext graceful close is not covered by the shared budget
-  yet; a peer that never closes holds the socket until `Shutdown`
-  ([#46](https://github.com/frostney/duetto/issues/46)).

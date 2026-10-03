@@ -129,16 +129,16 @@ any clock is armed.
   10 s) bounds the TLS handshake on the fd-owning transports and is reused,
   on all three transports, as the time a close that is still delivering its
   final bytes may hold the connection after the session dropped it. On
-  epoll and IOCP it bounds the TLS close drain (`close_notify` out, then FIN
-  and the peer's EOF); the transport's 100 ms deadline sweep closes the
-  socket abortively when it lapses. A plaintext epoll connection closes at once and
-  has no drain. The IOCP plaintext graceful close (FIN, then the peer's EOF,
-  possibly behind a send still in flight) has no deadline yet: a peer that
-  never closes holds the socket until `Shutdown`
-  ([#46](https://github.com/frostney/duetto/issues/46)). On Network.framework
-  it bounds any close deferred behind an in-flight send, TLS or not; a
-  dispatch timer on the connection's queue cancels the connection when it
-  lapses, and the field applies with `Enabled = False` too.
+  epoll it bounds the TLS close drain (`close_notify` out, then FIN and the
+  peer's EOF); a plaintext epoll connection closes at once and has no
+  drain. On IOCP it bounds every graceful close, TLS or plaintext: the
+  `close_notify` drain, a close deferred behind a send still in flight, and
+  the wait for the peer's EOF after FIN. On both, the transport's 100 ms
+  deadline sweep closes the socket abortively when the budget lapses. On
+  Network.framework it bounds any close deferred behind an in-flight send,
+  TLS or not, and a dispatch timer on the connection's queue cancels the
+  connection when it lapses. IOCP and Network.framework read the field with
+  `Enabled = False` too.
 
 The transport budget starts only after the session drops the connection.
 A peer that stops reading can hold a descriptor for up to `CloseTimeoutMs`
