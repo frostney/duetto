@@ -248,24 +248,43 @@ well-formed upgrade after `WS.Handshake` accepted it and before the 101
 is queued:
 
 ```pascal
-function THost.UpgradeRequest(const AHS: TWSServerHandshake;
-  const ARawRequest: RawByteString; out AReason: string): Boolean;
+function THost.UpgradeRequest(var AContext: TWSUpgradeContext): Boolean;
 begin
   // Non-browser clients send no Origin; browsers always do.
-  Result := (AHS.Origin = '') or (AHS.Origin = FAllowedOrigin);
-  if not Result then AReason := 'origin not allowed';
-  // Any other header is one HeaderValue(ARawRequest, ...) away.
+  Result := (AContext.Request.Origin = '') or
+    (AContext.Request.Origin = FAllowedOrigin);
+  if not Result then AContext.Reason := 'origin not allowed';
+  // Any other header is one HeaderValue(AContext.RawRequest, ...) away.
 end;
 
 Ws.OnUpgradeRequest := Host.UpgradeRequest;
 ```
+
+The hook takes one `TWSUpgradeContext` record, so fields added to it
+later do not break existing handlers:
+
+- **`Request`** is the request as parsed by `WS.Handshake` (`Path`,
+  `Host`, `Origin`, `Protocols`, the negotiated `Deflate`). It is
+  read-only by contract: the 101 is built from the server's own copy,
+  so writing to it changes nothing.
+- **`RawRequest`** is exactly this request's header block, and nothing
+  pipelined behind it.
+- **`Reason`** is the 403 body on refusal.
+- **`UserData`** starts `nil`. On accept the server copies it to
+  `TWSConnection.UserData` before `OnOpen` fires, so state the hook
+  computed (an authentication result, say) lands on the connection it
+  was computed for. On refusal it is discarded, and so it is when the
+  peer is gone before the 101 goes out: neither `OnOpen` nor
+  `OnClientClose` fires then, so nothing hands it back. Point it at
+  state the host can reclaim on its own, rather than at an allocation
+  only `OnClientClose` would free.
 
 The contract mirrors `OnPlainRequest`:
 
 - **Return `True` to accept**; the handshake proceeds unchanged and
   `OnOpen` fires as usual.
 - **Return `False` to refuse**: the server writes
-  `HTTP/1.1 403 Forbidden` with `AReason` as the body (`forbidden` when
+  `HTTP/1.1 403 Forbidden` with `Reason` as the body (`forbidden` when
   left empty) and closes the connection. Neither `OnOpen` nor
   `OnClientClose` fires for it — the connection never opened.
 - **A raising hook is a refusal.** The exception is swallowed and the
