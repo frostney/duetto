@@ -53,7 +53,8 @@ run_client_suite() {
 
   docker stop "$CONTAINER" >/dev/null
   trap - EXIT
-  python3 "$ROOT/tools/autobahn-check.py" "$REPORT_DIR/client/index.json"
+  python3 "$ROOT/tools/autobahn-check.py" --direction=client \
+    "$REPORT_DIR/client/index.json"
 }
 
 run_server_suite() {
@@ -83,7 +84,8 @@ run_server_suite() {
 
   kill "$ECHO_PID" "$ECHO_NODEFLATE_PID" 2>/dev/null || true
   trap - EXIT
-  python3 "$ROOT/tools/autobahn-check.py" "$REPORT_DIR/server/index.json"
+  python3 "$ROOT/tools/autobahn-check.py" --direction=server \
+    "$REPORT_DIR/server/index.json"
 }
 
 case "$MODE" in

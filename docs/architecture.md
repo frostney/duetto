@@ -30,7 +30,7 @@ once on protocol failure, after queueing the appropriate close frame
 | `WS.Handshake` | upgrade request/response both directions, `Sec-WebSocket-Accept`, deflate parameter negotiation |
 | `WS.Deflate` | RFC 7692 over paszlib: raw deflate, sync flush, 4-byte tail, context takeover control, inflate output cap |
 | `WS.Protocol` | the sans-I/O machine above |
-| `WS.Client` | blocking client, `ws://` and `wss://` (TLS via lwpt's TransportSecurity) |
+| `WS.Client` | blocking client, `ws://` and `wss://` (TLS via lwpt's TransportSecurity); messages queue for `ReadMessage`, or go to an optional synchronous `OnMessage` inside the read that completed them, so a reply leaves ahead of a close that a later frame in the same read provokes |
 | `WS.Transport` | the completion-shaped transport contract (ADR-0001): submit sends/closes, receive data/lifecycle completions on the transport's execution context (ADR-0003); an optional gather send (ADR-0004: `SupportsGather` / `SubmitSendV`) that only a transport writing synchronously offers, letting the server hand frame header + caller payload to the socket without copying the payload into the out queue; also `WSParseBindAddress`, the strict IPv4/IPv6 literal parser every transport binds through (never a resolver) |
 | `WS.Transport.PostQueue` | thread-safe FIFO behind the reactor transports' `SubmitPost` (cross-thread `Conn.Post` hand-off); the Network.framework transport posts straight onto its per-connection GCD queues instead |
 | `WS.Transport.TlsServer` | platform-neutral per-connection server TLS over lwpt's memory-BIO accept API: handshake pump, accepted-prefix re-offer, input/output flow accounting, `close_notify` drain; used by the fd-owning transports only |
@@ -65,7 +65,12 @@ Four nets, from innermost to outermost:
    backwards and advances in milliseconds.
 2. **`wsinterop`**: own client ↔ own server over real TCP, plus raw-socket
    violations (unmasked frame → 1002, invalid close code → 1002, fragmented
-   ping → 1002, invalid UTF-8 → 1007), an upgrade-hook section (a server
+   ping → 1002, invalid UTF-8 → 1007), a client-delivery section (a raw
+   peer writes a valid message, an RSV2 frame and a ping in one send,
+   both after the 101 and glued to it; the client's `OnMessage` echo must
+   leave before its 1002 close, with nothing after it; `Close` from the
+   handler completes, `ReadMessage` from it raises), an upgrade-hook
+   section (a server
    bound to `127.0.0.1` explicitly whose `OnUpgradeRequest` refuses one
    `Origin` with a 403 — no `OnOpen`, no `OnClientClose` — treats a
    raising hook the same way, and sets a `UserData` that `OnOpen` finds
