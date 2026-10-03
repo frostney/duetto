@@ -37,7 +37,7 @@ once on protocol failure, after queueing the appropriate close frame
 | `WS.Transport.Epoll` | Linux transport: nonblocking sockets, one shared 256 KB read buffer, a bounded number of reads per readiness event (level-triggered, so one busy peer cannot hold the loop), `EPOLLOUT` armed only while a connection has backlog, gather send via `sendmsg` on plaintext connections; native `wss://` through `WS.Transport.TlsServer`, with the handshake deadline, the inbound pre-handshake budget and the `EPOLLIN` pause/resume owned by the reactor |
 | `WS.Transport.NetworkFramework` | macOS transport (ADR-0002): `nw_listener`/`nw_connection` C API, one serial dispatch queue per connection, native TLS via a PKCS#12 `SecIdentity` |
 | `WS.Transport.Iocp` | Windows transport: one completion-port thread, `AcceptEx`/`WSARecv`/`WSASend` always armed overlapped, copy-on-send, outstanding-operation pinning for deferred frees; native `wss://` (x64 and win32, via lwpt's SChannel accept — no OpenSSL on Windows) through `WS.Transport.TlsServer`, with the handshake deadline, the inbound pre-handshake budget and the `WSARecv` suppress/resume owned by the completion loop |
-| `WS.Server` | platform-neutral session layer: handshake accumulation, protocol wiring, flush/backpressure policy over the transport seam; `SendText`/`SendBinary` return False when the transport dropped (and freed) the connection mid-flush, and `Conn.Post` is the any-thread hand-off for server-driven pushes (ADR-0003 amendment); `OnUpgradeRequest` vetoes a parsed upgrade (403, then close — no `OnOpen`/`OnClientClose`) before the 101 is queued, and the constructors take an optional bind address (`''` = every interface; an IPv4 or IPv6 literal binds that one, no DNS) |
+| `WS.Server` | platform-neutral session layer: handshake accumulation, protocol wiring, flush/backpressure policy over the transport seam; `SendText`/`SendBinary` return False when the transport dropped (and freed) the connection mid-flush, and `Conn.Post` is the any-thread hand-off for server-driven pushes (ADR-0003 amendment); `OnUpgradeRequest` vetoes a parsed upgrade (403, then close — no `OnOpen`/`OnClientClose`) before the 101 is queued; an exception escaping `OnOpen`, `OnMessage`, `OnClientClose` or a `Post` proc is contained on every transport (that connection closes with 1011 unless it is already closing, `OnError` reports it, `Run` and every other connection carry on); and the constructors take an optional bind address (`''` = every interface; an IPv4 or IPv6 literal binds that one, no DNS) |
 
 Units higher in the table never depend on units lower down. The programs in
 `source/apps/` depend on the library, never the other way around.
@@ -68,7 +68,10 @@ Four nets, from innermost to outermost:
    ping → 1002, invalid UTF-8 → 1007), an upgrade-hook section (a server
    bound to `127.0.0.1` explicitly whose `OnUpgradeRequest` refuses one
    `Origin` with a 403 — no `OnOpen`, no `OnClientClose` — and treats a
-   raising hook the same way), a handshake-size section (a request
+   raising hook the same way), a handler-fault section (a raising
+   `OnMessage`, `OnOpen` or `Post` proc costs only its connection: 1011,
+   reported to `OnError`, a bystander still echoes; a raising
+   `OnClientClose` is only reported), a handshake-size section (a request
    header block past the 16 KiB cap gets `431 Request Header Fields Too
    Large`, while a block at the cap with frames pipelined behind it and a
    client path longer than 2 KiB still upgrade), a
