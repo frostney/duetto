@@ -330,6 +330,13 @@ end;
 
 // ---------------------------------------------------------------------------
 // Block invoke trampolines (cdecl; first argument is the block itself)
+//
+// No exception may leave a trampoline: unwinding into libdispatch
+// terminates the process. The session already contains every user
+// handler's exception (TWSServer.OnError); what still reaches a
+// trampoline from a session callback is contained here, defensively,
+// and costs only the connection it escaped on — torn down as a remote
+// close would be (RemoteClosed, which itself never raises).
 // ---------------------------------------------------------------------------
 
 type
@@ -436,6 +443,7 @@ var
   Map, Buf: Pointer;
   Size: NativeUInt;
   T: TWSNetworkFrameworkTransport;
+  Faulted: Boolean;
 begin
   EnsureThreadInit;
   C := TWSNwConn(ABlock^.Ctx);
@@ -444,9 +452,19 @@ begin
   if AContent <> nil then
   begin
     Map := Dispatch_data_create_map(AContent, @Buf, @Size);
-    if (Size > 0) and Assigned(T.OnData) then
-      T.OnData(C, Buf, Size);
+    Faulted := False;
+    try
+      if (Size > 0) and Assigned(T.OnData) then
+        T.OnData(C, Buf, Size);
+    except
+      Faulted := True; // contained (see the trampolines' header)
+    end;
     Dispatch_release(Map);
+    if Faulted then
+    begin
+      C.RemoteClosed;
+      Exit;
+    end;
     if C.FDead then Exit; // the session tore it down inside OnData
   end;
   if (AError <> nil) or AComplete then
@@ -471,7 +489,11 @@ begin
   if AError <> nil then
     C.RemoteClosed
   else if Assigned(C.FTransport.OnSendReady) then
-    C.FTransport.OnSendReady(C);
+    try
+      C.FTransport.OnSendReady(C);
+    except
+      C.RemoteClosed; // contained (see the trampolines' header)
+    end;
 end;
 
 procedure PostInvoke(ABlock: PWSBlock); cdecl;
@@ -494,13 +516,16 @@ begin
   finally
     T.FLiveLock.Release;
   end;
-  // PostDone must run even if the posted proc raises: a missed
-  // decrement would leave FPostsPending nonzero and spin Shutdown's
-  // drain loop forever. (The exception still propagates into GCD,
-  // which typically terminates the process — but the accounting stays
-  // honest for any path that survives.)
+  // PostDone must run on every path: a missed decrement would leave
+  // FPostsPending nonzero and spin Shutdown's drain loop forever. The
+  // except keeps any exception out of GCD (see the trampolines'
+  // header); C, when live, cannot finalize while this block runs.
   try
-    if Assigned(T.OnPost) then T.OnPost(C, P^.Data);
+    try
+      if Assigned(T.OnPost) then T.OnPost(C, P^.Data);
+    except
+      if C <> nil then C.RemoteClosed;
+    end;
   finally
     Dispose(P);
     T.PostDone;
@@ -529,7 +554,15 @@ begin
   Inc(T.FNextId);
   C.Id := T.FNextId;
   InterLockedIncrement(T.FActive);
-  if Assigned(T.OnAccept) then T.OnAccept(C);
+  // Contained (see the trampolines' header): an accept the session
+  // could not take is refused like one over the connection cap. Only
+  // out of memory reaches here, and a session object it had already
+  // allocated is not reclaimed — the process is in trouble anyway.
+  try
+    if Assigned(T.OnAccept) then T.OnAccept(C);
+  except
+    C.SubmitClose;
+  end;
   if C.FDead then
   begin
     // Refused inside OnAccept (the session's connection cap). The
@@ -592,20 +625,22 @@ begin
   FClosedNotified := True;
   // The nw side is torn down even if OnClosed raises: without the
   // cancel, the cancelled state (which frees this object) never comes.
+  // The exception itself is contained, so RemoteClosed never raises —
+  // the trampolines rely on that (see their header).
   try
     if Assigned(FTransport.OnClosed) then FTransport.OnClosed(Self);
-  finally
-    // The session has dropped its references; tear the nw side down.
-    // The cancelled state is the final callback and frees this object.
-    // A send still in flight performs the cancel from its completion
-    // instead (no need to abort the final bytes; cancel is idempotent)
-    // — within the drain budget.
-    FDead := True;
-    if FInFlight then
-      ArmDrainDeadline
-    else
-      Nw_connection_cancel(FNw);
+  except
   end;
+  // The session has dropped its references; tear the nw side down.
+  // The cancelled state is the final callback and frees this object.
+  // A send still in flight performs the cancel from its completion
+  // instead (no need to abort the final bytes; cancel is idempotent)
+  // — within the drain budget.
+  FDead := True;
+  if FInFlight then
+    ArmDrainDeadline
+  else
+    Nw_connection_cancel(FNw);
 end;
 
 function TWSNwConn.SubmitSend(P: PByte; ALen: NativeInt): NativeInt;
