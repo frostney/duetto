@@ -219,7 +219,8 @@ The contract is deliberately narrow:
   is not a WebSocket upgrade attempt. Everything else — requests
   advertising a body, malformed noise, broken upgrade attempts — keeps
   the standard refusal, as does every request while the property is
-  unset.
+  unset. A header block past the server's 16 KiB cap gets `431 Request
+  Header Fields Too Large` before any classification.
 - **Single-shot.** Return `True` with a complete HTTP/1.1 response in
   `AResponse` (status line, headers, body; include `Connection: close`
   so clients expect what follows): the bytes are written verbatim and
@@ -271,8 +272,9 @@ The contract mirrors `OnPlainRequest`:
   same 403 goes out, so one misbehaving handler cannot leak the
   connection or take down the transport's execution context.
 - **Malformed requests never reach it** — they keep the standard 400 (or
-  `OnPlainRequest`, when eligible). Unset, every well-formed upgrade is
-  accepted, exactly as before the hook existed.
+  `OnPlainRequest`, when eligible), and a header block past the server's
+  16 KiB cap gets `431 Request Header Fields Too Large`. Unset, every
+  well-formed upgrade is accepted, exactly as before the hook existed.
 - **Threading.** Same as every other callback: the connection's
   execution context (ADR-0003).
 
