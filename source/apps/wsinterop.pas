@@ -179,13 +179,12 @@ type
   end;
 
   // A server thread that survives exceptions escaping Run and counts
-  // them. Handlers are contained since 0.6.0, so nothing may escape:
-  // both counters must stay 0.
+  // them, so a section can still report. Handlers are contained, so
+  // nothing may escape: Escaped must stay 0.
   TCatchingServerThread = class(TThread)
   public
     Srv: TWSServer;
-    Raised: LongInt;     // the section's own raises
-    Unexpected: LongInt; // anything else out of Run: must stay 0
+    Escaped: LongInt;
     procedure Execute; override;
   end;
 
@@ -545,17 +544,11 @@ begin
       Srv.Run(50);
     except
       on E: Exception do
-        // Only the section's own raise is expected; anything else is a
-        // real fault, counted apart so a later expected raise cannot mask
-        // it.
-        if E.Message = CloseRaiseText then
-          InterLockedIncrement(Raised)
-        else
-        begin
-          InterLockedIncrement(Unexpected);
-          WriteLn('       unexpected server exception: ', E.ClassName,
-            ': ', E.Message);
-        end;
+      begin
+        InterLockedIncrement(Escaped);
+        WriteLn('       exception escaped Run: ', E.ClassName, ': ',
+          E.Message);
+      end;
     end;
 end;
 
@@ -1945,7 +1938,7 @@ begin
   Cli[0] := TWSClient.Create;
   Cli[0].Connect(Format('ws://127.0.0.1:%d/', [Port]));
   Cli[0].SendText(HelloProbe);
-  Check((Host.Errors = 2) and (SrvT.Raised = 0) and
+  Check((Host.Errors = 2) and (SrvT.Escaped = 0) and
     Cli[0].ReadMessage(IsText, Data) and (Length(Data) = Length(HelloProbe)),
     'both raising handlers reached OnError once each, not Run; ' +
     'the server still echoes');
@@ -1983,14 +1976,12 @@ begin
   SrvT.Srv.Free;
   Check((Host.Opens = CloseSectionOpens) and (Host.Closes = Host.Opens) and
     (Host.SendsAccepted = 0) and (Host.Broadcasts = CloseSectionBroadcasts) and
-    (Host.Errors = CloseSectionErrors) and (SrvT.Raised = 0) and
-    (SrvT.Unexpected = 0),
+    (Host.Errors = CloseSectionErrors) and (SrvT.Escaped = 0),
     Format('Destroy pairs every OnOpen with one OnClientClose; sends to any ' +
     'connection report the drop (opens %d, closes %d, sends taken %d, ' +
-    'broadcasts finished %d, reported to OnError %d, raised out of Run %d, ' +
-    'unexpected %d)',
+    'broadcasts finished %d, reported to OnError %d, escaped Run %d)',
     [Host.Opens, Host.Closes, Host.SendsAccepted, Host.Broadcasts, Host.Errors,
-    SrvT.Raised, SrvT.Unexpected]));
+    SrvT.Escaped]));
   SrvT.Free;
   for I := 0 to High(Cli) do Cli[I].Free;
   Host.Free;
@@ -2086,8 +2077,7 @@ begin
   Bystander.SendText(HelloProbe);
   Check(Bystander.ReadMessage(IsText, Data) and
     (Length(Data) = Length(HelloProbe)) and
-    (Host.Errors = FaultSectionCases) and (SrvT.Raised = 0) and
-    (SrvT.Unexpected = 0),
+    (Host.Errors = FaultSectionCases) and (SrvT.Escaped = 0),
     'a bystander keeps echoing through every raise; none escaped Run');
   Bystander.Close(1000, 'done');
   Bystander.Free;

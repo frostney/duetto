@@ -261,10 +261,19 @@ type
     // queues 1011 when it is open, reports to OnError. Called while AConn
     // is still allocated; never raises.
     procedure HandlerRaised(AConn: TWSConnection);
-    // Get the queued close frame out, then drop: at once when it is on
-    // the wire, once it drains otherwise. Shared by protocol failures
-    // and handler faults.
-    procedure FailConn(AConn: TWSConnection);
+    // Get what is queued (a plain answer, a 403, a close frame) onto the
+    // wire, then drop: at once when it is out, once it drains otherwise.
+    // Draining starts before the flush so the MaxPendingOutput cap, which
+    // exempts a draining connection, cannot drop it with the final bytes
+    // still queued.
+    procedure DrainThenDrop(AConn: TWSConnection);
+    // Run a user handler on AConn under the delivery guard (drops inside
+    // it are deferred) with its exception contained, then settle.
+    function DeliverContained(AConn: TWSConnection; AProc: TWSConnProc): Boolean;
+    // After a delivery run: perform a deferred drop, or fail a faulted
+    // connection. False = AConn is gone or closing — do not deliver to it
+    // again.
+    function SettleDelivery(AConn: TWSConnection): Boolean;
     // Caller-initiated teardown; returns False so drop sites can chain
     // "Exit(DropConn(...))". The connection is freed on return — or,
     // mid-delivery, as soon as the delivery site unwinds (deferred).
@@ -919,24 +928,47 @@ begin
     end;
 end;
 
-procedure TWSServer.FailConn(AConn: TWSConnection);
+procedure TWSServer.DrainThenDrop(AConn: TWSConnection);
 begin
-  // No protocol object yet, so no out queue to drain.
-  if AConn.FProto = nil then
-  begin
-    DropConn(AConn);
-    Exit;
-  end;
   // If a prior send is still in flight the transport takes nothing now —
-  // defer the drop until OnSendReady has drained the close frame, or it
-  // never reaches the wire (races the 101 on fast loopback).
+  // the drop waits for OnSendReady to drain the queue, or the final
+  // bytes never reach the wire (races the 101 on fast loopback).
+  AConn.BeginDrain;
+  // Nested rather than `and`-ed: FlushConn returning False means the
+  // connection was dropped and possibly freed, and the second test
+  // would read OutPending out of it.
   if FlushConn(AConn) then
   begin
     if AConn.FProto.OutPending = 0 then
-      DropConn(AConn)
-    else
-      AConn.BeginDrain;
+      DropConn(AConn);
   end;
+end;
+
+function TWSServer.DeliverContained(AConn: TWSConnection;
+  AProc: TWSConnProc): Boolean;
+begin
+  AConn.FInDelivery := True;
+  try
+    AProc(AConn);
+  except
+    HandlerRaised(AConn);
+  end;
+  AConn.FInDelivery := False;
+  Result := SettleDelivery(AConn);
+end;
+
+function TWSServer.SettleDelivery(AConn: TWSConnection): Boolean;
+begin
+  Result := False;
+  if AConn.FDropDeferred then
+  begin
+    AConn.FDropDeferred := False;
+    DropConn(AConn);
+  end
+  else if AConn.FFaulted then
+    DrainThenDrop(AConn) // the 1011 out, then the drop
+  else
+    Result := True;
 end;
 
 procedure TWSServer.PostToConn(AConn: TWSConnection; AProc: TWSConnProc);
@@ -1084,15 +1116,7 @@ begin
       AConn.FProto := TWSProtocol.Create(wsrServer, HS.Deflate, FMaxMessage);
       AConn.FProto.QueueRaw(@Resp[1], Length(Resp));
       AConn.FHsBuf := '';
-      AConn.BeginDrain; // drop as soon as the response drains
-      // Nested rather than `and`-ed: FlushConn returning False means the
-      // connection was dropped and possibly freed, and the second test
-      // would read OutPending out of it.
-      if FlushConn(AConn) then
-      begin
-        if AConn.FProto.OutPending = 0 then
-          DropConn(AConn);
-      end;
+      DrainThenDrop(AConn); // drop as soon as the response drains
       Exit;
     end;
     Resp := ServerBuildReject(400, HS.Failure);
@@ -1120,12 +1144,7 @@ begin
       AConn.FProto := TWSProtocol.Create(wsrServer, HS.Deflate, FMaxMessage);
       AConn.FProto.QueueRaw(@Resp[1], Length(Resp));
       AConn.FHsBuf := '';
-      AConn.BeginDrain;
-      if FlushConn(AConn) then
-      begin
-        if AConn.FProto.OutPending = 0 then
-          DropConn(AConn);
-      end;
+      DrainThenDrop(AConn);
       // Still wcsHandshake: no OnOpen ever fired, so no OnClientClose.
       Exit;
     end;
@@ -1149,27 +1168,10 @@ begin
 
   // Same deferral guard as the Ingest run: a send inside OnOpen may
   // find the peer dead, and the caller still reads Conn state after we
-  // return — the drop must not free the object under it.
-  AConn.FInDelivery := True;
-  if Assigned(FOnOpen) then
-    try
-      FOnOpen(AConn);
-    except
-      HandlerRaised(AConn);
-    end;
-  AConn.FInDelivery := False;
-  if AConn.FDropDeferred then
-  begin
-    AConn.FDropDeferred := False;
-    Exit(DropConn(AConn)); // False: the caller must not touch Conn
-  end;
-  if AConn.FFaulted then
-  begin
-    // False as well: frames pipelined behind the request are not
-    // replayed into a connection that is closing with 1011.
-    FailConn(AConn);
-    Exit;
-  end;
+  // return — the drop must not free the object under it. False: the
+  // caller must not touch Conn, nor replay frames pipelined behind the
+  // request into a connection closing with 1011.
+  if Assigned(FOnOpen) and not DeliverContained(AConn, FOnOpen) then Exit;
   Result := True;
 end;
 
@@ -1194,16 +1196,12 @@ begin
     IngestOk := False;
   end;
   AConn.FInDelivery := False;
-  if AConn.FDropDeferred then
-  begin
-    AConn.FDropDeferred := False;
-    Exit(DropConn(AConn));
-  end;
+  // A handler fault settles here; a protocol failure below — both get
+  // their close frame out, then die.
+  if not SettleDelivery(AConn) then Exit;
   if not IngestOk then
   begin
-    // Protocol failure or handler fault: get the close frame out, then
-    // die.
-    FailConn(AConn);
+    DrainThenDrop(AConn);
     Exit;
   end;
   if not FlushConn(AConn) then Exit;
@@ -1348,21 +1346,8 @@ begin
     if not Assigned(Env^.Proc) then Exit;
     // Delivered like OnMessage: a drop inside AProc (a Send returning
     // False) is deferred until it returns, so Conn is still allocated
-    // for the containment below and is freed only after it.
-    Conn.FInDelivery := True;
-    try
-      Env^.Proc(Conn);
-    except
-      HandlerRaised(Conn);
-    end;
-    Conn.FInDelivery := False;
-    if Conn.FDropDeferred then
-    begin
-      Conn.FDropDeferred := False;
-      DropConn(Conn);
-    end
-    else if Conn.FFaulted then
-      FailConn(Conn);
+    // for the containment and is freed only after it.
+    DeliverContained(Conn, Env^.Proc);
   finally
     Dispose(Env);
   end;
