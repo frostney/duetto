@@ -79,8 +79,12 @@ safe shape:
   brackets) and listens only there; without it `wsecho` listens on every
   interface. Hostnames are refused, never resolved.
 - `--pkcs12-pass-file` reads the passphrase from a file, minus one
-  trailing newline, so `echo "$SECRET" > id.pass` works. Keep the file
-  readable by the service user only (`chmod 600`).
+  trailing newline, so a file written by `echo` works. Create it
+  readable by the service user only from the start:
+  `(umask 077; printf '%s\n' "$SECRET" > id.pass)`. A later `chmod 600`
+  leaves a window in which other users can read it. The path can also be
+  a pipe, such as `--pkcs12-pass-file=<(pass show wsecho)`, which keeps
+  the secret off disk. The file may hold at most 4096 bytes.
 - `WSECHO_PKCS12_PASS` in the environment is the other safe source, for
   a supervisor that injects secrets as variables (systemd's
   `EnvironmentFile=`, a container runtime). An empty value counts as

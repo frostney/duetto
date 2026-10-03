@@ -273,11 +273,11 @@ type
     // with a message naming the address; names are never resolved.
     // Port 0 still means kernel-assigned, read back through Port.
     constructor Create(APort: Word; AAllowDeflate: Boolean = True;
-      AMaxMessage: NativeInt = 16 * 1024 * 1024;
+      AMaxMessage: NativeInt = WS_DEFAULT_MAX_MESSAGE;
       const ABindAddress: string = ''); overload;
     constructor Create(APort: Word; const ATls: TWSTransportTls;
       AAllowDeflate: Boolean = True;
-      AMaxMessage: NativeInt = 16 * 1024 * 1024;
+      AMaxMessage: NativeInt = WS_DEFAULT_MAX_MESSAGE;
       const ABindAddress: string = ''); overload;
     destructor Destroy; override;
 

@@ -75,7 +75,7 @@ type
 
     // url: ws://host[:port]/path or wss://host[:port]/path
     procedure Connect(const AUrl: string; AOfferDeflate: Boolean = False;
-      AMaxMessage: NativeInt = 16 * 1024 * 1024);
+      AMaxMessage: NativeInt = WS_DEFAULT_MAX_MESSAGE);
 
     procedure SendText(const S: RawByteString);
     procedure SendBinary(P: PByte; ALen: NativeInt);

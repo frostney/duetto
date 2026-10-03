@@ -22,8 +22,9 @@ program wsecho;
 // and win32, nothing to ship beside the executable).
 //
 // The PKCS#12 passphrase has three sources. --pkcs12-pass-file reads
-// it from a file (one trailing newline stripped, so `echo secret >
-// file` works) and WSECHO_PKCS12_PASS from the environment; neither
+// it from a file or a pipe such as `<(pass show x)` (at most 4096 bytes,
+// one trailing newline stripped, so `echo secret > file` works) and
+// WSECHO_PKCS12_PASS from the environment; neither
 // lands in the argument list `ps` shows every local user, nor in shell
 // history. --pkcs12-pass=SECRET still works
 // but is the insecure form: every local user can read it in `ps`.
@@ -53,15 +54,16 @@ uses
 
   CLI.Help, CLI.Options, CLI.Parser,
 
-  WS.Server, WS.Transport;
+  WS.Protocol, WS.Server, WS.Transport;
 
 const
   UsageLine = '[--port=N] [--bind=ADDRESS] [--no-deflate] [--quiet] ' +
     '[--pkcs12=FILE [--pkcs12-pass-file=PATH | --pkcs12-pass=SECRET]]';
   PassphraseEnvironmentName = 'WSECHO_PKCS12_PASS';
-  // TWSServer's own default, restated because --bind is the argument
-  // after it.
-  MaxMessageBytes = 16 * 1024 * 1024;
+  // Upper bound on a passphrase file, in bytes. Real passphrases are far
+  // shorter; the cap stops a mistyped path (a log, /dev/zero) from being
+  // read whole.
+  MaxPassphraseFileBytes = 4096;
 
 type
   // Where the PKCS#12 passphrase comes from. Location is the file path
@@ -96,30 +98,53 @@ begin
     WriteLn('open id=', AConn.Id);
 end;
 
-// Reads a passphrase file whole and strips exactly one trailing newline
-// (LF or CRLF) — the one `echo` or an editor appends. Anything else,
-// including further newlines or spaces, is part of the passphrase.
+// Reads a passphrase file whole (at most MaxPassphraseFileBytes) and
+// strips exactly one trailing newline (LF or CRLF) — the one `echo` or an
+// editor appends. Anything else, including further newlines or spaces,
+// is part of the passphrase. Reads to end of file rather than trusting
+// the file size, so a pipe, a FIFO or a process substitution (`<(...)`),
+// which have none, work too. FileRead rather than a stream, whose Read
+// reports an I/O error as end of file.
 function ReadPassphraseFile(const APath: string): string;
 var
-  Stream: TFileStream;
-  Len: Integer;
+  Handle: THandle;
+  // One byte past the cap, so an oversized file is refused, not truncated.
+  Buffer: array[0..MaxPassphraseFileBytes] of Byte;
+  Total, Got, ReadError, Len: Integer;
 begin
   if DirectoryExists(APath) then
     raise Exception.CreateFmt('--pkcs12-pass-file %s is a directory',
       [APath]);
+  Handle := FileOpen(APath, fmOpenRead or fmShareDenyNone);
+  if Handle = feInvalidHandle then
+    raise Exception.CreateFmt('cannot read --pkcs12-pass-file %s: %s',
+      [APath, SysErrorMessage(GetLastOSError)]);
+  Total := 0;
+  ReadError := 0;
   try
-    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
-    try
-      SetLength(Result, Stream.Size);
-      if Length(Result) > 0 then
-        Stream.ReadBuffer(Result[1], Length(Result));
-    finally
-      Stream.Free;
-    end;
-  except
-    on E: Exception do
-      raise Exception.CreateFmt('cannot read --pkcs12-pass-file: %s',
-        [E.Message]);
+    repeat
+      Got := FileRead(Handle, Buffer[Total], Length(Buffer) - Total);
+      if Got < 0 then
+        ReadError := GetLastOSError
+      else
+        Inc(Total, Got);
+    until (Got <= 0) or (Total = Length(Buffer));
+  finally
+    FileClose(Handle);
+  end;
+  try
+    if ReadError <> 0 then
+      raise Exception.CreateFmt('cannot read --pkcs12-pass-file %s: %s',
+        [APath, SysErrorMessage(ReadError)]);
+    if Total > MaxPassphraseFileBytes then
+      raise Exception.CreateFmt(
+        '--pkcs12-pass-file %s is larger than %d bytes',
+        [APath, MaxPassphraseFileBytes]);
+    SetLength(Result, Total);
+    if Total > 0 then
+      Move(Buffer[0], Result[1], Total);
+  finally
+    FillChar(Buffer, SizeOf(Buffer), 0);
   end;
   Len := Length(Result);
   if (Len > 0) and (Result[Len] = #10) then
@@ -264,7 +289,7 @@ begin
         Tls.Pkcs12Passphrase := ReadPassphrase(PassphraseSource);
       end;
       Srv := TWSServer.Create(PortOpt.ValueOr(9001), Tls,
-        not NoDeflateOpt.Present, MaxMessageBytes, BindOpt.ValueOr(''));
+        not NoDeflateOpt.Present, WS_DEFAULT_MAX_MESSAGE, BindOpt.ValueOr(''));
     except
       on E: Exception do
       begin
