@@ -469,7 +469,7 @@ uses
   {$endif}
 
 const
-  HandshakeMaxBytes = 16 * 1024;
+  HandshakeTooLargeReason = 'request header block too large';
   // Smallest payload worth a gather write over a copy into the queue.
   // Set from load_test on epoll (separate cores): with no threshold the
   // two-element sendmsg ran ~2% behind copy + send at 20 B, and the two
@@ -1271,6 +1271,7 @@ var
   Conn: TWSConnection;
   Off, HdrEnd, LeftLen: Integer;
   Left: TBytes;
+  Resp: RawByteString;
 begin
   Conn := TWSConnection(ATConn.UserData);
   if Conn = nil then Exit;
@@ -1285,12 +1286,25 @@ begin
         Off := Length(Conn.FHsBuf);
         SetLength(Conn.FHsBuf, Off + ALen);
         Move(P^, Conn.FHsBuf[Off + 1], ALen);
-        if Length(Conn.FHsBuf) > HandshakeMaxBytes then
+        // The first Off bytes were searched on earlier reads: resume
+        // there, so the scan of a trickled request costs linear time.
+        HdrEnd := HandshakeFindEnd(PByte(Conn.FHsBuf), Length(Conn.FHsBuf),
+          Off);
+        // The cap bounds the header block, not the frames a client may
+        // pipeline behind a complete one. Past it, say why (RFC 6585 §5)
+        // before dropping, best effort like the 400 refusal: nothing has
+        // been sent on this connection yet, so unlike the 403 the reply
+        // cannot queue behind earlier output. A peer still sending may
+        // see a reset instead. The connection never opened: no OnOpen,
+        // no OnClientClose.
+        if ((HdrEnd = 0) and (Length(Conn.FHsBuf) > WS_MAX_HANDSHAKE)) or
+          (HdrEnd > WS_MAX_HANDSHAKE) then
         begin
+          Resp := ServerBuildReject(431, HandshakeTooLargeReason);
+          ATConn.SubmitSend(@Resp[1], Length(Resp));
           DropConn(Conn);
           Exit;
         end;
-        HdrEnd := HandshakeFindEnd(Conn.FHsBuf);
         if HdrEnd = 0 then Exit;
         // Frames pipelined behind the request get replayed post-101.
         LeftLen := Length(Conn.FHsBuf) - HdrEnd;

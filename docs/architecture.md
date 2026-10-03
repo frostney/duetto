@@ -71,7 +71,10 @@ Four nets, from innermost to outermost:
    raising hook the same way), a handler-fault section (a raising
    `OnMessage`, `OnOpen` or `Post` proc costs only its connection: 1011,
    reported to `OnError`, a bystander still echoes; a raising
-   `OnClientClose` is only reported), a
+   `OnClientClose` is only reported), a handshake-size section (a request
+   header block past the 16 KiB cap gets `431 Request Header Fields Too
+   Large`, while a block at the cap with frames pipelined behind it and a
+   client path longer than 2 KiB still upgrade), a
    plaintext egress-backpressure probe
    (a stalled reader backs the server's egress up — on Linux forcing the
    epoll gather write short mid-message; eight 1 MiB echoes must still
