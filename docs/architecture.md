@@ -30,7 +30,7 @@ once on protocol failure, after queueing the appropriate close frame
 | `WS.Handshake` | upgrade request/response both directions, `Sec-WebSocket-Accept`, deflate parameter negotiation |
 | `WS.Deflate` | RFC 7692 over paszlib: raw deflate, sync flush, 4-byte tail, context takeover control, inflate output cap |
 | `WS.Protocol` | the sans-I/O machine above |
-| `WS.Client` | blocking client, `ws://` and `wss://` (TLS via lwpt's TransportSecurity); messages queue for `ReadMessage`, or go to an optional synchronous `OnMessage` inside the read that completed them, so a reply leaves ahead of a close that a later frame in the same read provokes |
+| `WS.Client` | blocking client, `ws://` and `wss://` (TLS via lwpt's TransportSecurity); messages queue for `ReadMessage`, or go to an optional synchronous `OnMessage` inside the read that completed them, so a reply leaves ahead of a close that a later frame in the same read provokes; a failure after `Connect` (reset, dead peer, TLS error) never raises, it ends the connection (`Open` False, `ReadMessage` False / `wrrClosed`), while `Connect` raises only `EWSClient`; `ConnectTimeoutMs`, `HandshakeTimeoutMs` and `CloseTimeoutMs` (10 s, 10 s, 5 s by default) bound the TCP connect, the wait for the 101 and the wait for the close echo — over `wss://` they bound only the wait for ciphertext, and the TLS handshake itself stays unbounded until lwpt can disarm a handshake deadline; plaintext sends never raise `SIGPIPE` (`MSG_NOSIGNAL` on Linux, `SO_NOSIGPIPE` on Darwin; Linux `wss://` writes inside OpenSSL still can, duetto#79), `EINTR` is retried, and a reconnect releases everything the previous connection held, its undrained queue included |
 | `WS.Transport` | the completion-shaped transport contract (ADR-0001): submit sends/closes, receive data/lifecycle completions on the transport's execution context (ADR-0003); an optional gather send (ADR-0004: `SupportsGather` / `SubmitSendV`) that only a transport writing synchronously offers, letting the server hand frame header + caller payload to the socket without copying the payload into the out queue; also `WSParseBindAddress`, the strict IPv4/IPv6 literal parser every transport binds through (never a resolver) |
 | `WS.Transport.PostQueue` | thread-safe FIFO behind the reactor transports' `SubmitPost` (cross-thread `Conn.Post` hand-off); the Network.framework transport posts straight onto its per-connection GCD queues instead |
 | `WS.Transport.TlsServer` | platform-neutral per-connection server TLS over lwpt's memory-BIO accept API: handshake pump, accepted-prefix re-offer, input/output flow accounting, `close_notify` drain; used by the fd-owning transports only |
@@ -69,7 +69,13 @@ Four nets, from innermost to outermost:
    peer writes a valid message, an RSV2 frame and a ping in one send,
    both after the 101 and glued to it; the client's `OnMessage` echo must
    leave before its 1002 close, with nothing after it; `Close` from the
-   handler completes, `ReadMessage` from it raises), an upgrade-hook
+   handler completes, `ReadMessage` from it raises), a client-robustness
+   section (sends into a peer that hung up and reset, with `SIGPIPE`
+   back at its default action; connect, handshake and close timeouts
+   against a full backlog, a silent listener and a peer that never
+   echoes; a TLS handshake failure surfacing as `EWSClient`; a blocking
+   read interrupted by signals; reconnects after undrained messages and
+   after a raising `OnMessage`), an upgrade-hook
    section (a server
    bound to `127.0.0.1` explicitly whose `OnUpgradeRequest` refuses one
    `Origin` with a 403 — no `OnOpen`, no `OnClientClose` — treats a
@@ -87,7 +93,8 @@ Four nets, from innermost to outermost:
    arrive intact and in order), and — on Linux — a `wss://` section
    against a TLS listener built from a runtime-generated identity
    (handshake, echo, flow-control windows, `close_notify`, handshake
-   deadline, inbound pre-handshake budget).
+   deadline, inbound pre-handshake budget, and a client whose TLS stream
+   breaks mid-session through a garbage record or a reset).
 3. **The Autobahn testsuite** in both directions via Docker — the industry
    conformance net. See [tooling.md](tooling.md#autobahn-testsuite) for how
    it runs and is judged.

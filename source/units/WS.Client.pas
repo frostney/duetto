@@ -11,6 +11,20 @@ unit WS.Client;
 // An optional OnMessage handler takes delivery synchronously, inside the
 // read, for applications that must answer a message before anything
 // later in the same read is acted on.
+//
+// Failure contract: a dead peer, a reset, a failed send or a TLS error
+// never raises out of a send, a read or Close. It ends the connection
+// (Open goes False), and the next ReadMessage reports it (False /
+// wrrClosed, CloseCode 1006 unless a close frame arrived). Connect is the
+// one call that raises, always EWSClient, TLS failures included.
+//
+// SIGPIPE: plaintext sends carry MSG_NOSIGNAL on Linux, and Darwin
+// sockets set SO_NOSIGPIPE, which also covers lwpt's SecureTransport
+// writes. On Linux, wss:// writes go through OpenSSL's own socket BIO,
+// which this unit cannot flag: a write into a reset TLS connection (the
+// close_notify a teardown sends included) can still raise SIGPIPE there
+// until lwpt sends with MSG_NOSIGNAL (duetto#79). A Linux process using
+// wss:// should ignore SIGPIPE until then.
 
 {$I Shared.inc}
 
@@ -38,6 +52,11 @@ const
   {$else}
   WSSocketInvalid = TWSPlatformSocket(-1);
   {$endif}
+
+  // TWSClient's timeout defaults, in milliseconds. See the properties.
+  WSDefaultConnectTimeoutMs = 10000;
+  WSDefaultHandshakeTimeoutMs = 10000;
+  WSDefaultCloseTimeoutMs = 5000;
 
 type
   // Outcome of the bounded ReadMessage overload.
@@ -68,6 +87,10 @@ type
     FDeflate: TWSDeflateParams;
     FOnMessage: TWSClientMessage;
     FDelivering: Boolean; // inside OnMessage, i.e. inside FProto.Ingest
+    FConnectTimeoutMs: Integer;
+    FHandshakeTimeoutMs: Integer;
+    FCloseTimeoutMs: Integer;
+    FTlsError: string; // the last TLS failure, for Connect's message
 
     // pending complete messages (several can arrive in one TCP read)
     FQueue: array of record Text: Boolean; Data: TBytes; end;
@@ -78,16 +101,33 @@ type
     procedure ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
     function RawRead(P: PByte; ALen: Integer): Integer;
     function RawWrite(P: PByte; ALen: Integer): Integer;
+    function TlsRead(P: PByte; ALen: Integer): Integer;
+    function TlsWrite(P: PByte; ALen: Integer): Integer;
     procedure FlushOut;
     function PumpOnce: Boolean;
     function WaitReadable(ATimeoutMs: Integer): Boolean;
     procedure PopMessage(out AText: Boolean; out AData: TBytes); inline;
     procedure RefuseReadInHandler; inline;
+    procedure ReleaseTransport;
+    procedure ResetConnection;
+    procedure StartTls(const AHost: string);
+    function ReadUpgradeResponse(ADeadline: QWord; out AHeaderEnd: Integer;
+      const APeer: string): RawByteString;
+    procedure AwaitCloseEcho;
   public
     constructor Create;
     destructor Destroy; override;
 
     // url: ws://host[:port]/path or wss://host[:port]/path
+    //
+    // Raises EWSClient on any failure — resolution, connect, TLS, a
+    // timeout or a rejected upgrade — and leaves no socket or TLS
+    // session behind. A client is reusable: Connect after Close, after a
+    // failed Connect or after a connection ended by itself (a dead peer,
+    // a raising OnMessage) first releases everything the previous
+    // connection held, its undrained ReadMessage queue included. Until
+    // then that queue stays readable, so messages that arrived before a
+    // close are not lost to it. Connect on an open client raises.
     procedure Connect(const AUrl: string; AOfferDeflate: Boolean = False;
       AMaxMessage: NativeInt = WS_DEFAULT_MAX_MESSAGE);
 
@@ -130,7 +170,8 @@ type
     function ReadMessage(out AText: Boolean; out AData: TBytes;
       ATimeoutMs: Integer): TWSReadResult; overload;
 
-    // Initiate the closing handshake and wait (bounded) for the echo.
+    // Initiate the closing handshake, wait at most CloseTimeoutMs for the
+    // echo, then drop TCP regardless. Never raises on a dead connection.
     procedure Close(ACode: Word = 1000; const AReason: string = '');
 
     // Optional synchronous delivery, the client's counterpart of the
@@ -156,6 +197,39 @@ type
     // the bounded form returns wrrTimeout or wrrClosed. Messages queued
     // before the handler was assigned are still returned by ReadMessage.
     property OnMessage: TWSClientMessage read FOnMessage write FOnMessage;
+
+    // Timeouts, in milliseconds, read by the next Connect or Close. Every
+    // bound runs on WSMonotonicMs, so a wall-clock step cannot move it.
+    //
+    // ConnectTimeoutMs (default 10 s) bounds the TCP connect, shared by
+    // every address a name resolves to. Name resolution itself is not
+    // bounded. <= 0 waits as long as the OS keeps trying (minutes on
+    // Linux against a host that drops SYNs).
+    //
+    // HandshakeTimeoutMs (default 10 s) starts once TCP is connected and
+    // bounds the opening handshake: sending the upgrade request and
+    // waiting for the 101. <= 0 waits indefinitely. Over wss:// it is
+    // weaker. The TLS handshake counts against the budget but is not cut
+    // short by it: lwpt's TransportSecurity keeps a handshake deadline
+    // armed for the life of the session, so a long-lived connection would
+    // fail once it had passed, and the TLS handshake runs without one
+    // until lwpt can disarm it. The wait for the 101 is then bounded only
+    // until TLS bytes arrive, as in the bounded ReadMessage: once a
+    // record starts arriving the read blocks until an application record
+    // completes. A server that stalls inside TLS is not bounded.
+    //
+    // CloseTimeoutMs (default 5 s) bounds Close's wait for the peer's
+    // close echo; TCP is dropped when it runs out. <= 0 skips the wait:
+    // the close frame is sent and the connection dropped at once. The
+    // wait covers arriving bytes only, with the same wss:// caveat as the
+    // bounded ReadMessage, and a close frame queued behind a peer that
+    // has stopped reading is sent on a blocking socket.
+    property ConnectTimeoutMs: Integer read FConnectTimeoutMs
+      write FConnectTimeoutMs;
+    property HandshakeTimeoutMs: Integer read FHandshakeTimeoutMs
+      write FHandshakeTimeoutMs;
+    property CloseTimeoutMs: Integer read FCloseTimeoutMs
+      write FCloseTimeoutMs;
 
     property Open: Boolean read FOpen;
     property Deflate: TWSDeflateParams read FDeflate;
@@ -212,13 +286,265 @@ begin
   if AHost = '' then raise EWSClient.Create('missing host in URL');
 end;
 
+{ sockets }
+
+const
+  {$ifdef LINUX}
+  // A send into a reset connection fails with EPIPE instead of raising
+  // SIGPIPE, which would kill the host process.
+  WSSendFlags = MSG_NOSIGNAL;
+  {$else}
+  WSSendFlags = 0;
+  {$endif}
+  {$ifdef DARWIN}
+  // <sys/socket.h>. Darwin has no MSG_NOSIGNAL; set on the socket, it
+  // covers every send through it, lwpt's SecureTransport writes included.
+  WSSoNoSigPipe = $1022;
+  {$endif}
+  WSNoDeadline = 0;
+
+// The deadline for a timeout property: WSNoDeadline when ATimeoutMs <= 0.
+function DeadlineAfter(ATimeoutMs: Integer): QWord;
+begin
+  if ATimeoutMs <= 0 then Exit(WSNoDeadline);
+  Result := WSMonotonicMs + QWord(ATimeoutMs);
+end;
+
+// Milliseconds left before ADeadline: -1 (wait without limit) for
+// WSNoDeadline, 0 once it has passed.
+function RemainingMs(ADeadline: QWord): Integer;
+var
+  Left: Int64;
+begin
+  if ADeadline = WSNoDeadline then Exit(-1);
+  Left := Int64(ADeadline) - Int64(WSMonotonicMs);
+  if Left <= 0 then Exit(0);
+  if Left > High(Integer) then Exit(High(Integer));
+  Result := Integer(Left);
+end;
+
+procedure CloseSocketHandle(ASock: TWSPlatformSocket);
+begin
+  {$ifdef UNIX}
+  CloseSocket(ASock);
+  {$else}
+  WinSock2.closesocket(ASock);
+  {$endif}
+end;
+
+// Wait at most ATimeoutMs milliseconds (-1 = no limit) for ASock to turn
+// readable, or writable when AWrite. > 0 = ready, 0 = the time ran out
+// or a signal cut the wait short (callers re-derive what is left of
+// their deadline), < 0 = the wait itself failed.
+//
+// An error or a hangup counts as ready: the call that follows is what
+// turns it into the right close code or failure, and swallowing it here
+// would only stall until the deadline.
+//
+// POSIX uses poll rather than select: select's fd_set caps at
+// FD_MAXFDSET (1024) and fpFD_SET silently does nothing above it, which
+// would leave the set empty and turn every wait into a full-length false
+// timeout in a process holding many descriptors.
+function WaitSocket(ASock: TWSPlatformSocket; AWrite: Boolean;
+  ATimeoutMs: Integer): Integer;
+var
+  {$ifdef UNIX}
+  PFD: TPollFd;
+  {$else}
+  Ready, Failed: TFDSet;
+  TV: TTimeVal;
+  PTV: PTimeVal;
+  {$endif}
+begin
+  {$ifdef UNIX}
+  PFD.fd := ASock;
+  if AWrite then PFD.events := POLLOUT else PFD.events := POLLIN;
+  PFD.revents := 0;
+  Result := FpPoll(@PFD, 1, ATimeoutMs);
+  if Result < 0 then
+  begin
+    if fpGetErrno = ESysEINTR then Result := 0;
+    Exit;
+  end;
+  if (Result > 0) and ((PFD.revents and
+      (PFD.events or POLLERR or POLLHUP or POLLNVAL)) = 0) then
+    Result := 0;
+  {$else}
+  // One socket per set, and the sets store handles rather than indexing
+  // by them, so FD_SETSIZE is moot; WinSock ignores nfds.
+  Ready.fd_count := 1;
+  Ready.fd_array[0] := ASock;
+  Failed.fd_count := 1;
+  Failed.fd_array[0] := ASock;
+  PTV := nil;
+  if ATimeoutMs >= 0 then
+  begin
+    TV.tv_sec := ATimeoutMs div 1000;
+    TV.tv_usec := (ATimeoutMs mod 1000) * 1000;
+    PTV := @TV;
+  end;
+  // A failed non-blocking connect shows up in the exception set only.
+  if AWrite then
+    Result := WinSock2.select(0, nil, @Ready, @Failed, PTV)
+  else
+    Result := WinSock2.select(0, @Ready, nil, nil, PTV);
+  // WinSock has no EINTR: a failed select is a failed wait.
+  if Result = SOCKET_ERROR then Result := -1;
+  {$endif}
+end;
+
+function SetNonBlocking(ASock: TWSPlatformSocket; AOn: Boolean): Boolean;
+var
+  {$ifdef UNIX}
+  Flags: cint;
+  {$else}
+  Mode: u_long;
+  {$endif}
+begin
+  {$ifdef UNIX}
+  Flags := FpFcntl(ASock, F_GETFL);
+  if Flags < 0 then Exit(False);
+  if AOn then
+    Flags := Flags or O_NONBLOCK
+  else
+    Flags := Flags and not O_NONBLOCK;
+  Result := FpFcntl(ASock, F_SETFL, Flags) = 0;
+  {$else}
+  Mode := Ord(AOn);
+  Result := WinSock2.ioctlsocket(ASock, LongInt(FIONBIO), Mode) = 0;
+  {$endif}
+end;
+
+// The connect's own outcome, read once the socket turned writable.
+function PendingConnectError(ASock: TWSPlatformSocket): Integer;
+var
+  {$ifdef UNIX}
+  Len: TSockLen;
+  {$else}
+  Len: LongInt;
+  {$endif}
+begin
+  Result := 0;
+  Len := SizeOf(Result);
+  {$ifdef UNIX}
+  if fpGetSockOpt(ASock, SOL_SOCKET, SO_ERROR, @Result, @Len) <> 0 then
+    Result := fpGetErrno;
+  {$else}
+  if WinSock2.getsockopt(ASock, SOL_SOCKET, SO_ERROR, PChar(@Result),
+      Len) <> 0 then
+    Result := WSAGetLastError;
+  {$endif}
+end;
+
+// Socket options every client connection carries.
+procedure ConfigureClientSocket(ASock: TWSPlatformSocket);
+var
+  One: Integer;
+begin
+  One := 1;
+  {$ifdef DARWIN}
+  fpSetSockOpt(ASock, SOL_SOCKET, WSSoNoSigPipe, @One, SizeOf(One));
+  {$endif}
+  {$ifdef UNIX}
+  fpSetSockOpt(ASock, IPPROTO_TCP, TCP_NODELAY, @One, SizeOf(One));
+  {$else}
+  WinSock2.setsockopt(ASock, IPPROTO_TCP, TCP_NODELAY, @One, SizeOf(One));
+  {$endif}
+end;
+
+// Connect one resolved address before ADeadline (WSNoDeadline = as long
+// as the OS keeps trying). Returns a connected socket, back in blocking
+// mode and configured for the client, or WSSocketInvalid with AError
+// saying why — 'timed out' when the deadline ran out first. Callers with
+// several addresses try each in turn against one shared deadline.
+//
+// The connect runs non-blocking so the deadline can cut it short. A
+// signal interrupting it (EINTR) does not abort it: the connection keeps
+// establishing in the background, so it is awaited like EINPROGRESS.
+function ConnectAddress(AFamily: Integer; AAddr: PSockAddr;
+  AAddrLen: Integer; ADeadline: QWord; out AError: string): TWSPlatformSocket;
+var
+  Sock: TWSPlatformSocket;
+  Code, Ready: Integer;
+  Pending: Boolean;
+begin
+  Result := WSSocketInvalid;
+  AError := '';
+  {$ifdef UNIX}
+  Sock := fpSocket(AFamily, SOCK_STREAM, 0);
+  if Sock < 0 then
+  {$else}
+  Sock := WinSock2.socket(AFamily, SOCK_STREAM, IPPROTO_TCP);
+  if Sock = WSSocketInvalid then
+  {$endif}
+  begin
+    AError := 'socket() failed';
+    Exit;
+  end;
+  try
+    if not SetNonBlocking(Sock, True) then
+    begin
+      AError := 'cannot make the socket non-blocking';
+      Exit;
+    end;
+
+    {$ifdef UNIX}
+    Pending := fpConnect(Sock, AAddr, AAddrLen) <> 0;
+    if Pending then Code := fpGetErrno else Code := 0;
+    if Pending and (Code <> ESysEINPROGRESS) and (Code <> ESysEINTR) then
+    {$else}
+    Pending := WinSock2.connect(Sock, AAddr, AAddrLen) = SOCKET_ERROR;
+    if Pending then Code := WSAGetLastError else Code := 0;
+    if Pending and (Code <> WSAEWOULDBLOCK) then
+    {$endif}
+    begin
+      AError := Format('%s (%d)', [SysErrorMessage(Code), Code]);
+      Exit;
+    end;
+
+    while Pending do
+    begin
+      Ready := RemainingMs(ADeadline);
+      if Ready = 0 then
+      begin
+        AError := 'timed out';
+        Exit;
+      end;
+      Ready := WaitSocket(Sock, True, Ready);
+      if Ready < 0 then
+      begin
+        AError := 'readiness wait failed';
+        Exit;
+      end;
+      Pending := Ready = 0; // out of time or interrupted: re-derive, wait on
+    end;
+    Code := PendingConnectError(Sock);
+    if Code <> 0 then
+    begin
+      AError := Format('%s (%d)', [SysErrorMessage(Code), Code]);
+      Exit;
+    end;
+
+    if not SetNonBlocking(Sock, False) then
+    begin
+      AError := 'cannot make the socket blocking again';
+      Exit;
+    end;
+    ConfigureClientSocket(Sock);
+    Result := Sock;
+  finally
+    if Result = WSSocketInvalid then CloseSocketHandle(Sock);
+  end;
+end;
+
 {$ifdef UNIX}
-function ResolveAndConnect(const AHost: string; APort: Integer): Tsocket;
+function ResolveAndConnect(const AHost: string; APort: Integer;
+  ADeadline: QWord): TWSPlatformSocket;
 var
   SA: TInetSockAddr;
   HE: THostEntry;
   Addr: in_addr;
-  One: Integer;
+  Err: string;
 begin
   Addr := StrToNetAddr(AHost);
   if Addr.s_addr = 0 then
@@ -239,21 +565,14 @@ begin
       raise EWSClient.CreateFmt('cannot resolve %s', [AHost]);
   end;
 
-  Result := fpSocket(AF_INET, SOCK_STREAM, 0);
-  if Result < 0 then raise EWSClient.Create('socket() failed');
-
   FillChar(SA, SizeOf(SA), 0);
   SA.sin_family := AF_INET;
   SA.sin_port := htons(APort);
   SA.sin_addr := Addr;
-  if fpConnect(Result, @SA, SizeOf(SA)) <> 0 then
-  begin
-    CloseSocket(Result);
-    raise EWSClient.CreateFmt('connect to %s:%d failed', [AHost, APort]);
-  end;
-
-  One := 1;
-  fpSetSockOpt(Result, IPPROTO_TCP, TCP_NODELAY, @One, SizeOf(One));
+  Result := ConnectAddress(AF_INET, @SA, SizeOf(SA), ADeadline, Err);
+  if Result = WSSocketInvalid then
+    raise EWSClient.CreateFmt('connect to %s:%d failed: %s',
+      [AHost, APort, Err]);
 end;
 {$endif}
 
@@ -290,13 +609,13 @@ begin
   WinSockInitialized := True;
 end;
 
-function ResolveAndConnect(const AHost: string;
-  APort: Integer): TWSPlatformSocket;
+function ResolveAndConnect(const AHost: string; APort: Integer;
+  ADeadline: QWord): TWSPlatformSocket;
 var
   Hints: TWSAddrInfo;
   Info, Current: PWSAddrInfo;
   Host, Service: AnsiString;
-  One: Integer;
+  Err: string;
 begin
   EnsureWinSockInitialized;
   FillChar(Hints, SizeOf(Hints), 0);
@@ -310,29 +629,21 @@ begin
     raise EWSClient.CreateFmt('cannot resolve %s', [AHost]);
 
   Result := WSSocketInvalid;
+  Err := 'no address';
   try
     Current := Info;
-    while Current <> nil do
+    while (Current <> nil) and (Result = WSSocketInvalid) do
     begin
-      Result := WinSock2.socket(Current^.ai_family, Current^.ai_socktype,
-        Current^.ai_protocol);
-      if Result <> WSSocketInvalid then
-      begin
-        if WinSock2.connect(Result, Current^.ai_addr,
-            Current^.ai_addrlen) = 0 then Break;
-        WinSock2.closesocket(Result);
-        Result := WSSocketInvalid;
-      end;
+      Result := ConnectAddress(Current^.ai_family, Current^.ai_addr,
+        Integer(Current^.ai_addrlen), ADeadline, Err);
       Current := Current^.ai_next;
     end;
   finally
     C_freeaddrinfo(Info);
   end;
   if Result = WSSocketInvalid then
-    raise EWSClient.CreateFmt('connect to %s:%d failed', [AHost, APort]);
-
-  One := 1;
-  WinSock2.setsockopt(Result, IPPROTO_TCP, TCP_NODELAY, @One, SizeOf(One));
+    raise EWSClient.CreateFmt('connect to %s:%d failed: %s',
+      [AHost, APort, Err]);
 end;
 {$endif}
 
@@ -342,46 +653,107 @@ constructor TWSClient.Create;
 begin
   inherited;
   FSock := WSSocketInvalid;
+  FConnectTimeoutMs := WSDefaultConnectTimeoutMs;
+  FHandshakeTimeoutMs := WSDefaultHandshakeTimeoutMs;
+  FCloseTimeoutMs := WSDefaultCloseTimeoutMs;
   SetLength(FRecvBuf, 64 * 1024);
 end;
 
 destructor TWSClient.Destroy;
 begin
-  if FUseTls and FTls.Active then CloseTransportSecurity(FTls);
-  if FSock <> WSSocketInvalid then
-  begin
-    {$ifdef UNIX}
-    CloseSocket(FSock);
-    {$else}
-    WinSock2.closesocket(FSock);
-    {$endif}
-  end;
+  ReleaseTransport;
   FProto.Free;
   inherited;
 end;
 
+// Close the TLS session and the socket, whatever state they are in. Safe
+// to repeat; the protocol object and the queue are left alone, so
+// CloseCode and undrained messages stay readable.
+procedure TWSClient.ReleaseTransport;
+begin
+  if FTls.Active then
+  try
+    CloseTransportSecurity(FTls);
+  except
+    // A session that already failed may fail its close_notify too; the
+    // socket below goes regardless.
+    on ETransportSecurityError do;
+  end;
+  if FSock <> WSSocketInvalid then
+  begin
+    CloseSocketHandle(FSock);
+    FSock := WSSocketInvalid;
+  end;
+end;
+
+// Everything the previous connection left behind, before a new one.
+procedure TWSClient.ResetConnection;
+begin
+  ReleaseTransport;
+  FreeAndNil(FProto);
+  FQueue := nil;
+  FQHead := 0;
+  FQTail := 0;
+  FDeflate := Default(TWSDeflateParams);
+  FTlsError := '';
+  FOpen := False;
+end;
+
+// lwpt raises ETransportSecurityError for a failed TLS read or write (a
+// bad record, a reset, an EOF without close_notify). Inside a session
+// that is a dead connection like any other: report it as one (-1), so
+// the callers' FOpen := False path handles it and nothing escapes a send,
+// a read or Close.
+function TWSClient.TlsRead(P: PByte; ALen: Integer): Integer;
+begin
+  try
+    Result := TransportSecurityRead(FTls, PWSByteSpan(P)^, ALen);
+  except
+    on E: ETransportSecurityError do
+    begin
+      FTlsError := E.Message;
+      Result := -1;
+    end;
+  end;
+end;
+
+function TWSClient.TlsWrite(P: PByte; ALen: Integer): Integer;
+begin
+  try
+    Result := TransportSecurityWrite(FTls, P, ALen);
+  except
+    on E: ETransportSecurityError do
+    begin
+      FTlsError := E.Message;
+      Result := -1;
+    end;
+  end;
+end;
+
+// A signal landing while the call blocks (EINTR) is retried: it says
+// nothing about the connection.
 function TWSClient.RawRead(P: PByte; ALen: Integer): Integer;
 begin
-  if FUseTls then
-    Result := TransportSecurityRead(FTls, PWSByteSpan(P)^, ALen)
-  else
-    {$ifdef UNIX}
+  if FUseTls then Exit(TlsRead(P, ALen));
+  {$ifdef UNIX}
+  repeat
     Result := fpRecv(FSock, P, ALen, 0);
-    {$else}
-    Result := WinSock2.recv(FSock, P^, ALen, 0);
-    {$endif}
+  until (Result >= 0) or (fpGetErrno <> ESysEINTR);
+  {$else}
+  Result := WinSock2.recv(FSock, P^, ALen, 0);
+  {$endif}
 end;
 
 function TWSClient.RawWrite(P: PByte; ALen: Integer): Integer;
 begin
-  if FUseTls then
-    Result := TransportSecurityWrite(FTls, P, ALen)
-  else
-    {$ifdef UNIX}
-    Result := fpSend(FSock, P, ALen, 0);
-    {$else}
-    Result := WinSock2.send(FSock, P^, ALen, 0);
-    {$endif}
+  if FUseTls then Exit(TlsWrite(P, ALen));
+  {$ifdef UNIX}
+  repeat
+    Result := fpSend(FSock, P, ALen, WSSendFlags);
+  until (Result >= 0) or (fpGetErrno <> ESysEINTR);
+  {$else}
+  Result := WinSock2.send(FSock, P^, ALen, 0);
+  {$endif}
 end;
 
 procedure TWSClient.FlushOut;
@@ -437,65 +809,119 @@ begin
   Inc(FQTail);
 end;
 
+// No deadline for the TLS handshake itself, deliberately: lwpt keeps the
+// deadline it is given armed on the session for good, and every later
+// read or write that has to wait re-checks it — on macOS that is any
+// record split across TCP segments — so a long-lived connection would
+// fail once the handshake budget had passed. See HandshakeTimeoutMs.
+procedure TWSClient.StartTls(const AHost: string);
+begin
+  try
+    StartTransportSecurity(FTls, FSock, AHost);
+  except
+    on E: ETransportSecurityError do
+      raise EWSClient.Create('TLS handshake failed: ' + E.Message);
+  end;
+  if not FTls.Active then
+    raise EWSClient.Create('TLS handshake failed');
+end;
+
+// Read the upgrade response up to its header terminator; bytes after it
+// (AHeaderEnd onwards) are frame data the server pipelined behind the
+// 101. Every blocking read waits on a readiness poll sized by what is
+// left of ADeadline first.
+function TWSClient.ReadUpgradeResponse(ADeadline: QWord;
+  out AHeaderEnd: Integer; const APeer: string): RawByteString;
+var
+  Buf: array[0..8191] of Byte;
+  Got, Ready: Integer;
+begin
+  Result := '';
+  AHeaderEnd := 0;
+  repeat
+    if ADeadline <> WSNoDeadline then
+    begin
+      Ready := RemainingMs(ADeadline);
+      if Ready > 0 then Ready := WaitSocket(FSock, False, Ready);
+      if Ready < 0 then
+        raise EWSClient.Create('connection lost in handshake');
+      if Ready = 0 then
+      begin
+        // The time ran out, or a signal cut the wait short.
+        if RemainingMs(ADeadline) = 0 then
+          raise EWSClient.CreateFmt('handshake with %s timed out after %d ms',
+            [APeer, FHandshakeTimeoutMs]);
+        Continue;
+      end;
+    end;
+    Got := RawRead(@Buf[0], SizeOf(Buf));
+    if Got <= 0 then
+    begin
+      if FTlsError <> '' then
+        raise EWSClient.Create('connection lost in handshake: ' + FTlsError);
+      raise EWSClient.Create('connection lost in handshake');
+    end;
+    SetLength(Result, Length(Result) + Got);
+    Move(Buf[0], Result[Length(Result) - Got + 1], Got);
+    if Length(Result) > 64 * 1024 then
+      raise EWSClient.Create('handshake response too large');
+    AHeaderEnd := HandshakeFindEnd(Result);
+  until AHeaderEnd > 0;
+end;
+
 procedure TWSClient.Connect(const AUrl: string; AOfferDeflate: Boolean;
   AMaxMessage: NativeInt);
 var
-  Host, Path, Key, Req, Err: string;
+  Host, Path, Key, Req, Err, Peer: string;
   Port: Integer;
   Raw: RawByteString;
-  Buf: array[0..8191] of Byte;
-  Got, HdrEnd: Integer;
+  HdrEnd: Integer;
+  Deadline: QWord;
 begin
+  // Inside OnMessage the previous connection's read is still running on
+  // the protocol object a reconnect would free.
+  if FDelivering then
+    raise EWSClient.Create('cannot connect from inside OnMessage');
   if FOpen then raise EWSClient.Create('already connected');
+  ResetConnection;
   ParseWsUrl(AUrl, FUseTls, Host, Port, Path);
+  Peer := Host + ':' + IntToStr(Port);
 
-  {$ifdef UNIX}
-  FSock := ResolveAndConnect(Host, Port);
-  {$else}
-  FSock := ResolveAndConnect(Host, Port);
-  {$endif}
+  try
+    FSock := ResolveAndConnect(Host, Port, DeadlineAfter(FConnectTimeoutMs));
+    Deadline := DeadlineAfter(FHandshakeTimeoutMs);
+    if FUseTls then StartTls(Host);
 
-  if FUseTls then
-  begin
-    StartTransportSecurity(FTls, FSock, Host);
-    if not FTls.Active then
-      raise EWSClient.Create('TLS handshake failed');
+    Key := ClientGenerateKey;
+    if (Port = 80) or (Port = 443) then
+      Req := ClientBuildRequest(Host, Path, Key, AOfferDeflate)
+    else
+      Req := ClientBuildRequest(Peer, Path, Key, AOfferDeflate);
+    if RawWrite(@Req[1], Length(Req)) <> Length(Req) then
+      raise EWSClient.Create('handshake send failed');
+
+    Raw := ReadUpgradeResponse(Deadline, HdrEnd, Peer);
+    if not ClientParseResponse(Copy(Raw, 1, HdrEnd), Key, AOfferDeflate,
+        FDeflate, Err) then
+      raise EWSClient.Create('handshake rejected: ' + Err);
+
+    FProto := TWSProtocol.Create(wsrClient, FDeflate, AMaxMessage);
+    FProto.OnMessage := ProtoMessage;
+    FOpen := True;
+
+    // Anything the server pipelined behind its 101 goes straight in.
+    if HdrEnd < Length(Raw) then
+      if not FProto.Ingest(@Raw[HdrEnd + 1], Length(Raw) - HdrEnd) then
+        FOpen := False;
+    FlushOut;
+  except
+    // Nothing half-open survives a failed Connect (a raising OnMessage
+    // on a pipelined message included). The protocol object stays for
+    // CloseCode until the next Connect or Free.
+    FOpen := False;
+    ReleaseTransport;
+    raise;
   end;
-
-  Key := ClientGenerateKey;
-  if (Port = 80) or (Port = 443) then
-    Req := ClientBuildRequest(Host, Path, Key, AOfferDeflate)
-  else
-    Req := ClientBuildRequest(Host + ':' + IntToStr(Port), Path, Key,
-      AOfferDeflate);
-  if RawWrite(@Req[1], Length(Req)) <> Length(Req) then
-    raise EWSClient.Create('handshake send failed');
-
-  // Read until the header terminator. Bytes after it are frame data.
-  Raw := '';
-  repeat
-    Got := RawRead(@Buf[0], SizeOf(Buf));
-    if Got <= 0 then raise EWSClient.Create('connection lost in handshake');
-    SetLength(Raw, Length(Raw) + Got);
-    Move(Buf[0], Raw[Length(Raw) - Got + 1], Got);
-    if Length(Raw) > 64 * 1024 then
-      raise EWSClient.Create('handshake response too large');
-    HdrEnd := HandshakeFindEnd(Raw);
-  until HdrEnd > 0;
-
-  if not ClientParseResponse(Copy(Raw, 1, HdrEnd), Key, AOfferDeflate,
-      FDeflate, Err) then
-    raise EWSClient.Create('handshake rejected: ' + Err);
-
-  FProto := TWSProtocol.Create(wsrClient, FDeflate, AMaxMessage);
-  FProto.OnMessage := ProtoMessage;
-  FOpen := True;
-
-  // Anything the server pipelined behind its 101 goes straight in.
-  if HdrEnd < Length(Raw) then
-    if not FProto.Ingest(@Raw[HdrEnd + 1], Length(Raw) - HdrEnd) then
-      FOpen := False;
-  FlushOut;
 end;
 
 function TWSClient.PumpOnce: Boolean;
@@ -518,58 +944,17 @@ end;
 // True when the socket has bytes to read within ATimeoutMs milliseconds
 // (0 = one non-blocking check). An unrecoverable readiness failure is
 // recorded the way every other death here is — FOpen goes False — so the
-// caller ends the connection instead of spinning on a permanent error.
+// caller ends the connection instead of spinning on a permanent error; a
+// signal only cuts the wait short, and the caller re-derives the rest.
 // The bounded ReadMessage overload documents what this cannot see over
 // wss://.
-//
-// POSIX uses poll rather than select: select's fd_set caps at
-// FD_MAXFDSET (1024) and fpFD_SET silently does nothing above it, which
-// would leave the read set empty and turn every wait into a full-length
-// false timeout in a process holding many descriptors.
 function TWSClient.WaitReadable(ATimeoutMs: Integer): Boolean;
 var
-  {$ifdef UNIX}
-  PFD: TPollFd;
-  {$else}
-  FDs: TFDSet;
-  TV: TTimeVal;
-  {$endif}
   Ready: Integer;
 begin
-  {$ifdef UNIX}
-  PFD.fd := FSock;
-  PFD.events := POLLIN;
-  PFD.revents := 0;
-  Ready := FpPoll(@PFD, 1, ATimeoutMs);
-  if Ready < 0 then
-  begin
-    // A signal only cuts the wait short — the caller re-derives the
-    // remainder, so time still advances. Anything else (EBADF, EINVAL)
-    // would repeat forever at full CPU, so it ends the connection.
-    if fpGetErrno <> ESysEINTR then FOpen := False;
-    Exit(False);
-  end;
-  // POLLERR/POLLHUP/POLLNVAL count as readable: the read that follows is
-  // what turns them into the right close code or failure, and swallowing
-  // them here would only stall until the deadline.
-  Result := (Ready > 0) and ((PFD.revents and
-    (POLLIN or POLLERR or POLLHUP or POLLNVAL)) <> 0);
-  {$else}
-  TV.tv_sec := ATimeoutMs div 1000;
-  TV.tv_usec := (ATimeoutMs mod 1000) * 1000;
-  WinSock2.FD_ZERO(FDs);
-  WinSock2.FD_SET(FSock, FDs);
-  // WinSock ignores the nfds parameter. One socket per set, and the set
-  // stores handles rather than indexing by them, so FD_SETSIZE is moot.
-  Ready := WinSock2.select(0, @FDs, nil, nil, @TV);
-  if Ready = SOCKET_ERROR then
-  begin
-    // No EINTR here — a failed select is fatal for this connection.
-    FOpen := False;
-    Exit(False);
-  end;
+  Ready := WaitSocket(FSock, False, ATimeoutMs);
+  if Ready < 0 then FOpen := False;
   Result := Ready > 0;
-  {$endif}
 end;
 
 procedure TWSClient.PopMessage(out AText: Boolean; out AData: TBytes);
@@ -681,11 +1066,30 @@ begin
   FlushOut;
 end;
 
-procedure TWSClient.Close(ACode: Word; const AReason: string);
+// Pump until the peer's close echo arrives or CloseTimeoutMs runs out.
+// Messages arriving meanwhile still queue (or reach OnMessage).
+procedure TWSClient.AwaitCloseEcho;
 var
-  Spins: Integer;
+  Deadline: QWord;
+  Remaining: Int64;
 begin
-  if FProto = nil then Exit;
+  if FCloseTimeoutMs <= 0 then Exit;
+  Deadline := WSMonotonicMs + QWord(FCloseTimeoutMs);
+  Remaining := FCloseTimeoutMs;
+  while FOpen and not FProto.CloseDone and (Remaining > 0) do
+  begin
+    if WaitReadable(Integer(Remaining)) then PumpOnce;
+    Remaining := Int64(Deadline) - Int64(WSMonotonicMs);
+  end;
+end;
+
+procedure TWSClient.Close(ACode: Word; const AReason: string);
+begin
+  if FProto = nil then
+  begin
+    ReleaseTransport;
+    Exit;
+  end;
   if FDelivering then
   begin
     // Inside OnMessage the read below us is still running and cannot be
@@ -704,25 +1108,10 @@ begin
   begin
     FProto.SendClose(ACode, AReason); // no-op once a close went out
     FlushOut;
-    // Bounded wait for the peer's close echo; then drop TCP regardless.
-    Spins := 0;
-    while FOpen and not FProto.CloseDone and (Spins < 64) do
-    begin
-      PumpOnce;
-      Inc(Spins);
-    end;
+    AwaitCloseEcho;
   end;
   FOpen := False;
-  if FUseTls and FTls.Active then CloseTransportSecurity(FTls);
-  if FSock <> WSSocketInvalid then
-  begin
-    {$ifdef UNIX}
-    CloseSocket(FSock);
-    {$else}
-    WinSock2.closesocket(FSock);
-    {$endif}
-    FSock := WSSocketInvalid;
-  end;
+  ReleaseTransport;
 end;
 
 function TWSClient.CloseCode: Word;
