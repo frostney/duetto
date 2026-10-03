@@ -41,10 +41,12 @@ wsautobahn = { source = "source/apps/wsautobahn.pas", output = "build/wsautobahn
 # battery into section procedures (as it now is) keeps its routines small
 # but cannot lower the file figure; the file cyclomatic ceiling therefore
 # follows the battery. Regression ratchets — CI fails when a change pushes
-# a metric past its ceiling.
+# a metric past its ceiling. The client-delivery section (#72) took
+# wsinterop to file cyclomatic 321 and cognitive 382; both file ceilings
+# moved with it.
 [health]
-max-file-cyclomatic = 300
-max-file-cognitive = 380
+max-file-cyclomatic = 340
+max-file-cognitive = 410
 max-routine-cyclomatic = 70
 max-routine-cognitive = 130
 

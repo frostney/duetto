@@ -3,7 +3,9 @@ program wsinterop;
 // Live-socket battery: duetto TWSClient against duetto TWSServer over real
 // TCP (loopback), plus a raw-socket section that injects protocol
 // violations a conforming client cannot produce and asserts the close
-// codes RFC 6455 (and Autobahn cases 4.x/7.x) require, a plain-request
+// codes RFC 6455 (and Autobahn cases 4.x/7.x) require, a client-delivery
+// section (a raw peer playing Autobahn 3.2 at TWSClient: the OnMessage
+// echo must leave ahead of the 1002 close), a plain-request
 // section covering the single-port OnPlainRequest fallback, an
 // upgrade-hook section (a server bound to 127.0.0.1 explicitly whose
 // OnUpgradeRequest vetoes one Origin with a 403 and treats a raising
@@ -1780,6 +1782,274 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Client delivery ahead of a failing frame (duetto#72)
+// ---------------------------------------------------------------------------
+
+const
+  FailingPeerMessage: RawByteString = 'Hello, world!';
+  // Long enough for the client to be past its 101 read when the frames
+  // land, so they reach it through the pump rather than the handshake
+  // read. Either way the section asserts the same order.
+  FailingPeerUpgradeGapMs = 200;
+
+type
+  // A one-shot raw server that plays Autobahn case 3.2 at TWSClient: it
+  // answers the upgrade, then writes a valid text message, an RSV2 frame
+  // and a ping in a single send — glued to the 101 when Pipelined — and
+  // records every byte the client sends until the client hangs up.
+  TFailingPeer = class(TThread)
+  public
+    Listener: Tsocket;
+    Pipelined: Boolean;
+    Received: RawByteString;
+    Failure: string;
+    procedure Execute; override;
+  end;
+
+  // TWSClient.OnMessage that counts and echoes — or, when told to, closes
+  // or tries to read from inside the handler instead.
+  TClientEcho = class
+  public
+    Calls: Integer;
+    CloseInside, ReadInside: Boolean;
+    procedure Echo(AClient: TWSClient; AText: Boolean; P: PByte;
+      Len: NativeInt);
+  end;
+
+procedure TClientEcho.Echo(AClient: TWSClient; AText: Boolean; P: PByte;
+  Len: NativeInt);
+var
+  S: RawByteString;
+  IsText: Boolean;
+  Data: TBytes;
+begin
+  Inc(Calls);
+  if ReadInside then
+    AClient.ReadMessage(IsText, Data) // must raise: the read is in progress
+  else if CloseInside then
+    AClient.Close(1000, 'handler done')
+  else
+  begin
+    SetLength(S, Len);
+    if Len > 0 then Move(P^, S[1], Len);
+    AClient.SendText(S);
+  end;
+end;
+
+procedure TFailingPeer.Execute;
+var
+  Fd: Tsocket;
+  Raw, Frames, Bad: RawByteString;
+  HS: TWSServerHandshake;
+  Buf: array[0..4095] of Byte;
+  Got: Integer;
+begin
+  Fd := fpAccept(Listener, nil, nil);
+  if Fd < 0 then
+  begin
+    Failure := 'accept failed';
+    Exit;
+  end;
+  try
+    Raw := '';
+    repeat
+      Got := fpRecv(Fd, @Buf[0], SizeOf(Buf), 0);
+      if Got <= 0 then
+      begin
+        Failure := 'upgrade request lost';
+        Exit;
+      end;
+      SetLength(Raw, Length(Raw) + Got);
+      Move(Buf[0], Raw[Length(Raw) - Got + 1], Got);
+    until HandshakeFindEnd(Raw) > 0;
+    if not ServerParseRequest(Raw, False, HS) then
+    begin
+      Failure := 'upgrade request rejected: ' + HS.Failure;
+      Exit;
+    end;
+
+    Bad := BuildFrameBytes(WS_OP_TEXT, FailingPeerMessage, False);
+    Bad[1] := AnsiChar(Ord(Bad[1]) or $20); // RSV2: nothing negotiated it
+    Frames := BuildFrameBytes(WS_OP_TEXT, FailingPeerMessage, False) + Bad +
+      BuildFrameBytes(WS_OP_PING, FailingPeerMessage, False);
+    Raw := ServerBuildResponse(HS);
+    if Pipelined then
+      Raw := Raw + Frames
+    else
+    begin
+      fpSend(Fd, @Raw[1], Length(Raw), 0);
+      Sleep(FailingPeerUpgradeGapMs);
+      Raw := Frames;
+    end;
+    fpSend(Fd, @Raw[1], Length(Raw), 0);
+
+    // Everything the client answers, up to its hang-up.
+    Received := '';
+    repeat
+      Got := fpRecv(Fd, @Buf[0], SizeOf(Buf), 0);
+      if Got > 0 then
+      begin
+        SetLength(Received, Length(Received) + Got);
+        Move(Buf[0], Received[Length(Received) - Got + 1], Got);
+      end;
+    until Got <= 0;
+  finally
+    CloseSocket(Fd);
+  end;
+end;
+
+// Split what a client sent into frames: opcode and unmasked payload each.
+// False on a frame that is malformed, unmasked or cut short.
+function SplitClientFrames(const ARaw: RawByteString;
+  out AOpcodes: TBytes; out APayloads: array of RawByteString;
+  out ACount: Integer): Boolean;
+var
+  Off: NativeInt;
+  H: TWSFrameHeader;
+  Body: RawByteString;
+begin
+  ACount := 0;
+  SetLength(AOpcodes, 0);
+  Off := 0;
+  while Off < Length(ARaw) do
+  begin
+    if (ACount > High(APayloads)) or
+       (ParseFrameHeader(@ARaw[Off + 1], Length(ARaw) - Off, H) <> wprOK) or
+       (not H.Masked) or
+       (Off + H.HeaderLen + NativeInt(H.PayloadLen) > Length(ARaw)) then
+      Exit(False);
+    Body := Copy(ARaw, Off + H.HeaderLen + 1, H.PayloadLen);
+    if Body <> '' then
+      ApplyMask(@Body[1], Length(Body), H.MaskKey, 0);
+    SetLength(AOpcodes, ACount + 1);
+    AOpcodes[ACount] := H.Opcode;
+    APayloads[ACount] := Body;
+    Inc(ACount);
+    Inc(Off, H.HeaderLen + NativeInt(H.PayloadLen));
+  end;
+  Result := True;
+end;
+
+// One TWSClient with OnMessage against one TFailingPeer. The client must
+// echo the valid message ahead of the 1002 close the RSV2 frame provokes,
+// and answer nothing after it (no pong for the trailing ping).
+procedure RunFailingPeerCase(APipelined: Boolean; const ALabel: string);
+var
+  Listener: Tsocket;
+  SA: TInetSockAddr;
+  Len: LongInt;
+  Peer: TFailingPeer;
+  Handler: TClientEcho;
+  Client: TWSClient;
+  IsText: Boolean;
+  Data: TBytes;
+  Opcodes: TBytes;
+  Payloads: array[0..3] of RawByteString;
+  Count: Integer;
+  Split: Boolean;
+begin
+  Listener := fpSocket(AF_INET, SOCK_STREAM, 0);
+  FillChar(SA, SizeOf(SA), 0);
+  SA.sin_family := AF_INET;
+  SA.sin_port := 0; // kernel-assigned
+  SA.sin_addr.s_addr := htonl($7F000001);
+  fpBind(Listener, @SA, SizeOf(SA));
+  fpListen(Listener, 1);
+  Len := SizeOf(SA);
+  fpGetSockName(Listener, @SA, @Len);
+
+  Peer := TFailingPeer.Create(True);
+  Peer.Listener := Listener;
+  Peer.Pipelined := APipelined;
+  Peer.Start;
+  Handler := TClientEcho.Create;
+  Client := TWSClient.Create;
+  try
+    Client.OnMessage := Handler.Echo;
+    Client.Connect(Format('ws://127.0.0.1:%d/', [ntohs(SA.sin_port)]));
+    // With the handler set ReadMessage only pumps, until the failure.
+    while Client.ReadMessage(IsText, Data) do ;
+    Client.Close; // releases the socket: the peer sees its hang-up
+  finally
+    Client.Free;
+    Peer.WaitFor;
+    CloseSocket(Listener);
+  end;
+
+  Split := SplitClientFrames(Peer.Received, Opcodes, Payloads, Count);
+  if Peer.Failure <> '' then
+    WriteLn('       peer: ', Peer.Failure);
+  Check((Peer.Failure = '') and Split and (Count = 2) and
+    (Handler.Calls = 1) and
+    (Opcodes[0] = WS_OP_TEXT) and (Payloads[0] = FailingPeerMessage) and
+    (Opcodes[1] = WS_OP_CLOSE) and (Length(Payloads[1]) >= 2) and
+    (((Ord(Payloads[1][1]) shl 8) or Ord(Payloads[1][2])) = 1002),
+    ALabel);
+  Peer.Free;
+  Handler.Free;
+end;
+
+// What the handler may do besides sending, against the echo server at
+// AUrl: Close starts the handshake and the pumping ReadMessage finishes
+// it; ReadMessage raises and ends the connection.
+procedure RunClientHandlerCalls(const AUrl: string);
+var
+  Handler: TClientEcho;
+  Client: TWSClient;
+  IsText, Raised: Boolean;
+  Data: TBytes;
+begin
+  Handler := TClientEcho.Create;
+  Client := TWSClient.Create;
+  try
+    Handler.CloseInside := True;
+    Client.OnMessage := Handler.Echo;
+    Client.Connect(AUrl);
+    Client.SendText('close from the handler');
+    while Client.ReadMessage(IsText, Data) do ;
+    Check((Handler.Calls = 1) and (not Client.Open) and
+      (Client.CloseCode = 1000),
+      'client Close inside OnMessage completes through the pumping read');
+  finally
+    Client.Free;
+  end;
+
+  Handler.Calls := 0;
+  Handler.CloseInside := False;
+  Handler.ReadInside := True;
+  Client := TWSClient.Create;
+  try
+    Client.OnMessage := Handler.Echo;
+    Client.Connect(AUrl);
+    Client.SendText('read from the handler');
+    Raised := False;
+    try
+      Client.ReadMessage(IsText, Data);
+    except
+      on EWSClient do Raised := True;
+    end;
+    Check(Raised and (Handler.Calls = 1) and (not Client.Open),
+      'client ReadMessage inside OnMessage raises and ends the connection');
+  finally
+    Client.Free;
+    Handler.Free;
+  end;
+end;
+
+procedure RunClientDeliverySection(const AUrl: string;
+  var AStressPhase: ShortString);
+begin
+  // --- client OnMessage ahead of a failing frame (Autobahn 3.2) ----------
+  AStressPhase := 'client delivery before a failing frame';
+  RunFailingPeerCase(False,
+    'client OnMessage echo leaves before the RSV2 close 1002');
+  RunFailingPeerCase(True,
+    'client OnMessage echo of a message pipelined behind the 101 ' +
+    'leaves before the RSV2 close 1002');
+  RunClientHandlerCalls(AUrl);
+end;
+
+// ---------------------------------------------------------------------------
 
 const
   HelloProbe: RawByteString = 'hello duetto';
@@ -3170,6 +3440,7 @@ begin
   RunBoundedReadSection;
   RunDeflateSection;
   RunViolationSection;
+  RunClientDeliverySection(Url, StressPhase);
   RunEgressSection(Port, StressPhase);
   RunPlainRequestSection;
   RunUpgradeHookSection;
