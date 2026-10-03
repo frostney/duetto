@@ -112,6 +112,7 @@ type
     procedure ArmReceive;
     procedure CloseConnectionSocket;
     procedure BeginCloseDrain;
+    procedure ExpireCloseDrain;
     procedure BeginGracefulClose;
     procedure HardClose;
     function RawSend(P: PByte; ALen: NativeInt): NativeInt;
@@ -266,6 +267,8 @@ function C_WSASend(ASocket: TSocket; ABuffers: PWSIocpBuffer;
   external WINSOCK2_DLL name 'WSASend';
 function C_shutdown(ASocket: TSocket; AHow: Integer): Integer; stdcall;
   external WINSOCK2_DLL name 'shutdown';
+function C_CancelIoEx(AFile: THandle; AOverlapped: POverlapped): BOOL;
+  stdcall; external 'kernel32.dll' name 'CancelIoEx';
 function C_CreateIoCompletionPort(AFileHandle, AExistingPort: THandle;
   ACompletionKey: PtrUInt; AConcurrentThreads: DWORD): THandle; stdcall;
   external 'kernel32.dll' name 'CreateIoCompletionPort';
@@ -455,6 +458,31 @@ begin
   UserData := nil;
   FDeadline := WSMonotonicMs + QWord(FTransport.FCloseDrainMs);
   SetTimed(True);
+end;
+
+// The close-drain deadline passed: the peer is not reading, or never
+// answered the FIN. Abort rather than close — the same call the
+// Network.framework drain makes (a forced cancel). SO_LINGER 0 turns
+// closesocket into a reset that discards what the peer never took, so
+// neither the socket nor the kernel's send buffer outlives the budget
+// in a background graceful close, and a peer still sending sees the
+// reset. The explicit cancel releases the outstanding operations
+// first: closesocket cancels them on Windows, but Wine (the local
+// win32 check, tools/win32-wine.sh) leaves a pending WSASend armed,
+// which keeps the socket open.
+procedure TWSIocpConn.ExpireCloseDrain;
+var
+  Linger: TLinger;
+begin
+  if (not FDead) and (FSocket <> INVALID_SOCKET) then
+  begin
+    Linger.l_onoff := 1;
+    Linger.l_linger := 0;
+    WinSock2.setsockopt(FSocket, SOL_SOCKET, SO_LINGER, @Linger,
+      SizeOf(Linger));
+    C_CancelIoEx(THandle(FSocket), nil);
+  end;
+  HardClose;
 end;
 
 procedure TWSIocpConn.SubmitClose;
@@ -651,7 +679,8 @@ end;
 
 // One step of the close_notify drain. Runs from BeginTlsClose and from
 // a send completion — never from the deadline sweep, which does not
-// step a stalled drain but ends it (HardClose on the close deadline).
+// step a stalled drain but ends it (ExpireCloseDrain on the close
+// deadline).
 procedure TWSIocpConn.StepTlsClose;
 begin
   if FTls.DrainClose then
@@ -713,14 +742,11 @@ begin
     FTlsPolicy := WSTlsResolvePolicy(ATls);
     FTlsContext := WSTlsCreateServerContext(ATls, FTlsPolicy);
   end;
-  // The close-drain budget is the handshake deadline's field on both
-  // kinds of listener (see TWSTransportTls.HandshakeDeadlineMs): TLS
-  // takes the validated policy value; plaintext reads the raw field the
-  // way the Network.framework transport does, 0 or less meaning the
-  // shared 10 s default.
-  if FTlsContext <> nil then
-    FCloseDrainMs := FTlsPolicy.HandshakeDeadlineMs
-  else if ATls.HandshakeDeadlineMs > 0 then
+  // The close-drain budget (see TWSTransportTls.HandshakeDeadlineMs),
+  // read as the Network.framework transport reads it: 0 or less means
+  // the shared 10 s default. With TLS on, the policy above has already
+  // refused a negative value, so this is the policy's own resolution.
+  if ATls.HandshakeDeadlineMs > 0 then
     FCloseDrainMs := ATls.HandshakeDeadlineMs
   else
     FCloseDrainMs := WSTlsDefaultHandshakeDeadlineMs;
@@ -845,8 +871,9 @@ begin
   // A connection draining a close (plaintext or TLS, see
   // BeginCloseDrain) has already been handed back to the transport —
   // the session dropped its reference and UserData is nil — so it is
-  // reaped silently rather than announced a second time. The single guard covers every caller: both completion paths,
-  // the deadline sweep, and a receive that failed to arm.
+  // reaped silently rather than announced a second time. The single
+  // guard covers every caller: both completion paths, the deadline
+  // sweep, and a receive that failed to arm.
   if AConn.FClosing then
   begin
     AConn.HardClose;
@@ -1033,8 +1060,8 @@ begin
       if not AConn.FDead then
       begin
         if (not ASucceeded) or (ABytes = 0) then
-          // A connection draining its close_notify is reaped silently
-          // here — RemoteClosed owns that distinction.
+          // A connection draining a close is reaped silently here —
+          // RemoteClosed owns that distinction.
           RemoteClosed(AConn)
         // The one TLS fork on the receive path: a plaintext listener
         // pays a single never-taken branch per completion.
@@ -1298,7 +1325,7 @@ begin
     // plaintext connection carries, and it has no session to consult.
     if Conn.FClosing then
     begin
-      if ANowTick >= Conn.FDeadline then Conn.HardClose;
+      if ANowTick >= Conn.FDeadline then Conn.ExpireCloseDrain;
     end
     else if (Conn.FTls <> nil) and
       (Conn.FTls.Dead or Conn.FTls.DeadlineExpired) then

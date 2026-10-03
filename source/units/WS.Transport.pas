@@ -124,7 +124,8 @@ type
   //     timeout.
   //   - epoll (Linux) and IOCP (Windows) terminate TLS themselves over
   //     lwpt's TransportSecurity server API (WS.Transport.TlsServer).
-  //     Every field here applies.
+  //     Every field here applies; IOCP also reads HandshakeDeadlineMs
+  //     with Enabled = False, as its plaintext close-drain budget.
   //
   // All the tuning fields take 0 to mean "the default" so
   // WSTransportNoTls — and any zero-initialized record — is a valid
