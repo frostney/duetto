@@ -108,52 +108,45 @@ end;
 function ReadPassphraseFile(const APath: string): string;
 var
   Handle: THandle;
-  // One byte past the cap, so an oversized file is refused, not truncated.
-  Buffer: array[0..MaxPassphraseFileBytes] of Byte;
   Total, Got, ReadError, Len: Integer;
 begin
   if DirectoryExists(APath) then
     raise Exception.CreateFmt('--pkcs12-pass-file %s is a directory',
       [APath]);
-  Handle := FileOpen(APath, fmOpenRead or fmShareDenyNone);
-  if Handle = feInvalidHandle then
-    raise Exception.CreateFmt('cannot read --pkcs12-pass-file %s: %s',
-      [APath, SysErrorMessage(GetLastOSError)]);
+  // Room for one byte past the cap, so an oversized file is refused
+  // rather than silently truncated.
+  SetLength(Result, MaxPassphraseFileBytes + 1);
   Total := 0;
   ReadError := 0;
-  try
-    repeat
-      Got := FileRead(Handle, Buffer[Total], Length(Buffer) - Total);
+  Handle := FileOpen(APath, fmOpenRead or fmShareDenyNone);
+  if Handle = feInvalidHandle then
+    ReadError := GetLastOSError
+  else
+    try
+      repeat
+        Got := FileRead(Handle, Result[Total + 1], Length(Result) - Total);
+        if Got > 0 then
+          Inc(Total, Got);
+      until (Got <= 0) or (Total = Length(Result));
       if Got < 0 then
-        ReadError := GetLastOSError
-      else
-        Inc(Total, Got);
-    until (Got <= 0) or (Total = Length(Buffer));
-  finally
-    FileClose(Handle);
-  end;
-  try
-    if ReadError <> 0 then
-      raise Exception.CreateFmt('cannot read --pkcs12-pass-file %s: %s',
-        [APath, SysErrorMessage(ReadError)]);
-    if Total > MaxPassphraseFileBytes then
-      raise Exception.CreateFmt(
-        '--pkcs12-pass-file %s is larger than %d bytes',
-        [APath, MaxPassphraseFileBytes]);
-    SetLength(Result, Total);
-    if Total > 0 then
-      Move(Buffer[0], Result[1], Total);
-  finally
-    FillChar(Buffer, SizeOf(Buffer), 0);
-  end;
-  Len := Length(Result);
+        ReadError := GetLastOSError;
+    finally
+      FileClose(Handle);
+    end;
+  if ReadError <> 0 then
+    raise Exception.CreateFmt('cannot read --pkcs12-pass-file %s: %s',
+      [APath, SysErrorMessage(ReadError)]);
+  if Total > MaxPassphraseFileBytes then
+    raise Exception.CreateFmt('--pkcs12-pass-file %s is larger than %d bytes',
+      [APath, MaxPassphraseFileBytes]);
+  Len := Total;
   if (Len > 0) and (Result[Len] = #10) then
   begin
     Dec(Len);
     if (Len > 0) and (Result[Len] = #13) then
       Dec(Len);
-    SetLength(Result, Len);
   end;
+  SetLength(Result, Len);
 end;
 
 // Reads the passphrase from its source. Called once at startup today;
