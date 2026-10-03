@@ -2,6 +2,17 @@
 
 All notable changes to duetto are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); entries are generated from Conventional Commits by git-cliff.
 
+## [0.5.1] - 2026-10-03
+
+### Bug Fixes
+
+- pass C bools to Network.framework as 0/1 (#75)
+
+### Internal
+
+- refresh project Agent Skills (#77)
+- publish a GitHub Release for each version tag (#76)
+
 ## [0.5.0] - 2026-09-27
 
 ### Bug Fixes
