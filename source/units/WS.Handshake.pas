@@ -10,7 +10,9 @@ interface
 
 const
   WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-  WS_MAX_HANDSHAKE = 8192; // cap on accumulated request headers
+  // Cap on an inbound request's header block; WS.Server answers 431
+  // Request Header Fields Too Large past it.
+  WS_MAX_HANDSHAKE = 16 * 1024;
 
 type
   TWSDeflateParams = record
@@ -58,6 +60,12 @@ type
 // complete.
 function HandshakeFindEnd(ABuf: PByte; ALen: Integer): Integer; overload;
 function HandshakeFindEnd(const S: RawByteString): Integer; overload;
+// Incremental form for an accumulator that grows one read at a time:
+// the first AScanned bytes were already searched without a match, so the
+// search resumes 3 bytes before them (where a CRLFCRLF straddling the
+// old end starts at the earliest) instead of rescanning the whole
+// buffer. Same result as the two-argument form.
+function HandshakeFindEnd(ABuf: PByte; ALen, AScanned: Integer): Integer; overload;
 
 function ComputeAccept(const AKey: string): string;
 
@@ -148,34 +156,83 @@ end;
 // append AND per call when assigned to a procedure-local — measured at 9x
 // the cost of the same call assigned to a global. Building into a fixed
 // buffer and materialising the string once makes the cost identical
-// regardless of the caller's destination. 2 KiB is ample: our own
-// constructors emit < 300 bytes plus caller-supplied host/path, and the
-// inbound parser caps whole header blocks at WS_MAX_HANDSHAKE anyway.
+// regardless of the caller's destination.
+//
+// The stack buffer is only the fast path. Our own fixed text is < 300
+// bytes, but the caller supplies the path, host and reject reason, with
+// no bound (a JWT in the query string is the everyday long case). Content
+// that outgrows the buffer moves to a heap string that doubles, so the
+// output is always exactly what was appended: a clamp would drop the
+// terminating blank line or leave Content-Length longer than the body.
+const
+  BuilderStackBytes = 2048;
+
 type
   TWSStrBuilder = record
-    Buf: array[0..2047] of AnsiChar;
+    Buf: array[0..BuilderStackBytes - 1] of AnsiChar;
+    Heap: string;  // '' until the content outgrows Buf, then holds it all
+    Cap: Integer;  // bytes the current storage holds
     Len: Integer;
+    procedure Init; inline;
     procedure App(const S: string); inline;
+    procedure Grow(ANeed: SizeInt);
     function Done: string;
   end;
 
+procedure TWSStrBuilder.Init;
+begin
+  // Done hands Heap out shared; a reused builder must not write into it.
+  Heap := '';
+  Len := 0;
+  Cap := BuilderStackBytes;
+end;
+
 procedure TWSStrBuilder.App(const S: string);
 var
-  N: Integer;
+  N: SizeInt;
 begin
   N := Length(S);
-  if Len + N > SizeOf(Buf) then
-    N := SizeOf(Buf) - Len; // clamp; cannot occur for protocol-valid input
-  if N > 0 then
+  if N = 0 then Exit;
+  if N > Cap - Len then Grow(Len + N);
+  if Pointer(Heap) = nil then
+    Move(S[1], Buf[Len], N)
+  else
+    Move(S[1], PAnsiChar(Pointer(Heap))[Len], N);
+  Inc(Len, N);
+end;
+
+// Out of line: only content past BuilderStackBytes reaches it.
+procedure TWSStrBuilder.Grow(ANeed: SizeInt);
+var
+  NewCap: Integer;
+begin
+  // Len and Cap are Integer: content past 2 GiB cannot be represented.
+  if ANeed > MaxInt then Error(reOutOfMemory);
+  NewCap := Cap;
+  while NewCap < ANeed do
+    if NewCap > MaxInt div 2 then
+      NewCap := ANeed
+    else
+      NewCap := NewCap * 2;
+  if Pointer(Heap) = nil then
   begin
-    Move(S[1], Buf[Len], N);
-    Inc(Len, N);
-  end;
+    SetLength(Heap, NewCap);
+    Move(Buf[0], Heap[1], Len);
+  end
+  else
+    SetLength(Heap, NewCap); // sole owner: SetLength keeps the bytes
+  Cap := NewCap;
 end;
 
 function TWSStrBuilder.Done: string;
 begin
-  SetString(Result, PAnsiChar(@Buf[0]), Len);
+  if Pointer(Heap) = nil then
+    SetString(Result, PAnsiChar(@Buf[0]), Len)
+  else
+  begin
+    SetLength(Heap, Len);
+    Result := Heap;
+  end;
 end;
 
 
@@ -203,6 +260,17 @@ function HandshakeFindEnd(const S: RawByteString): Integer; overload;
 begin
   if S = '' then Exit(0);
   Result := HandshakeFindEnd(PByte(@S[1]), Length(S));
+end;
+
+function HandshakeFindEnd(ABuf: PByte; ALen, AScanned: Integer): Integer; overload;
+var
+  Start: Integer;
+begin
+  Start := AScanned - 3;
+  if Start < 0 then Start := 0;
+  if Start >= ALen then Exit(0);
+  Result := HandshakeFindEnd(@ABuf[Start], ALen - Start);
+  if Result > 0 then Inc(Result, Start);
 end;
 
 function ComputeAccept(const AKey: string): string;
@@ -656,7 +724,7 @@ function ServerBuildResponse(const AHS: TWSServerHandshake): RawByteString;
 var
   B: TWSStrBuilder;
 begin
-  B.Len := 0;
+  B.Init;
   B.App('HTTP/1.1 101 Switching Protocols'#13#10 +
     'Upgrade: websocket'#13#10 +
     'Connection: Upgrade'#13#10 +
@@ -692,10 +760,11 @@ begin
     400: StatusText := 'Bad Request';
     403: StatusText := 'Forbidden';
     426: StatusText := 'Upgrade Required';
+    431: StatusText := 'Request Header Fields Too Large'; // RFC 6585 §5
   else
     StatusText := 'Error';
   end;
-  B.Len := 0;
+  B.Init;
   B.App('HTTP/1.1 ');
   B.App(IntToStr(ACode));
   B.App(' ');
@@ -756,7 +825,7 @@ function ClientBuildRequest(const AHost, APath, AKey: string;
 var
   B: TWSStrBuilder;
 begin
-  B.Len := 0;
+  B.Init;
   B.App('GET ');
   B.App(APath);
   B.App(' HTTP/1.1'#13#10'Host: ');
