@@ -2059,8 +2059,8 @@ begin
   // PongDelayMs so the window itself is pinned, then the close handshake
   // must be a clean 1000, not the idle 1001.
   LimSrvT.Srv.IdleTimeoutMs := KeepaliveIdleMs;
-  Fd := RawUpgraded(LimPort);
-  KBuf := nil;
+  Fd := RawConnect(LimPort);
+  KBuf := RawHandshake(Fd); // a ping may ride in behind the 101
   Start := GetTickCount64;
   RawSendFrame(Fd, WS_OP_TEXT, StallCue, True);
   ReadFrame(Fd, nil, KBuf, Op, Payload);
@@ -2087,8 +2087,8 @@ begin
   // leaving to be credited, where loopback needs well under 1 ms: the
   // margin absorbs a shared CI runner descheduling either side (#80).
   // A raw peer, so a failure prints when each ping arrived.
-  Fd := RawUpgraded(LimPort);
-  KBuf := nil;
+  Fd := RawConnect(LimPort);
+  KBuf := RawHandshake(Fd); // a ping may ride in behind the 101
   Log := '';
   Pings := 0;
   Start := GetTickCount64;
