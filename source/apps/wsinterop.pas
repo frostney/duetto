@@ -2638,20 +2638,26 @@ var
 begin
   Client := TWSClient.Create;
   try
-    Client.Connect(AUrl);
-    Client.SendText('stale one');
-    Client.SendText('stale two');
-    Client.SendText('stale three');
-    Client.Close; // the echoes queue while Close waits for its own
-    Kept := Client.ReadMessage(IsText, Data) and
-      (AsText(Data) = 'stale one');
-    Client.Connect(AUrl);
-    Client.SendText('fresh');
-    Check(Kept and Client.ReadMessage(IsText, Data) and
-      (AsText(Data) = 'fresh'),
-      'client: messages queued before Close stay readable, and a ' +
-      'reconnect drops the rest: the first read is the new peer''s');
-    Client.Close;
+    try
+      Client.Connect(AUrl);
+      Client.SendText('stale one');
+      Client.SendText('stale two');
+      Client.SendText('stale three');
+      Client.Close; // the echoes queue while Close waits for its own
+      Kept := Client.ReadMessage(IsText, Data) and
+        (AsText(Data) = 'stale one');
+      Client.Connect(AUrl);
+      Client.SendText('fresh');
+      Check(Kept and Client.ReadMessage(IsText, Data) and
+        (AsText(Data) = 'fresh'),
+        'client: messages queued before Close stay readable, and a ' +
+        'reconnect drops the rest: the first read is the new peer''s');
+      Client.Close;
+    except
+      on E: Exception do
+        Check(False, 'client: reconnect queue case raised ' +
+          E.ClassName + ': ' + E.Message);
+    end;
   finally
     Client.Free;
   end;

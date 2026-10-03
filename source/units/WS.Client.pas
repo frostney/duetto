@@ -552,8 +552,10 @@ begin
 end;
 
 {$ifdef UNIX}
+// ATimeoutMs is ConnectTimeoutMs: the deadline starts once the name has
+// resolved, so a slow lookup does not eat the connect budget.
 function ResolveAndConnect(const AHost: string; APort: Integer;
-  ADeadline: QWord): TWSPlatformSocket;
+  ATimeoutMs: Integer): TWSPlatformSocket;
 var
   SA: TInetSockAddr;
   HE: THostEntry;
@@ -583,7 +585,8 @@ begin
   SA.sin_family := AF_INET;
   SA.sin_port := htons(APort);
   SA.sin_addr := Addr;
-  Result := ConnectAddress(AF_INET, @SA, SizeOf(SA), ADeadline, Err);
+  Result := ConnectAddress(AF_INET, @SA, SizeOf(SA),
+    DeadlineAfter(ATimeoutMs), Err);
   if Result = WSSocketInvalid then
     raise EWSClient.CreateFmt('connect to %s:%d failed: %s',
       [AHost, APort, Err]);
@@ -623,13 +626,16 @@ begin
   WinSockInitialized := True;
 end;
 
+// ATimeoutMs is ConnectTimeoutMs: the deadline starts once the name has
+// resolved, so a slow lookup does not eat the connect budget.
 function ResolveAndConnect(const AHost: string; APort: Integer;
-  ADeadline: QWord): TWSPlatformSocket;
+  ATimeoutMs: Integer): TWSPlatformSocket;
 var
   Hints: TWSAddrInfo;
   Info, Current: PWSAddrInfo;
   Host, Service: AnsiString;
   Err: string;
+  Deadline: QWord;
 begin
   EnsureWinSockInitialized;
   FillChar(Hints, SizeOf(Hints), 0);
@@ -644,12 +650,13 @@ begin
 
   Result := WSSocketInvalid;
   Err := 'no address';
+  Deadline := DeadlineAfter(ATimeoutMs);
   try
     Current := Info;
     while (Current <> nil) and (Result = WSSocketInvalid) do
     begin
       Result := ConnectAddress(Current^.ai_family, Current^.ai_addr,
-        Integer(Current^.ai_addrlen), ADeadline, Err);
+        Integer(Current^.ai_addrlen), Deadline, Err);
       Current := Current^.ai_next;
     end;
   finally
@@ -909,7 +916,7 @@ begin
   Peer := Host + ':' + IntToStr(Port);
 
   try
-    FSock := ResolveAndConnect(Host, Port, DeadlineAfter(FConnectTimeoutMs));
+    FSock := ResolveAndConnect(Host, Port, FConnectTimeoutMs);
     Deadline := DeadlineAfter(FHandshakeTimeoutMs);
     if FUseTls then StartTls(Host);
 
