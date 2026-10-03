@@ -180,7 +180,10 @@ type
     // Network.framework transport reads it for exactly that drain —
     // how long a close may wait behind a send the peer is not taking
     // — and for nothing else; it applies there with Enabled = False
-    // too, since plaintext closes defer behind sends the same way.
+    // too, since plaintext closes defer behind sends the same way. So
+    // does IOCP's: a plaintext close there also waits behind its final
+    // send and then for the peer's FIN, and this budget bounds both.
+    // (A plaintext epoll close is immediate and has no drain to bound.)
     HandshakeDeadlineMs: Integer;
 
     // Total ciphertext, in bytes, one connection may push at the server

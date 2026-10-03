@@ -20,10 +20,14 @@ unit WS.Transport.Iocp;
 // the same code, with the same work per completion, as it did before
 // TLS existed.
 //
+// Every graceful close, plaintext or TLS, is a drain: the FIN goes out
+// behind the final bytes, the armed receive waits for the peer's EOF,
+// and a close-drain deadline bounds a peer that never sends one. While
+// any connection carries a deadline (that drain, or a TLS handshake
+// pending), the GetQueuedCompletionStatus wait is bounded so a peer
+// that goes silent still gets swept.
+//
 // The TLS additions to the completion loop proper are:
-//   - a bounded GetQueuedCompletionStatus timeout while any connection
-//     carries a deadline (handshake pending, or a graceful close
-//     draining), so a peer that goes silent still gets swept;
 //   - the next WSARecv suppressed while lwpt reports encrypted-input
 //     backpressure, re-armed on lwpt's own low-water hysteresis — the
 //     Windows counterpart of the epoll reactor dropping EPOLLIN;
@@ -77,6 +81,12 @@ type
     FCloseRequested: Boolean;  // SubmitClose while a send is in flight
     FSentAny: Boolean;         // a WSASend completed; peer earned a FIN
     FFinSent: Boolean;         // graceful close begun; recv drains to EOF
+    // Handed back by SubmitClose and draining: no callbacks, the close-
+    // drain deadline running (BeginCloseDrain). Set on every graceful
+    // close, so FFinSent implies it.
+    FClosing: Boolean;
+    FTimed: Boolean;           // counted in the transport's deadline sweep
+    FDeadline: QWord;          // close-drain deadline (monotonic)
     // --- TLS only; all nil/False on a plaintext listener --------------
     FTls: TWSTlsServerSession;
     // No WSARecv is outstanding and none may be armed until lwpt's
@@ -85,7 +95,6 @@ type
     FRecvSuppressed: Boolean;
     FInPump: Boolean;          // inside a TLS pump; teardown defers
     FFreeDeferred: Boolean;    // SubmitClose landed mid-pump
-    FClosing: Boolean;         // graceful close draining; no callbacks
     // A SubmitSend went short: the session layer is holding output and
     // waiting for the OnSendReady the transport contract promises. It
     // is tracked separately from what the TLS engine owes the WIRE,
@@ -100,10 +109,9 @@ type
     // is what keeps the carrier one-shot: a session that cannot make
     // progress goes quiet instead of spinning the port.
     FSendReadyPosted: Boolean;
-    FTimed: Boolean;           // counted in the transport's deadline sweep
-    FDeadline: QWord;          // close-drain deadline (monotonic)
     procedure ArmReceive;
     procedure CloseConnectionSocket;
+    procedure BeginCloseDrain;
     procedure BeginGracefulClose;
     procedure HardClose;
     function RawSend(P: PByte; ALen: NativeInt): NativeInt;
@@ -157,6 +165,9 @@ type
     FTlsContext: TTransportSecurityServerContext;
     FTlsPolicy: TWSTlsPolicy;
     FTimedCount: Integer;      // connections carrying a live deadline
+    // How long a graceful close may drain before it is reset: the
+    // TWSTransportTls.HandshakeDeadlineMs budget, plaintext or TLS.
+    FCloseDrainMs: Integer;
     FTlsReadLen: DWORD;        // per-round WSARecv bound on a TLS conn
     FNextSweepTick: QWord;     // deadline sweeps are amortized on the clock
     procedure ArmAccept;
@@ -215,9 +226,9 @@ const
   SendReadyCompletionKey = PtrUInt(4);
   LiveTableGrowth = 64;
   AcceptAddressLength = SizeOf(TSockAddrIn6) + 16;
-  // Granularity of the TLS deadline sweep. Only ever shortens a wait
-  // that would otherwise park, and only while at least one connection
-  // carries a deadline — a plaintext listener never sees it.
+  // Granularity of the deadline sweep. Only ever shortens a wait that
+  // would otherwise park, and only while at least one connection carries
+  // a deadline — a TLS handshake pending, or a close draining.
   TlsDeadlinePollMs = 100;
   // How long the listener stays unarmed after AcceptEx (or the accept
   // socket's creation) failed for want of a resource. Short: the kernel
@@ -418,14 +429,32 @@ end;
 // this). shutdown(SD_SEND) sends the FIN while the armed receive stays
 // outstanding; the peer's own close completes that receive, and the
 // zero-byte/error completion performs the real teardown via
-// RemoteClosed. A peer that never closes holds the connection until
-// Shutdown's sweep hard-closes it — bounded, and only reachable by
-// peers that already received a complete reply.
+// RemoteClosed. A peer that never closes is reset by the close-drain
+// deadline (BeginCloseDrain), which every FIN puts on the clock.
 procedure TWSIocpConn.BeginGracefulClose;
 begin
   if FDead or FFinSent then Exit;
   FFinSent := True;
+  BeginCloseDrain;
   C_shutdown(FSocket, SdSend);
+end;
+
+// The session has handed this connection back (SubmitClose) and it is
+// draining towards its teardown. From here on no callback fires for
+// it: received bytes are dropped (the receive stays armed only so the
+// peer's EOF completes it), the peer's EOF or an error reaps it
+// silently (RemoteClosed), and posts and send-ready carriers skip it.
+// The close-drain deadline starts once, here — nothing the peer does
+// later restarts it — and the sweep resets a connection still draining
+// when it passes: a peer that stopped reading behind a deferred send,
+// or that never answers the FIN.
+procedure TWSIocpConn.BeginCloseDrain;
+begin
+  if FClosing then Exit;
+  FClosing := True;
+  UserData := nil;
+  FDeadline := WSMonotonicMs + QWord(FTransport.FCloseDrainMs);
+  SetTimed(True);
 end;
 
 procedure TWSIocpConn.SubmitClose;
@@ -444,9 +473,14 @@ begin
   // A send still in flight carries the final bytes (typically a close
   // frame or handshake rejection) — closesocket would cancel the
   // overlapped WSASend. Defer; the send completion finishes the close.
+  // A plaintext connection starts draining now: a peer that is not
+  // reading never completes that send, so the clock cannot wait for it.
+  // (A TLS connection still runs its pump on that completion and begins
+  // its close_notify drain there.)
   if FSendInFlight and (not FDead) then
   begin
     FCloseRequested := True;
+    if FTls = nil then BeginCloseDrain;
     Exit;
   end;
   // An activated TLS session owes the peer close_notify before FIN;
@@ -601,12 +635,8 @@ end;
 
 procedure TWSIocpConn.BeginTlsClose;
 begin
-  FClosing := True;
   FCloseRequested := False;
-  UserData := nil;
-  FDeadline := WSMonotonicMs +
-    QWord(FTransport.FTlsPolicy.HandshakeDeadlineMs);
-  SetTimed(True);
+  BeginCloseDrain;
   // A suppressed connection has no receive to notice the peer's EOF
   // with; the drain needs one. Inside a receive completion the token
   // reads False (the completion's own tail is the single place that
@@ -683,6 +713,17 @@ begin
     FTlsPolicy := WSTlsResolvePolicy(ATls);
     FTlsContext := WSTlsCreateServerContext(ATls, FTlsPolicy);
   end;
+  // The close-drain budget is the handshake deadline's field on both
+  // kinds of listener (see TWSTransportTls.HandshakeDeadlineMs): TLS
+  // takes the validated policy value; plaintext reads the raw field the
+  // way the Network.framework transport does, 0 or less meaning the
+  // shared 10 s default.
+  if FTlsContext <> nil then
+    FCloseDrainMs := FTlsPolicy.HandshakeDeadlineMs
+  else if ATls.HandshakeDeadlineMs > 0 then
+    FCloseDrainMs := ATls.HandshakeDeadlineMs
+  else
+    FCloseDrainMs := WSTlsDefaultHandshakeDeadlineMs;
   // See ArmReceive: on a TLS connection this, not the buffer size, is
   // the per-round read bound.
   FTlsReadLen := IocpReceiveBufferSize;
@@ -801,10 +842,10 @@ end;
 procedure TWSIocpTransport.RemoteClosed(AConn: TWSIocpConn);
 begin
   if AConn.FDead then Exit;
-  // A connection draining its close_notify has already been handed back
-  // to the transport — the session dropped its reference and UserData
-  // is nil — so it is reaped silently rather than announced a second
-  // time. The single guard covers every caller: both completion paths,
+  // A connection draining a close (plaintext or TLS, see
+  // BeginCloseDrain) has already been handed back to the transport —
+  // the session dropped its reference and UserData is nil — so it is
+  // reaped silently rather than announced a second time. The single guard covers every caller: both completion paths,
   // the deadline sweep, and a receive that failed to arm.
   if AConn.FClosing then
   begin
@@ -999,7 +1040,9 @@ begin
         // pays a single never-taken branch per completion.
         else if AConn.FTls <> nil then
           HandleReceivedTls(AConn, ABytes)
-        else if Assigned(OnData) then
+        // Draining a close: the session has let go, so the bytes are
+        // dropped; the re-arm below stays so the EOF behind them reaps.
+        else if (not AConn.FClosing) and Assigned(OnData) then
           OnData(AConn, @AConn.FReceiveBuffer[0], ABytes);
       end;
     finally
@@ -1052,7 +1095,8 @@ begin
         else if AConn.FCloseRequested then
           // The deferred close's final bytes just went out; FIN, don't
           // reset (see BeginGracefulClose). The armed receive drains to
-          // the peer's EOF, whose completion tears the connection down.
+          // the peer's EOF, whose completion tears the connection down;
+          // the drain deadline SubmitClose started keeps running.
           AConn.BeginGracefulClose
         else if Assigned(OnSendReady) then
           OnSendReady(AConn);
@@ -1190,7 +1234,7 @@ end;
 // Deliver a self-posted carrier. Drain-style and id-validated, like the
 // post path: the connection may have died and been freed between the
 // post and this dequeue, and one that is dead, finalizing or draining
-// its close_notify has nothing left to be paid.
+// a close has nothing left to be paid.
 procedure TWSIocpTransport.DeliverSendReady(AConnId: NativeUInt);
 var
   I: Integer;
@@ -1223,10 +1267,11 @@ begin
 end;
 
 // Reactor-owned deadlines. Two kinds:
-//   - handshake pending: a peer that connected and then went quiet (or
-//     trickles just enough to look alive) is aborted;
-//   - graceful close draining: a peer that stopped reading must not pin
-//     the socket forever waiting for its close_notify to fit.
+//   - TLS handshake pending: a peer that connected and then went quiet
+//     (or trickles just enough to look alive) is aborted;
+//   - graceful close draining, plaintext or TLS: a peer that stopped
+//     reading (behind a deferred send or a close_notify that does not
+//     fit) or never answers the FIN must not pin the socket forever.
 //
 // The skip precondition is deliberately the same one the epoll sweep
 // uses — "not carrying a clock, or already reaped" — even though the
@@ -1249,11 +1294,14 @@ begin
       Inc(I);
       Continue;
     end;
+    // A draining close is tested first: it is the only deadline a
+    // plaintext connection carries, and it has no session to consult.
     if Conn.FClosing then
     begin
       if ANowTick >= Conn.FDeadline then Conn.HardClose;
     end
-    else if Conn.FTls.Dead or Conn.FTls.DeadlineExpired then
+    else if (Conn.FTls <> nil) and
+      (Conn.FTls.Dead or Conn.FTls.DeadlineExpired) then
       RemoteClosed(Conn);
     // Untrack swaps the last entry into this slot, so an index that
     // still holds the same object is the only one safe to advance past.
@@ -1355,8 +1403,8 @@ begin
         // Posts are cold path, a scan is fine. Re-scanned per node: the
         // previous OnPost may have torn any connection down. FDead conns
         // are pending finalize — the session has let go of them, and so
-        // it has of an FClosing one (a TLS connection draining its
-        // close_notify already had UserData cleared).
+        // it has of an FClosing one (a connection draining a close
+        // already had UserData cleared; see BeginCloseDrain).
         for I := 0 to FLiveCount - 1 do
           if FLive[I].Id = Node^.ConnId then
           begin
@@ -1449,8 +1497,9 @@ end;
 
 // A parked GetQueuedCompletionStatus cannot notice a deadline pass.
 // While any connection carries one, bound the park — this only ever
-// SHORTENS the wait, so the Run(>= 0) contract still holds, and with
-// TLS off FTimedCount is always zero and the wait is untouched.
+// SHORTENS the wait, so the Run(>= 0) contract still holds, and while
+// nothing is handshaking or draining a close FTimedCount is zero and
+// the wait is untouched.
 function TWSIocpTransport.DeadlineBoundedWait(ATimeout: DWORD): DWORD;
 begin
   Result := ATimeout;
