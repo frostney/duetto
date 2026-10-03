@@ -90,9 +90,9 @@ it takes the registry lock, walks the live connections and compares each
 one's earliest due time with the clock. For a connection that is due and
 has no check queued, it posts `CheckClock` onto that connection's execution
 context through the transport's `SubmitPost`, the cross-thread hand-off
-behind `TWSConnection.Post`. The sweeper reads the due time without the
-connection's cooperation and may see a stale value; that costs at most a
-spare check. `CheckClock` re-reads the clocks on the connection's own
+behind `TWSConnection.Post`. The sweeper reads the due time without
+synchronizing with the connection and may see a stale value; that costs
+at most a spare check. `CheckClock` re-reads the clocks on the connection's own
 context and does the work there: it drops a lapsed handshake, closes an
 idle connection with 1001, drops a lapsed close or drain, or sends a due
 ping. Clock events therefore keep ADR-0003's per-connection serialization
@@ -128,8 +128,8 @@ any clock is armed.
   on all three transports, as the time a close that is still delivering its
   final bytes may hold the connection after the session dropped it. On
   epoll and IOCP it bounds the TLS close drain (`close_notify` out, then FIN
-  and the peer's EOF); the reactor's 100 ms deadline sweep closes the socket
-  abortively when it lapses. A plaintext epoll connection closes at once and
+  and the peer's EOF); the transport's 100 ms deadline sweep closes the
+  socket abortively when it lapses. A plaintext epoll connection closes at once and
   has no drain. The IOCP plaintext graceful close (FIN, then the peer's EOF,
   possibly behind a send still in flight) has no deadline yet: a peer that
   never closes holds the socket until `Shutdown`
