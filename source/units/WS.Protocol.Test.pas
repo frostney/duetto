@@ -46,6 +46,14 @@ type
     procedure OnClose(ACode: Word; const AReason: string);
   end;
 
+  // Answers every message from inside OnMessage, the way the server's
+  // and the client's synchronous handlers do.
+  TReplySink = class
+  public
+    Proto: TWSProtocol;
+    procedure OnMsg(AText: Boolean; P: PByte; ALen: NativeInt);
+  end;
+
   TProtoEcho = class(TTestSuite)
   public
     procedure SetupTests; override;
@@ -102,6 +110,7 @@ type
     procedure TestFragmentsAssembled;
     procedure TestClientWholeFrameInPlace;
     procedure TestEmptyFirstFragment;
+    procedure TestReplyBeforeFailClose;
   end;
 
   TProtoDirect = class(TTestSuite)
@@ -140,6 +149,14 @@ begin
   if ALen > 0 then Move(P^, LastMsg[0], ALen);
   SetLength(History, Length(History) + 1);
   History[High(History)] := System.Copy(LastMsg, 0, ALen);
+end;
+
+procedure TReplySink.OnMsg(AText: Boolean; P: PByte; ALen: NativeInt);
+begin
+  if AText then
+    Proto.SendText(P, ALen)
+  else
+    Proto.SendBinary(P, ALen);
 end;
 
 procedure TSink.OnPing(P: PByte; ALen: NativeInt);
@@ -1215,6 +1232,55 @@ begin
   end;
 end;
 
+// Autobahn 3.2 in the client role: a valid message, an RSV2 frame and a
+// ping in one read. A reply made from inside OnMessage is queued ahead of
+// the 1002 close the violation provokes, and nothing follows the close.
+// This pins the ordering TWSClient.OnMessage relies on (duetto#72); the
+// client-level regression check is wsinterop's client-delivery section.
+procedure TProtoDelivery.TestReplyBeforeFailClose;
+var
+  C: TWSProtocol;
+  RS: TReplySink;
+  Hello, Wire_, Out_: TBytes;
+  H: TWSFrameHeader;
+  N, Off: NativeInt;
+begin
+  RS := TReplySink.Create;
+  C := TWSProtocol.Create(wsrClient, NoDeflate);
+  RS.Proto := C;
+  C.OnMessage := RS.OnMsg;
+  try
+    Hello := Bytes('Hello, world!');
+    Wire_ := Concat(
+      BuildFrame(WS_OP_TEXT, True, False, False, False, Hello, 0),
+      BuildFrame(WS_OP_TEXT, True, False, True, False, Hello, 0),
+      BuildFrame(WS_OP_PING, True, False, False, False, Hello, 0));
+    Expect<Boolean>(C.Ingest(@Wire_[0], Length(Wire_))).ToBe(False);
+    N := C.OutPending;
+    SetLength(Out_, N);
+    Move(C.OutPtr^, Out_[0], N);
+
+    // First on the wire: the echo, masked, byte for byte.
+    Expect<Boolean>(ParseFrameHeader(@Out_[0], N, H) = wprOK).ToBe(True);
+    Expect<Integer>(Integer(H.Opcode)).ToBe(WS_OP_TEXT);
+    Expect<Boolean>(H.Masked).ToBe(True);
+    Expect<Integer>(Integer(H.PayloadLen)).ToBe(Length(Hello));
+    ApplyMask(@Out_[H.HeaderLen], H.PayloadLen, H.MaskKey, 0);
+    Expect<Boolean>(CompareMem(@Out_[H.HeaderLen], @Hello[0],
+      Length(Hello))).ToBe(True);
+
+    // Then the close, and it ends the queue: no pong for the ping.
+    Off := H.HeaderLen + NativeInt(H.PayloadLen);
+    Expect<Boolean>(ParseFrameHeader(@Out_[Off], N - Off, H) = wprOK).ToBe(True);
+    Expect<Integer>(Integer(H.Opcode)).ToBe(WS_OP_CLOSE);
+    Expect<Integer>(Integer(Off + H.HeaderLen + NativeInt(H.PayloadLen)))
+      .ToBe(Integer(N));
+    Expect<Integer>(Integer(WireCloseCode(C))).ToBe(1002);
+  finally
+    C.Free; RS.Free;
+  end;
+end;
+
 procedure TProtoDelivery.SetupTests;
 begin
   Test('whole frame delivered from the ingested buffer', TestWholeFrameInPlace);
@@ -1225,6 +1291,8 @@ begin
   Test('fragmented message is assembled',          TestFragmentsAssembled);
   Test('client role: whole frame delivered in place', TestClientWholeFrameInPlace);
   Test('empty first fragment, final continuation',  TestEmptyFirstFragment);
+  Test('client role: reply from OnMessage precedes the fail close',
+                                                   TestReplyBeforeFailClose);
 end;
 
 procedure TProtoDeflate.SetupTests;

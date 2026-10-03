@@ -8,6 +8,9 @@ unit WS.Client;
 // the TLS shim, the opening handshake, and a pump loop. ReadMessage blocks
 // until a complete message arrives (pings are answered invisibly along the
 // way) or the connection ends; a bounded overload caps the wait instead.
+// An optional OnMessage handler takes delivery synchronously, inside the
+// read, for applications that must answer a message before anything
+// later in the same read is acted on.
 
 {$I Shared.inc}
 
@@ -47,6 +50,14 @@ type
   TWSByteSpan = array[0..MaxInt - 1] of Byte;
   PWSByteSpan = ^TWSByteSpan;
 
+  TWSClient = class;
+
+  // P/Len are valid only for the duration of the callback: they may point
+  // into the client's read buffer, overwritten by the next read. Copy the
+  // bytes to keep them.
+  TWSClientMessage = procedure(AClient: TWSClient; AText: Boolean;
+    P: PByte; Len: NativeInt) of object;
+
   TWSClient = class
   private
     FSock: TWSPlatformSocket;
@@ -55,6 +66,8 @@ type
     FProto: TWSProtocol;
     FOpen: Boolean;
     FDeflate: TWSDeflateParams;
+    FOnMessage: TWSClientMessage;
+    FDelivering: Boolean; // inside OnMessage, i.e. inside FProto.Ingest
 
     // pending complete messages (several can arrive in one TCP read)
     FQueue: array of record Text: Boolean; Data: TBytes; end;
@@ -69,6 +82,7 @@ type
     function PumpOnce: Boolean;
     function WaitReadable(ATimeoutMs: Integer): Boolean;
     procedure PopMessage(out AText: Boolean; out AData: TBytes); inline;
+    procedure RefuseReadInHandler; inline;
   public
     constructor Create;
     destructor Destroy; override;
@@ -118,6 +132,30 @@ type
 
     // Initiate the closing handshake and wait (bounded) for the echo.
     procedure Close(ACode: Word = 1000; const AReason: string = '');
+
+    // Optional synchronous delivery, the client's counterpart of the
+    // server's OnMessage. When assigned, each complete message goes to
+    // the handler from inside the read that completed it, instead of to
+    // the ReadMessage queue, and the rest of that read waits until the
+    // handler returns. A send made here therefore leaves ahead of
+    // anything later in the same read provokes: when a valid message
+    // and a frame that fails the connection arrive together, the reply
+    // goes out before the failure's close frame. Assign it before
+    // Connect so messages pipelined behind the 101 take this path too.
+    //
+    // SendText, SendBinary and Ping work from inside the handler. Close
+    // there only sends the close frame; the echo is awaited by the reads
+    // that follow, or by a later Close, which waits for it (bounded) as
+    // usual. Either ReadMessage raises EWSClient there (the read in
+    // progress cannot be re-entered). An exception escaping the handler
+    // propagates out of the call that was reading (ReadMessage, Connect
+    // or Close) and ends the connection: the rest of that read is lost.
+    //
+    // With a handler assigned, ReadMessage is the pump that drives it:
+    // the unbounded form returns False once the connection has ended;
+    // the bounded form returns wrrTimeout or wrrClosed. Messages queued
+    // before the handler was assigned are still returned by ReadMessage.
+    property OnMessage: TWSClientMessage read FOnMessage write FOnMessage;
 
     property Open: Boolean read FOpen;
     property Deflate: TWSDeflateParams read FDeflate;
@@ -366,7 +404,27 @@ end;
 procedure TWSClient.ProtoMessage(AText: Boolean; P: PByte; ALen: NativeInt);
 var
   N: Integer;
+  Returned: Boolean;
 begin
+  if Assigned(FOnMessage) then
+  begin
+    // A send inside an earlier handler call of this same read may have
+    // found the socket dead; the rest of the read is not the
+    // application's to see.
+    if not FOpen then Exit;
+    FDelivering := True;
+    Returned := False;
+    try
+      FOnMessage(Self, AText, P, ALen);
+      Returned := True;
+    finally
+      FDelivering := False;
+      // An exception is unwinding Ingest mid-read: the rest of the read
+      // is lost, so the stream cannot be trusted again.
+      if not Returned then FOpen := False;
+    end;
+    Exit;
+  end;
   N := Length(FQueue);
   if FQTail = N then
   begin
@@ -527,8 +585,17 @@ begin
   end;
 end;
 
+procedure TWSClient.RefuseReadInHandler;
+begin
+  // Ingest is not re-entrant, and FRecvBuf is what the running handler
+  // may be looking at.
+  if FDelivering then
+    raise EWSClient.Create('cannot read from inside OnMessage');
+end;
+
 function TWSClient.ReadMessage(out AText: Boolean; out AData: TBytes): Boolean;
 begin
+  RefuseReadInHandler;
   while FQHead = FQTail do
   begin
     if not FOpen then Exit(False);
@@ -544,6 +611,7 @@ var
   Deadline: QWord;
   Remaining: Int64;
 begin
+  RefuseReadInHandler;
   // Already queued: no clock, no poll, no syscall.
   if FQHead <> FQTail then
   begin
@@ -618,9 +686,23 @@ var
   Spins: Integer;
 begin
   if FProto = nil then Exit;
-  if FOpen and not FProto.CloseSent then
+  if FDelivering then
   begin
-    FProto.SendClose(ACode, AReason);
+    // Inside OnMessage the read below us is still running and cannot be
+    // re-entered to wait for the echo: send the close frame and leave the
+    // echo to the reads that follow, or to a later Close.
+    if FOpen then
+    begin
+      FProto.SendClose(ACode, AReason);
+      FlushOut;
+    end;
+    Exit;
+  end;
+  // CloseDone, not CloseSent: a close sent from inside OnMessage still
+  // gets its bounded wait for the echo here.
+  if FOpen and not FProto.CloseDone then
+  begin
+    FProto.SendClose(ACode, AReason); // no-op once a close went out
     FlushOut;
     // Bounded wait for the peer's close echo; then drop TCP regardless.
     Spins := 0;

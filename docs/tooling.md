@@ -60,9 +60,15 @@ tools/autobahn.sh client   # suite's fuzzingserver fuzzes build/wsautobahn
   (agent `duetto`) and without (agent `duetto-nodeflate`).
 - The client direction runs `wsautobahn` twice: agent `duetto` and agent
   `duetto-deflate` (permessage-deflate offered).
-- `tools/autobahn-check.py` judges `index.json`: `behavior` must be
-  OK / NON-STRICT / INFORMATIONAL / UNIMPLEMENTED and `behaviorClose`
+- `tools/autobahn-check.py --direction={client|server}` judges
+  `index.json`: `behavior` must be OK / INFORMATIONAL / UNIMPLEMENTED —
+  plus NON-STRICT in the server direction only — and `behaviorClose`
   OK / INFORMATIONAL / UNIMPLEMENTED; anything else fails the run.
+  `tools/autobahn.sh` passes the direction it ran, and the verdict line
+  names it; without `--direction` the server-direction rules apply and
+  the verdict line says `unspecified`. Neither direction currently has a
+  NON-STRICT case; the client direction fails on one so the gap closed by
+  duetto#72 cannot reopen.
 
 ## Benchmarks
 
