@@ -9,7 +9,8 @@ unit WS.Server;
 // instead be answered by the host via OnPlainRequest (single-shot,
 // then close); with the hook unset it is refused exactly as before.
 // Between parse and answer of a valid upgrade the host may veto it via
-// OnUpgradeRequest (403, then close); with that hook unset every
+// OnUpgradeRequest (403, then close) or attach UserData to the
+// connection it is about to open; with that hook unset every
 // well-formed upgrade is accepted exactly as before.
 //
 // Concurrency (ADR-0003): callbacks fire on the transport's execution
@@ -215,21 +216,37 @@ type
     const ARawRequest: RawByteString;
     out AResponse: RawByteString): Boolean of object;
 
+  // What OnUpgradeRequest sees and may fill in for one upgrade. A record
+  // so later fields extend it without breaking existing handlers.
+  // Request is the request as parsed by WS.Handshake — Path, Host,
+  // Origin, Protocols and the negotiated Deflate are filled. It is
+  // read-only by contract: the 101 is built from the server's own copy,
+  // so writing to it changes nothing. RawRequest is exactly this
+  // request's header block (request line through the terminating blank
+  // line) and nothing pipelined behind it, so any other header can be
+  // read with WS.Handshake.HeaderValue. Reason is the 403 body on
+  // refusal ('forbidden' when left empty). UserData starts nil; on
+  // accept it is copied to TWSConnection.UserData before OnOpen fires,
+  // so state computed here (an authentication result, say) lands on
+  // its own connection. On refusal it is discarded, and so it is when
+  // the peer is gone before the 101 goes out — neither OnOpen nor
+  // OnClientClose fires then, so nothing hands it back to the host.
+  TWSUpgradeContext = record
+    Request: TWSServerHandshake;
+    RawRequest: RawByteString;
+    Reason: string;
+    UserData: Pointer;
+  end;
+
   // Veto point on the opening handshake (see TWSServer.OnUpgradeRequest).
-  // AHS is the request as parsed by WS.Handshake — Path, Host, Origin,
-  // Protocols and the negotiated Deflate are filled; ARawRequest is
-  // exactly this request's header block (request line through the
-  // terminating blank line) and nothing pipelined behind it, so any
-  // other header can be read with WS.Handshake.HeaderValue. Return True
-  // to accept: the 101 follows and OnOpen fires as usual. Return False
-  // to refuse: the server writes a 403 carrying AReason as its body
-  // ('forbidden' when AReason is left empty) and closes the connection;
-  // OnOpen and OnClientClose never fire for it. An exception escaping
-  // the hook is swallowed and treated as False — one misbehaving
-  // handler must not leak the connection or take down the transport's
-  // execution context.
-  TWSUpgradeRequestEvent = function(const AHS: TWSServerHandshake;
-    const ARawRequest: RawByteString; out AReason: string): Boolean of object;
+  // Return True to accept: the 101 follows and OnOpen fires as usual.
+  // Return False to refuse: the server writes a 403 carrying
+  // AContext.Reason as its body and closes the connection; OnOpen and
+  // OnClientClose never fire for it. An exception escaping the hook is
+  // swallowed and treated as False — one misbehaving handler must not
+  // leak the connection or take down the transport's execution context.
+  TWSUpgradeRequestEvent = function(
+    var AContext: TWSUpgradeContext): Boolean of object;
 
   TWSServer = class
   private
@@ -306,11 +323,11 @@ type
     // with a message naming the address; names are never resolved.
     // Port 0 still means kernel-assigned, read back through Port.
     constructor Create(APort: Word; AAllowDeflate: Boolean = True;
-      AMaxMessage: NativeInt = 16 * 1024 * 1024;
+      AMaxMessage: NativeInt = WS_DEFAULT_MAX_MESSAGE;
       const ABindAddress: string = ''); overload;
     constructor Create(APort: Word; const ATls: TWSTransportTls;
       AAllowDeflate: Boolean = True;
-      AMaxMessage: NativeInt = 16 * 1024 * 1024;
+      AMaxMessage: NativeInt = WS_DEFAULT_MAX_MESSAGE;
       const ABindAddress: string = ''); overload;
     destructor Destroy; override;
 
@@ -443,10 +460,12 @@ type
     // place for Origin allow-lists, identity headers and the like.
     // Malformed requests never reach it (they get the standard 400 or,
     // when eligible, OnPlainRequest). Unset = accept everything,
-    // unchanged behaviour. Fires on the connection's execution context
-    // like every other callback (ADR-0003): the Run thread on
-    // Linux/Windows, the connection's dispatch queue on macOS. On a TLS
-    // listener the request arrives already decrypted.
+    // unchanged behaviour. The hook may also set AContext.UserData,
+    // which becomes the connection's UserData before OnOpen. Fires on
+    // the connection's execution context like every other callback
+    // (ADR-0003): the Run thread on Linux/Windows, the connection's
+    // dispatch queue on macOS. On a TLS listener the request arrives
+    // already decrypted.
     property OnUpgradeRequest: TWSUpgradeRequestEvent
       read FOnUpgradeRequest write FOnUpgradeRequest;
   end;
@@ -1092,7 +1111,7 @@ function TWSServer.FinishHandshake(AConn: TWSConnection;
 var
   HS: TWSServerHandshake;
   Resp, HdrBlock: RawByteString;
-  Reason: string;
+  Ctx: TWSUpgradeContext;
   Answered, Accepted: Boolean;
 begin
   Result := False;
@@ -1144,8 +1163,13 @@ begin
 
   if Assigned(FOnUpgradeRequest) then
   begin
+    // The hook gets a copy of HS: the 101 below is built from HS itself,
+    // which keeps Request read-only no matter what the hook writes.
+    Ctx := Default(TWSUpgradeContext);
+    Ctx.Request := HS;
+    Ctx.RawRequest := HdrBlock;
     try
-      Accepted := FOnUpgradeRequest(HS, HdrBlock, Reason);
+      Accepted := FOnUpgradeRequest(Ctx);
     except
       // A raising hook is a refusal, swallowed here — the same reasoning
       // as OnPlainRequest above: an escaping exception would leave the
@@ -1154,8 +1178,8 @@ begin
     end;
     if not Accepted then
     begin
-      if Reason = '' then Reason := 'forbidden';
-      Resp := ServerBuildReject(403, Reason);
+      if Ctx.Reason = '' then Ctx.Reason := 'forbidden';
+      Resp := ServerBuildReject(403, Ctx.Reason);
       // Same backpressure path as OnPlainRequest answers: queue the 403
       // through the protocol out buffer and drop once it drains. A bare
       // SubmitSend + DropConn can truncate under OnSendReady deferral.
@@ -1166,6 +1190,7 @@ begin
       // Still wcsHandshake: no OnOpen ever fired, so no OnClientClose.
       Exit;
     end;
+    AConn.UserData := Ctx.UserData;
   end;
 
   AConn.FProto := TWSProtocol.Create(wsrServer, HS.Deflate, FMaxMessage);

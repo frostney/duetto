@@ -6,13 +6,14 @@ program wsinterop;
 // codes RFC 6455 (and Autobahn cases 4.x/7.x) require, a plain-request
 // section covering the single-port OnPlainRequest fallback, an
 // upgrade-hook section (a server bound to 127.0.0.1 explicitly whose
-// OnUpgradeRequest vetoes one Origin with a 403 and treats a raising
-// hook the same way), a handler-fault section (a raising OnMessage,
-// OnOpen or Post proc costs only its connection: 1011, reported to
-// OnError, the rest keep being served; a raising OnClientClose or an
-// OnError rethrowing is only reported), a handshake-size section (an
-// oversized request header block answered 431, a client path past
-// 2 KiB upgraded), and a
+// OnUpgradeRequest vetoes one Origin with a 403, treats a raising hook
+// the same way, and attaches UserData that OnOpen reads back on the same
+// connection), a handler-fault section (a raising OnMessage, OnOpen or
+// Post proc costs only its connection: 1011, reported to OnError, the
+// rest keep being served; a raising OnClientClose or an OnError
+// rethrowing is only reported), a handshake-size section (an oversized
+// request header block answered 431, a client path past 2 KiB
+// upgraded), and a
 // concurrent-connections stress section — 33 client threads (28 echo,
 // 4 abrupt-drop, 1 pusher) of echo/burst/clean-close cycles racing
 // abrupt raw-socket drops and server-initiated pushes, ended by a
@@ -94,9 +95,10 @@ type
   // OnUpgradeRequest host for the hook section: refuses one Origin with
   // a reason, raises instead when told to, and counts what the server
   // went on to do — a refused handshake must produce neither OnOpen nor
-  // OnClientClose. Its OnClientClose also sends into the connection it
-  // is being told about (the "user left" broadcast that still lists the
-  // leaver): every such send must report False, and the close must be
+  // OnClientClose. A request for /<n> gets n as its UserData, which
+  // OnOpen sends back on that same connection. Its OnClientClose also
+  // sends into the connection it is being told about (the "user left"
+  // broadcast that still lists the leaver): every such send must report False, and the close must be
   // delivered exactly once — a flush into the dead transport used to
   // release the session object a second time. Runs on the connection's
   // execution context, hence the lock around the counters the battery
@@ -109,8 +111,7 @@ type
   public
     constructor Create;
     destructor Destroy; override;
-    function Check(const AHS: TWSServerHandshake;
-      const ARawRequest: RawByteString; out AReason: string): Boolean;
+    function Check(var AContext: TWSUpgradeContext): Boolean;
     procedure HandleOpen(AConn: TWSConnection);
     procedure HandleClose(AConn: TWSConnection);
     procedure SetRaiseMode(AValue: Boolean);
@@ -216,8 +217,7 @@ begin
   inherited;
 end;
 
-function TUpgradeGate.Check(const AHS: TWSServerHandshake;
-  const ARawRequest: RawByteString; out AReason: string): Boolean;
+function TUpgradeGate.Check(var AContext: TWSUpgradeContext): Boolean;
 var
   RaiseNow: Boolean;
 begin
@@ -232,13 +232,26 @@ begin
     raise Exception.Create('hook exploded on purpose');
   // The parsed Origin and the raw block must agree — the hook is
   // promised exactly this request's headers.
-  Result := (AHS.Origin <> ForbiddenOrigin) and
-    (HeaderValue(ARawRequest, 'Origin') = AHS.Origin);
-  if not Result then AReason := ForbiddenReason;
+  Result := (AContext.Request.Origin <> ForbiddenOrigin) and
+    (HeaderValue(AContext.RawRequest, 'Origin') = AContext.Request.Origin);
+  // Both are set on every call: the server reads Reason only on refusal
+  // and UserData only on accept. A bare / leaves UserData nil.
+  AContext.Reason := ForbiddenReason;
+  AContext.UserData := Pointer(PtrUInt(StrToIntDef(
+    Copy(AContext.Request.Path, 2, MaxInt), 0)));
 end;
 
 procedure TUpgradeGate.HandleOpen(AConn: TWSConnection);
+var
+  Ticket: RawByteString;
 begin
+  // UserData set by Check for this very handshake: report it on the
+  // connection it was attached to.
+  if AConn.UserData <> nil then
+  begin
+    Ticket := 'ticket ' + IntToStr(PtrUInt(AConn.UserData));
+    AConn.SendText(@Ticket[1], Length(Ticket));
+  end;
   FLock.Acquire;
   try
     Inc(FOpens);
@@ -2618,6 +2631,10 @@ var
   HookPort: Word;
   HookResp: RawByteString;
   Hits, Opens, Closes, CloseSendsAlive: Integer;
+  Cli2: TWSClient;
+const
+  Ticket7: RawByteString = 'ticket 7';
+  Ticket9: RawByteString = 'ticket 9';
 begin
   // --- bind address + OnUpgradeRequest -----------------------------------
   // A second server, bound to 127.0.0.1 explicitly (port 0 still
@@ -2703,6 +2720,25 @@ begin
   until GetTickCount64 > Deadline;
   Check(Ok and (Opens = 3) and (Closes = 3) and (CloseSendsAlive = 0),
     'send inside OnClientClose after an abrupt hangup: False, closed once');
+
+  // UserData the hook sets lands on its own connection before OnOpen:
+  // two connections open side by side with different tickets, and each
+  // OnOpen sends back the ticket it found on the connection it got.
+  Cli := TWSClient.Create;
+  Cli2 := TWSClient.Create;
+  Cli.Connect(Format('ws://127.0.0.1:%d/7', [HookPort]));
+  Cli2.Connect(Format('ws://127.0.0.1:%d/9', [HookPort]));
+  Ok := (Cli2.ReadMessage(IsText, Data, 5000) = wrrMessage) and IsText and
+    (Length(Data) = Length(Ticket9)) and
+    CompareMem(@Data[0], @Ticket9[1], Length(Ticket9));
+  Ok := (Cli.ReadMessage(IsText, Data, 5000) = wrrMessage) and IsText and
+    (Length(Data) = Length(Ticket7)) and
+    CompareMem(@Data[0], @Ticket7[1], Length(Ticket7)) and Ok;
+  Check(Ok, 'hook UserData reaches OnOpen on the connection it was set for');
+  Cli.Close(1000, 'done');
+  Cli2.Close(1000, 'done');
+  Cli.Free;
+  Cli2.Free;
 
   StressPhase := 'upgrade-hook section: teardown';
   HookSrvT.Terminate;
