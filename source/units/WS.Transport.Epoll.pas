@@ -807,8 +807,9 @@ begin
       end;
     end;
   finally
-    // A posted proc that raises unwinds Run like any other handler,
-    // but the rest of the chain must not leak: hand each envelope back
+    // An OnPost that raises unwinds Run like any other callback (WS.Server
+    // contains its handlers' exceptions, so this is defensive), but the
+    // rest of the chain must not leak: hand each envelope back
     // as dropped (nil conn frees it in the session) and reclaim nodes.
     while Node <> nil do
     begin
@@ -1025,7 +1026,8 @@ begin
   // IOCP and Network.framework transports already do.
   AConn.FDead := True;
   Untrack(AConn);
-  // Freed even if OnClosed raises (the exception carries on out of Run).
+  // Freed even if OnClosed raises (the exception carries on out of Run;
+  // WS.Server contains its handlers' exceptions, so this is defensive).
   try
     if Assigned(OnClosed) then OnClosed(AConn);
   finally

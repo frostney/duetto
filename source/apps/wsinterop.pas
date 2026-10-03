@@ -6,9 +6,14 @@ program wsinterop;
 // codes RFC 6455 (and Autobahn cases 4.x/7.x) require, a plain-request
 // section covering the single-port OnPlainRequest fallback, an
 // upgrade-hook section (a server bound to 127.0.0.1 explicitly whose
-// OnUpgradeRequest vetoes one Origin with a 403 and treats a raising
-// hook the same way), a handshake-size section (an oversized request
-// header block answered 431, a client path past 2 KiB upgraded), and a
+// OnUpgradeRequest vetoes one Origin with a 403, treats a raising hook
+// the same way, and attaches UserData that OnOpen reads back on the same
+// connection), a handler-fault section (a raising OnMessage, OnOpen or
+// Post proc costs only its connection: 1011, reported to OnError, the
+// rest keep being served; a raising OnClientClose or an OnError
+// rethrowing is only reported), a handshake-size section (an oversized
+// request header block answered 431, a client path past 2 KiB
+// upgraded), and a
 // concurrent-connections stress section — 33 client threads (28 echo,
 // 4 abrupt-drop, 1 pusher) of echo/burst/clean-close cycles racing
 // abrupt raw-socket drops and server-initiated pushes, ended by a
@@ -90,9 +95,10 @@ type
   // OnUpgradeRequest host for the hook section: refuses one Origin with
   // a reason, raises instead when told to, and counts what the server
   // went on to do — a refused handshake must produce neither OnOpen nor
-  // OnClientClose. Its OnClientClose also sends into the connection it
-  // is being told about (the "user left" broadcast that still lists the
-  // leaver): every such send must report False, and the close must be
+  // OnClientClose. A request for /<n> gets n as its UserData, which
+  // OnOpen sends back on that same connection. Its OnClientClose also
+  // sends into the connection it is being told about (the "user left"
+  // broadcast that still lists the leaver): every such send must report False, and the close must be
   // delivered exactly once — a flush into the dead transport used to
   // release the session object a second time. Runs on the connection's
   // execution context, hence the lock around the counters the battery
@@ -105,8 +111,7 @@ type
   public
     constructor Create;
     destructor Destroy; override;
-    function Check(const AHS: TWSServerHandshake;
-      const ARawRequest: RawByteString; out AReason: string): Boolean;
+    function Check(var AContext: TWSUpgradeContext): Boolean;
     procedure HandleOpen(AConn: TWSConnection);
     procedure HandleClose(AConn: TWSConnection);
     procedure SetRaiseMode(AValue: Boolean);
@@ -138,16 +143,17 @@ type
   end;
 
   // Close-handler lifecycle section: counts OnOpen / OnClientClose,
-  // tries a send inside every OnClientClose, and raises from it on
-  // demand. Counters are interlocked (handlers run on the server
-  // thread, on the thread calling Destroy, or on Network.framework's
-  // connection queues); the two flags are set only between checks.
+  // tries a send inside every OnClientClose, raises from it on demand,
+  // and counts what OnError reports. Counters are interlocked (handlers
+  // run on the server thread, on the thread calling Destroy, or on
+  // Network.framework's connection queues); the two flags are set only
+  // between checks.
   TCloseHost = class
   private
     FLock: TCriticalSection;
     FOpen: TFPList; // connections between OnOpen and OnClientClose
   public
-    Opens, Closes, SendsAccepted, Broadcasts: LongInt;
+    Opens, Closes, SendsAccepted, Broadcasts, Errors: LongInt;
     RaiseOnClose: Boolean;
     // "user left": OnClientClose also sends to every other open connection
     BroadcastOnClose: Boolean;
@@ -155,15 +161,36 @@ type
     destructor Destroy; override;
     procedure HandleOpen(AConn: TWSConnection);
     procedure HandleClose(AConn: TWSConnection);
+    procedure HandleError(AConn: TWSConnection; AError: Exception);
   end;
 
-  // A server thread that survives exceptions escaping Run (a raising
-  // OnClientClose) and counts them, so the section can keep going.
+  // Handler-fault section host: echoes, and raises from whichever
+  // handler a cue names. A connection is marked (UserData) just before
+  // its handler raises, so OnError can show it was handed exactly that
+  // connection and that exception. Counters are interlocked (handlers
+  // run on Network.framework's connection queues); the flags are set
+  // only between checks.
+  TFaultHost = class
+  public
+    Opens, Closes, Errors, Matched: LongInt;
+    RaiseOnOpen: Boolean;
+    // OnError rethrows the exception it was handed ("log and rethrow").
+    ReraiseOnError: Boolean;
+    procedure OnMsg(AConn: TWSConnection; AText: Boolean; P: PByte;
+      Len: NativeInt);
+    procedure RaiseFromPost(AConn: TWSConnection);
+    procedure HandleOpen(AConn: TWSConnection);
+    procedure HandleClose(AConn: TWSConnection);
+    procedure HandleError(AConn: TWSConnection; AError: Exception);
+  end;
+
+  // A server thread that survives exceptions escaping Run and counts
+  // them, so a section can still report. Handlers are contained, so
+  // nothing may escape: Escaped must stay 0.
   TCatchingServerThread = class(TThread)
   public
     Srv: TWSServer;
-    Raised: LongInt;     // the section's own raises
-    Unexpected: LongInt; // anything else out of Run: must stay 0
+    Escaped: LongInt;
     procedure Execute; override;
   end;
 
@@ -190,8 +217,7 @@ begin
   inherited;
 end;
 
-function TUpgradeGate.Check(const AHS: TWSServerHandshake;
-  const ARawRequest: RawByteString; out AReason: string): Boolean;
+function TUpgradeGate.Check(var AContext: TWSUpgradeContext): Boolean;
 var
   RaiseNow: Boolean;
 begin
@@ -206,13 +232,26 @@ begin
     raise Exception.Create('hook exploded on purpose');
   // The parsed Origin and the raw block must agree — the hook is
   // promised exactly this request's headers.
-  Result := (AHS.Origin <> ForbiddenOrigin) and
-    (HeaderValue(ARawRequest, 'Origin') = AHS.Origin);
-  if not Result then AReason := ForbiddenReason;
+  Result := (AContext.Request.Origin <> ForbiddenOrigin) and
+    (HeaderValue(AContext.RawRequest, 'Origin') = AContext.Request.Origin);
+  // Both are set on every call: the server reads Reason only on refusal
+  // and UserData only on accept. A bare / leaves UserData nil.
+  AContext.Reason := ForbiddenReason;
+  AContext.UserData := Pointer(PtrUInt(StrToIntDef(
+    Copy(AContext.Request.Path, 2, MaxInt), 0)));
 end;
 
 procedure TUpgradeGate.HandleOpen(AConn: TWSConnection);
+var
+  Ticket: RawByteString;
 begin
+  // UserData set by Check for this very handshake: report it on the
+  // connection it was attached to.
+  if AConn.UserData <> nil then
+  begin
+    Ticket := 'ticket ' + IntToStr(PtrUInt(AConn.UserData));
+    AConn.SendText(@Ticket[1], Length(Ticket));
+  end;
   FLock.Acquire;
   try
     Inc(FOpens);
@@ -448,6 +487,75 @@ begin
   end;
 end;
 
+// Every report counts: the checks expect exactly the section's own
+// raises, so anything else reaching OnError overshoots them.
+procedure TCloseHost.HandleError(AConn: TWSConnection; AError: Exception);
+begin
+  InterLockedIncrement(Errors);
+end;
+
+{ TFaultHost }
+
+const
+  FaultText = 'handler raised on purpose';
+  FaultCueMessage: RawByteString = 'raise-in-message';
+  FaultCuePost: RawByteString = 'raise-in-post';
+  FaultCueClose: RawByteString = 'raise-in-close';
+
+var
+  // AConn.UserData = @FaultMark: this connection's handler has raised.
+  // = @CloseMark: its OnClientClose is to raise.
+  FaultMark, CloseMark: Byte;
+
+procedure RaiseFault(AConn: TWSConnection);
+begin
+  AConn.UserData := @FaultMark;
+  raise Exception.Create(FaultText);
+end;
+
+procedure TFaultHost.OnMsg(AConn: TWSConnection; AText: Boolean; P: PByte;
+  Len: NativeInt);
+var
+  Cue: RawByteString;
+begin
+  SetString(Cue, PAnsiChar(P), Len);
+  if Cue = FaultCueMessage then
+    RaiseFault(AConn)
+  else if Cue = FaultCuePost then
+    AConn.Post(RaiseFromPost)
+  else
+  begin
+    if Cue = FaultCueClose then AConn.UserData := @CloseMark;
+    AConn.SendText(P, Len); // echo; for the close cue, the go-ahead
+  end;
+end;
+
+procedure TFaultHost.RaiseFromPost(AConn: TWSConnection);
+begin
+  RaiseFault(AConn);
+end;
+
+procedure TFaultHost.HandleOpen(AConn: TWSConnection);
+begin
+  InterLockedIncrement(Opens);
+  if RaiseOnOpen then RaiseFault(AConn);
+end;
+
+procedure TFaultHost.HandleClose(AConn: TWSConnection);
+begin
+  InterLockedIncrement(Closes);
+  if AConn.UserData = @CloseMark then RaiseFault(AConn);
+end;
+
+procedure TFaultHost.HandleError(AConn: TWSConnection; AError: Exception);
+begin
+  InterLockedIncrement(Errors);
+  if (AConn.UserData = @FaultMark) and (AError <> nil) and
+    (AError.Message = FaultText) then
+    InterLockedIncrement(Matched);
+  if ReraiseOnError and (AError <> nil) then raise AError;
+end;
+
 procedure TCatchingServerThread.Execute;
 begin
   while not Terminated do
@@ -455,17 +563,11 @@ begin
       Srv.Run(50);
     except
       on E: Exception do
-        // Only the section's own raise is expected; anything else is a
-        // real fault, counted apart so a later expected raise cannot mask
-        // it.
-        if E.Message = CloseRaiseText then
-          InterLockedIncrement(Raised)
-        else
-        begin
-          InterLockedIncrement(Unexpected);
-          WriteLn('       unexpected server exception: ', E.ClassName,
-            ': ', E.Message);
-        end;
+      begin
+        InterLockedIncrement(Escaped);
+        WriteLn('       exception escaped Run: ', E.ClassName, ': ',
+          E.Message);
+      end;
     end;
 end;
 
@@ -1793,16 +1895,16 @@ const
 // one too many must each be shed within its budget, and a live peer that
 // merely says nothing must be kept by the keepalive.
 // OnClientClose robustness: a raising handler must not leak the socket
-// or the session object, and a server destroyed with connections still
-// open owes each of them its OnClientClose.
+// or the session object, nor escape Run, and a server destroyed with
+// connections still open owes each of them its OnClientClose.
 const
-  // Two raw connections and one client before the Destroy check (Darwin
-  // skips the raw ones), then the three held open.
-  CloseSectionOpens = {$ifdef DARWIN} 3 {$else} 6 {$endif};
+  // Two raw connections and one client before the Destroy check, then
+  // the three held open.
+  CloseSectionOpens = 6;
   CloseSectionBroadcasts = {$ifdef DARWIN} 0 {$else} 3 {$endif};
-  // Exceptions out of Run: the two raising checks (none on Darwin);
-  // Destroy-time raises are swallowed by Destroy.
-  CloseSectionRaised = {$ifdef DARWIN} 0 {$else} 2 {$endif};
+  // Raises reported to OnError: the two raising checks, then the three
+  // Destroy-time ones. None may escape Run (or reach GCD on Darwin).
+  CloseSectionErrors = 5;
 
 procedure RunCloseHandlerSection(var AStressPhase: ShortString);
 var
@@ -1826,14 +1928,13 @@ begin
   SrvT.Srv.OnMessage := EchoHost.OnMsg;
   SrvT.Srv.OnOpen := Host.HandleOpen;
   SrvT.Srv.OnClientClose := Host.HandleClose;
+  SrvT.Srv.OnError := Host.HandleError;
   Port := SrvT.Srv.Port;
   SrvT.Start;
 
-  // The two raising-handler checks need the exception to come out of
-  // Run. On Network.framework callbacks run on GCD threads, where an
-  // escaping exception terminates the process (as from any callback),
-  // so they are not run there.
-  {$ifndef DARWIN}
+  // The two raising-handler checks: the exception reaches OnError and
+  // never Run — nor GCD on Network.framework, where it used to
+  // terminate the process.
   Host.RaiseOnClose := True;
   // Server-side drop (a protocol violation) with a raising handler: the
   // socket must still be closed behind the close frame.
@@ -1851,26 +1952,26 @@ begin
   fpSetSockOpt(Fd, SOL_SOCKET, SO_LINGER, @Hard, SizeOf(Hard));
   CloseSocket(Fd);
   Deadline := GetTickCount64 + 5000;
-  while (SrvT.Raised < 2) and (GetTickCount64 < Deadline) do Sleep(10);
+  while (Host.Errors < 2) and (GetTickCount64 < Deadline) do Sleep(10);
   Host.RaiseOnClose := False;
   Cli[0] := TWSClient.Create;
   Cli[0].Connect(Format('ws://127.0.0.1:%d/', [Port]));
   Cli[0].SendText(HelloProbe);
-  Check((SrvT.Raised = 2) and Cli[0].ReadMessage(IsText, Data) and
-    (Length(Data) = Length(HelloProbe)),
-    'both raising handlers surfaced once each; the server still echoes');
+  Check((Host.Errors = 2) and (SrvT.Escaped = 0) and
+    Cli[0].ReadMessage(IsText, Data) and (Length(Data) = Length(HelloProbe)),
+    'both raising handlers reached OnError once each, not Run; ' +
+    'the server still echoes');
   Cli[0].Close(1000, 'done');
   Cli[0].Free;
-  {$endif}
 
   // Destroy with three connections still open. Every OnOpen must get its
-  // OnClientClose. Off Darwin these run on this thread after Shutdown,
-  // so every handler also raises and broadcasts to the others: their
-  // transport objects are gone, every send must report the drop and
-  // every broadcast must finish. On Network.framework, Shutdown's cancel
-  // delivers them as ordinary remote closes on the connection queues
-  // instead, where a raise would terminate the battery and a broadcast
-  // may still reach a sibling that is not yet closed.
+  // OnClientClose, and every handler raises. Off Darwin these run on
+  // this thread after Shutdown, so every handler also broadcasts to the
+  // others: their transport objects are gone, every send must report
+  // the drop and every broadcast must finish. On Network.framework,
+  // Shutdown's cancel delivers them as ordinary remote closes on the
+  // connection queues instead, where a broadcast may still reach a
+  // sibling that is not yet closed.
   for I := 0 to High(Cli) do
   begin
     Cli[I] := TWSClient.Create;
@@ -1883,8 +1984,8 @@ begin
   Deadline := GetTickCount64 + 5000;
   while (Host.Closes < Host.Opens - Length(Cli)) and
     (GetTickCount64 < Deadline) do Sleep(10);
-  {$ifndef DARWIN}
   Host.RaiseOnClose := True;
+  {$ifndef DARWIN}
   Host.BroadcastOnClose := True;
   {$endif}
   AStressPhase := 'close-handler section: destroy';
@@ -1894,16 +1995,136 @@ begin
   SrvT.Srv.Free;
   Check((Host.Opens = CloseSectionOpens) and (Host.Closes = Host.Opens) and
     (Host.SendsAccepted = 0) and (Host.Broadcasts = CloseSectionBroadcasts) and
-    (SrvT.Raised = CloseSectionRaised) and (SrvT.Unexpected = 0),
+    (Host.Errors = CloseSectionErrors) and (SrvT.Escaped = 0),
     Format('Destroy pairs every OnOpen with one OnClientClose; sends to any ' +
     'connection report the drop (opens %d, closes %d, sends taken %d, ' +
-    'broadcasts finished %d, raised out of Run %d, unexpected %d)',
-    [Host.Opens, Host.Closes, Host.SendsAccepted, Host.Broadcasts, SrvT.Raised,
-    SrvT.Unexpected]));
+    'broadcasts finished %d, reported to OnError %d, escaped Run %d)',
+    [Host.Opens, Host.Closes, Host.SendsAccepted, Host.Broadcasts, Host.Errors,
+    SrvT.Escaped]));
   SrvT.Free;
   for I := 0 to High(Cli) do Cli[I].Free;
   Host.Free;
   EchoHost.Free;
+end;
+
+// --- handler faults ---------------------------------------------------------
+// One raising handler costs only its connection: its peer sees 1011
+// (OnClientClose has nothing left to close), OnError is handed that
+// connection and that exception, a bystander connection still echoes
+// afterwards, and nothing escapes Run — not even an OnError that
+// rethrows what it was handed.
+const
+  // OnMessage, OnMessage with OnError rethrowing, OnOpen, a Post proc,
+  // OnClientClose.
+  FaultSectionCases = 5;
+  // The bystander plus one connection per case.
+  FaultSectionOpens = FaultSectionCases + 1;
+
+// One raising case on a fresh connection: send ACue ('' = none, the raise
+// is OnOpen's), then expect the server's 1011 and exactly one more
+// matching OnError — already counted, as OnError runs before the close
+// frame is handed to the transport.
+function FaultCase(AHost: TFaultHost; APort: Word;
+  const ACue: RawByteString): Boolean;
+var
+  C: TWSClient;
+  Before: LongInt;
+  IsText: Boolean;
+  Data: TBytes;
+begin
+  Before := AHost.Matched;
+  C := TWSClient.Create;
+  try
+    C.Connect(Format('ws://127.0.0.1:%d/', [APort]));
+    if ACue <> '' then C.SendText(ACue);
+    Result := (not C.ReadMessage(IsText, Data)) and (C.CloseCode = 1011) and
+      (AHost.Matched = Before + 1);
+  finally
+    C.Free;
+  end;
+end;
+
+procedure RunHandlerFaultSection(var AStressPhase: ShortString);
+var
+  Host: TFaultHost;
+  SrvT: TCatchingServerThread;
+  Port: Word;
+  Bystander, Cli: TWSClient;
+  CaseOk, IsText: Boolean;
+  Data: TBytes;
+  Deadline: QWord;
+begin
+  AStressPhase := 'handler-fault section';
+  Host := TFaultHost.Create;
+  SrvT := TCatchingServerThread.Create(True);
+  SrvT.Srv := TWSServer.Create(0, False, 16 * 1024 * 1024, '127.0.0.1');
+  SrvT.Srv.OnMessage := Host.OnMsg;
+  SrvT.Srv.OnOpen := Host.HandleOpen;
+  SrvT.Srv.OnClientClose := Host.HandleClose;
+  SrvT.Srv.OnError := Host.HandleError;
+  Port := SrvT.Srv.Port;
+  SrvT.Start;
+
+  Bystander := TWSClient.Create;
+  Bystander.Connect(Format('ws://127.0.0.1:%d/', [Port]));
+
+  Check(FaultCase(Host, Port, FaultCueMessage),
+    'raising OnMessage: its peer sees 1011, OnError gets that connection ' +
+    'and exception');
+  // A rethrown AError rides a second raise frame with the same object:
+  // it must be swallowed without a double free.
+  Host.ReraiseOnError := True;
+  CaseOk := FaultCase(Host, Port, FaultCueMessage);
+  Host.ReraiseOnError := False;
+  Check(CaseOk and (SrvT.Escaped = 0), 'OnError rethrowing its exception: ' +
+    'swallowed, the peer still sees 1011');
+  Host.RaiseOnOpen := True;
+  CaseOk := FaultCase(Host, Port, '');
+  Host.RaiseOnOpen := False;
+  Check(CaseOk, 'raising OnOpen: its peer sees 1011, OnError gets that ' +
+    'connection and exception');
+  Check(FaultCase(Host, Port, FaultCuePost),
+    'raising Post proc: its peer sees 1011, OnError gets that connection ' +
+    'and exception');
+
+  // The cue marks the connection (its echo is the go-ahead), then a
+  // clean close lets OnClientClose raise: nothing left to close, but
+  // the close completes and OnError still hears of it.
+  Cli := TWSClient.Create;
+  Cli.Connect(Format('ws://127.0.0.1:%d/', [Port]));
+  Cli.SendText(FaultCueClose);
+  Cli.ReadMessage(IsText, Data);
+  Cli.Close(1000, 'done');
+  Deadline := GetTickCount64 + 5000;
+  // Matched, not Errors: OnError counts Errors first, so waiting on it
+  // could read Matched a step early.
+  while (Host.Matched < FaultSectionCases) and (GetTickCount64 < Deadline) do
+    Sleep(10);
+  Check((Cli.CloseCode = 1000) and (Host.Matched = FaultSectionCases),
+    'raising OnClientClose: the close completes, OnError gets that ' +
+    'connection and exception');
+  Cli.Free;
+
+  Bystander.SendText(HelloProbe);
+  Check(Bystander.ReadMessage(IsText, Data) and
+    (Length(Data) = Length(HelloProbe)) and
+    (Host.Errors = FaultSectionCases) and (SrvT.Escaped = 0),
+    'a bystander still echoes after every raise; none escaped Run');
+  Bystander.Close(1000, 'done');
+  Bystander.Free;
+  Deadline := GetTickCount64 + 5000;
+  while (Host.Closes < FaultSectionOpens) and (GetTickCount64 < Deadline) do
+    Sleep(10);
+  Check((Host.Opens = FaultSectionOpens) and (Host.Closes = Host.Opens),
+    Format('every faulted connection still gets its OnClientClose ' +
+    '(opens %d, closes %d)', [Host.Opens, Host.Closes]));
+
+  SrvT.Terminate;
+  SrvT.Srv.Stop;
+  SrvT.WaitFor;
+  SrvT.Srv.Free;
+  SrvT.Free;
+  Host.Free;
 end;
 
 procedure RunLimitsSection(var AStressPhase: ShortString);
@@ -2403,6 +2624,10 @@ var
   HookPort: Word;
   HookResp: RawByteString;
   Hits, Opens, Closes, CloseSendsAlive: Integer;
+  Cli2: TWSClient;
+const
+  Ticket7: RawByteString = 'ticket 7';
+  Ticket9: RawByteString = 'ticket 9';
 begin
   // --- bind address + OnUpgradeRequest -----------------------------------
   // A second server, bound to 127.0.0.1 explicitly (port 0 still
@@ -2488,6 +2713,25 @@ begin
   until GetTickCount64 > Deadline;
   Check(Ok and (Opens = 3) and (Closes = 3) and (CloseSendsAlive = 0),
     'send inside OnClientClose after an abrupt hangup: False, closed once');
+
+  // UserData the hook sets lands on its own connection before OnOpen:
+  // two connections open side by side with different tickets, and each
+  // OnOpen sends back the ticket it found on the connection it got.
+  Cli := TWSClient.Create;
+  Cli2 := TWSClient.Create;
+  Cli.Connect(Format('ws://127.0.0.1:%d/7', [HookPort]));
+  Cli2.Connect(Format('ws://127.0.0.1:%d/9', [HookPort]));
+  Ok := (Cli2.ReadMessage(IsText, Data, 5000) = wrrMessage) and IsText and
+    (Length(Data) = Length(Ticket9)) and
+    CompareMem(@Data[0], @Ticket9[1], Length(Ticket9));
+  Ok := (Cli.ReadMessage(IsText, Data, 5000) = wrrMessage) and IsText and
+    (Length(Data) = Length(Ticket7)) and
+    CompareMem(@Data[0], @Ticket7[1], Length(Ticket7)) and Ok;
+  Check(Ok, 'hook UserData reaches OnOpen on the connection it was set for');
+  Cli.Close(1000, 'done');
+  Cli2.Close(1000, 'done');
+  Cli.Free;
+  Cli2.Free;
 
   StressPhase := 'upgrade-hook section: teardown';
   HookSrvT.Terminate;
@@ -3297,6 +3541,7 @@ begin
   RunHandshakeSizeSection;
   RunLimitsSection(StressPhase);
   RunCloseHandlerSection(StressPhase);
+  RunHandlerFaultSection(StressPhase);
   RunServerTlsSection;
   RunStressSection;
   for I := 0 to High(Linger) do
