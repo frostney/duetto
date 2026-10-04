@@ -14,7 +14,7 @@ live-socket battery, and the Autobahn testsuite. See
 ## Install
 
 ```toml
-duetto = "frostney/duetto@^0.5.1"   # in lwpt.toml [dependencies]
+duetto = "frostney/duetto@^0.6.0"   # in lwpt.toml [dependencies]
 ```
 
 ## Usage

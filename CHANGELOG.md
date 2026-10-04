@@ -2,6 +2,34 @@
 
 All notable changes to duetto are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); entries are generated from Conventional Commits by git-cliff.
 
+## [0.6.0] - 2026-10-04
+
+### Bug Fixes
+
+- send an owed keepalive ping before judging the idle bound (#83)
+- accept IPv6, userinfo and query-only ws URLs, send a correct Host and resolve IPv4 and IPv6 (#94)
+- bound connect, handshake and close, and survive resets, TLS errors and EINTR (#91)
+- bound the plaintext close drain and silence completions after SubmitClose (#84)
+- let OnMessage answer a message before a failing frame's close (#87)
+- stop truncating long handshakes and answer 431 past the header cap (#86)
+
+### Documentation
+
+- document the resource bounds, session clocks and close-drain budget (#90)
+
+### Internal
+
+- refresh project Agent Skills (#93)
+- bump softprops/action-gh-release from 2.6.2 to 3.0.3 (#78)
+- pin the project-skills caller to known-good-route c2c76e4 (#92)
+
+### New Features
+
+- add --bind and passphrase sources outside the command line (#85)
+- **Breaking:** pass OnUpgradeRequest a mutable upgrade context (#89)
+- **Breaking:** contain handler exceptions behind OnError (#88)
+  — a raising OnClientClose no longer propagates out of Run (epoll, IOCP) or terminates the process (Network.framework); it is reported to OnError (reverses #58). Drops inside a Post proc are now deferred until it returns, as inside OnMessage.
+
 ## [0.5.1] - 2026-10-03
 
 ### Bug Fixes
