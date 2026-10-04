@@ -25,6 +25,12 @@
       "skillPath": "codebase-audit/SKILL.md",
       "computedHash": "243a0d231e4c18d146f7ba484ce4bcdd88357b5e93edaeb62b8af194034c574e"
     },
+    "codebase-design": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/codebase-design/SKILL.md",
+      "computedHash": "b2888e4f4e8c0af3bfd557575a64b905c44e6248c3101d72077816882b3a92b9"
+    },
     "create-issue": {
       "source": "frostney/known-good-route",
       "sourceType": "github",
@@ -55,6 +61,12 @@
       "skillPath": "delivery-wait/SKILL.md",
       "computedHash": "50bfd48347318aaf0e54f814bfdc91f5e84e59d7fbe5679d749594c08d6a11e3"
     },
+    "domain-modeling": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/domain-modeling/SKILL.md",
+      "computedHash": "b3eb40152b81f0c98fd2095a023c019452dbdce56f7540cc67fece2972db8369"
+    },
     "git-workflow": {
       "source": "frostney/known-good-route",
       "sourceType": "github",
@@ -66,6 +78,12 @@
       "sourceType": "github",
       "skillPath": "skills/engineering/grill-with-docs/SKILL.md",
       "computedHash": "35e62aa423aaeab6a414bcac273f56dfb17802ef2334b41b6a3b00f28196c8cf"
+    },
+    "grilling": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/grilling/SKILL.md",
+      "computedHash": "4dd886b0196bf43729d954ae326016f2bd9f5f79d892500b407c33a753362f14"
     },
     "implement": {
       "source": "frostney/known-good-route",
