@@ -28,9 +28,10 @@ once on protocol failure, after queueing the appropriate close frame
 | `WS.Frame` | header parse/encode, strict minimal-length rules; masking via byte loop / UInt64 / SSE2 |
 | `WS.Utf8` | Höhrmann DFA with an 8-byte-word ASCII fast path; resumable across fragments |
 | `WS.Handshake` | upgrade request/response both directions, `Sec-WebSocket-Accept`, deflate parameter negotiation |
+| `WS.Url` | RFC 6455 §3 `ws://` / `wss://` URIs for the client: case-insensitive scheme, ASCII registered names, IPv4 and bracketed IPv6 literals, RFC 3986 userinfo accepted and never sent (RFC 6455 has no URI credentials), port 1–65535 with the scheme default when absent, the §3 resource name (`ws://h?x=1` requests `/?x=1`), fragments refused (§3), control characters and spaces refused in host, path and query, and the §4.1 `Host` value (brackets kept, port only when it is not the scheme default) |
 | `WS.Deflate` | RFC 7692 over paszlib: raw deflate, sync flush, 4-byte tail, context takeover control, inflate output cap |
 | `WS.Protocol` | the sans-I/O machine above |
-| `WS.Client` | blocking client, `ws://` and `wss://` (TLS via lwpt's TransportSecurity); messages queue for `ReadMessage`, or go to an optional synchronous `OnMessage` inside the read that completed them, so a reply leaves ahead of a close that a later frame in the same read provokes; a failure after `Connect` (reset, dead peer, TLS error) never raises, it ends the connection (`Open` False, `ReadMessage` False / `wrrClosed`), while `Connect` raises only `EWSClient`; `ConnectTimeoutMs`, `HandshakeTimeoutMs` and `CloseTimeoutMs` (10 s, 10 s, 5 s by default) bound the TCP connect, the wait for the 101 and the wait for the close echo — over `wss://` the last two bound only the wait for the first ciphertext, and the TLS handshake itself stays unbounded until it can run on a non-blocking socket and lwpt can disarm its deadline afterwards; plaintext sends never raise `SIGPIPE` (`MSG_NOSIGNAL` on Linux, `SO_NOSIGPIPE` on Darwin; Linux `wss://` writes inside OpenSSL still can, duetto#79), `EINTR` is retried on plaintext sockets and on Linux `wss://` (lwpt's macOS and Windows TLS paths do not retry it), and a reconnect releases everything the previous connection held, its undrained queue included |
+| `WS.Client` | blocking client, `ws://` and `wss://` (TLS via lwpt's TransportSecurity); the URL goes through `WS.Url`, a refusal raising `EWSClient` before any socket exists, and the host resolves through `getaddrinfo` with `AF_UNSPEC` on every platform, each address tried in the resolver's order (an `AF_INET6` socket for an IPv6 one) under one shared `ConnectTimeoutMs` deadline; messages queue for `ReadMessage`, or go to an optional synchronous `OnMessage` inside the read that completed them, so a reply leaves ahead of a close that a later frame in the same read provokes; a failure after `Connect` (reset, dead peer, TLS error) never raises, it ends the connection (`Open` False, `ReadMessage` False / `wrrClosed`), while `Connect` raises only `EWSClient`; `ConnectTimeoutMs`, `HandshakeTimeoutMs` and `CloseTimeoutMs` (10 s, 10 s, 5 s by default) bound the TCP connect, the wait for the 101 and the wait for the close echo — over `wss://` the last two bound only the wait for the first ciphertext, and the TLS handshake itself stays unbounded until it can run on a non-blocking socket and lwpt can disarm its deadline afterwards; plaintext sends never raise `SIGPIPE` (`MSG_NOSIGNAL` on Linux, `SO_NOSIGPIPE` on Darwin; Linux `wss://` writes inside OpenSSL still can, duetto#79), `EINTR` is retried on plaintext sockets and on Linux `wss://` (lwpt's macOS and Windows TLS paths do not retry it), and a reconnect releases everything the previous connection held, its undrained queue included |
 | `WS.Transport` | the completion-shaped transport contract (ADR-0001): submit sends/closes, receive data/lifecycle completions on the transport's execution context (ADR-0003); an optional gather send (ADR-0004: `SupportsGather` / `SubmitSendV`) that only a transport writing synchronously offers, letting the server hand frame header + caller payload to the socket without copying the payload into the out queue; also `WSParseBindAddress`, the strict IPv4/IPv6 literal parser every transport binds through (never a resolver) |
 | `WS.Transport.PostQueue` | thread-safe FIFO behind the reactor transports' `SubmitPost` (cross-thread `Conn.Post` hand-off); the Network.framework transport posts straight onto its per-connection GCD queues instead |
 | `WS.Transport.TlsServer` | platform-neutral per-connection server TLS over lwpt's memory-BIO accept API: handshake pump, accepted-prefix re-offer, input/output flow accounting, `close_notify` drain; used by the fd-owning transports only |
@@ -59,7 +60,10 @@ Four nets, from innermost to outermost:
    `WS.Transport` suite pinning the bind-address literal parser (strict
    dotted-quad, RFC 4291 IPv6 forms, and a rejection matrix that names
    the offending input) and the default gather send every transport
-   inherits, plus a protocol direct-send suite (when a frame may bypass
+   inherits, a `WS.Url` suite covering every accepted URL form (IPv6
+   literals, userinfo, empty and boundary ports, a query without a path,
+   the scheme-relative `Host` port rule) and rejection tables (fragments,
+   CR/LF and other control characters, bad ports, hosts and schemes), plus a protocol direct-send suite (when a frame may bypass
    the out queue, and that exactly the untaken tail is queued), and a
    `WS.Clock` suite checking that the deadline clock never runs
    backwards and advances in milliseconds.
@@ -75,7 +79,12 @@ Four nets, from innermost to outermost:
    against a full backlog, a silent listener and a peer that never
    echoes; a TLS handshake failure surfacing as `EWSClient`; a blocking
    read interrupted by signals; reconnects after undrained messages and
-   after a raising `OnMessage`), an upgrade-hook
+   after a raising `OnMessage`), a client-URL section (URLs carrying
+   CR/LF refused before connecting, userinfo never sent, a query without
+   a path requesting `/?query` and the `Host` port seen by a raw peer;
+   `ws://[::1]:port/` echoing through a server bound to `::1` with the
+   literal bracketed in `Host`, or a skip line where IPv6 loopback is
+   unavailable), an upgrade-hook
    section (a server
    bound to `127.0.0.1` explicitly whose `OnUpgradeRequest` refuses one
    `Origin` with a 403 — no `OnOpen`, no `OnClientClose` — treats a

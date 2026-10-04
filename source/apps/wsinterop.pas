@@ -10,7 +10,10 @@ program wsinterop;
 // section (SIGPIPE-safe sends into a reset peer, connect / handshake /
 // close timeouts, a TLS handshake failure raising EWSClient, EINTR on a
 // blocking read, reconnects after undrained messages and after a
-// raising OnMessage), a plain-request
+// raising OnMessage), a client-URL section (CR/LF in a URL refused
+// before connecting, userinfo never sent, '/?query' for a query without
+// a path, the Host port, ws://[::1] against a server bound to ::1, or a
+// skip line where IPv6 loopback is unavailable), a plain-request
 // section covering the single-port OnPlainRequest fallback, an
 // upgrade-hook section (a server bound to 127.0.0.1 explicitly whose
 // OnUpgradeRequest vetoes one Origin with a 403, treats a raising hook
@@ -2247,6 +2250,9 @@ type
     DelayMs: Integer;
     Gate: PLongInt;
     Failure: string;
+    // The upgrade request as read, and its parsed Host and target.
+    Request: RawByteString;
+    RequestHost, RequestTarget: string;
     procedure Execute; override;
   end;
 
@@ -2295,11 +2301,14 @@ begin
       SetLength(Raw, Length(Raw) + Got);
       Move(Buf[0], Raw[Length(Raw) - Got + 1], Got);
     until HandshakeFindEnd(Raw) > 0;
+    Request := Raw;
     if not ServerParseRequest(Raw, False, HS) then
     begin
       Failure := 'upgrade request rejected: ' + HS.Failure;
       Exit;
     end;
+    RequestHost := HS.Host;
+    RequestTarget := HS.Path;
     Raw := ServerBuildResponse(HS);
     fpSend(Fd, @Raw[1], Length(Raw), 0);
     if Mode = rpmHangUp then Exit;
@@ -2810,6 +2819,217 @@ begin
   {$ifdef UNIX}
   RunClientInterruptedReadCase;
   {$endif}
+end;
+
+// ---------------------------------------------------------------------------
+// Client URL section (duetto#39)
+// ---------------------------------------------------------------------------
+// What TWSClient makes of a URL, observed on the wire: a URL carrying
+// CR/LF is refused before any socket exists; userinfo is never sent; a
+// query without a path requests '/?query'; the Host header carries a
+// non-default port; and a bracketed IPv6 literal connects over AF_INET6
+// to a server bound to ::1, with the literal bracketed in Host. The
+// hostname section's ws://localhost check covers name resolution.
+
+const
+  UrlUserinfo = 'alice9:s3cr3t-pw';
+  UrlProbe: RawByteString = 'over ::1';
+
+type
+  // OnUpgradeRequest hook that accepts everything and records the Host
+  // and target of the last request, for the ::1 server.
+  TUpgradeRecorder = class
+  private
+    FLock: TCriticalSection;
+    FHost, FTarget: string;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    function Accept(var AContext: TWSUpgradeContext): Boolean;
+    procedure Snapshot(out AHost, ATarget: string);
+  end;
+
+constructor TUpgradeRecorder.Create;
+begin
+  inherited;
+  FLock := TCriticalSection.Create;
+end;
+
+destructor TUpgradeRecorder.Destroy;
+begin
+  FLock.Free;
+  inherited;
+end;
+
+function TUpgradeRecorder.Accept(var AContext: TWSUpgradeContext): Boolean;
+begin
+  FLock.Acquire;
+  try
+    FHost := AContext.Request.Host;
+    FTarget := AContext.Request.Path;
+  finally
+    FLock.Release;
+  end;
+  Result := True;
+end;
+
+procedure TUpgradeRecorder.Snapshot(out AHost, ATarget: string);
+begin
+  FLock.Acquire;
+  try
+    AHost := FHost;
+    ATarget := FTarget;
+  finally
+    FLock.Release;
+  end;
+end;
+
+// One raw peer that accepts a single connection. The two URLs carrying
+// CR/LF go first: had either reached a socket, the peer would have
+// recorded its request instead of the one that follows.
+procedure RunClientUrlRequestCase;
+var
+  Peer: TRobustPeer;
+  Listener: Tsocket;
+  PeerPort: Word;
+  Client: TWSClient;
+  PathError, HostError, Error, Host, Target: string;
+  Request: RawByteString;
+  Finished: Boolean;
+begin
+  Peer := StartRobustPeer(rpmSilent, Listener, PeerPort);
+  Client := TWSClient.Create;
+  Client.CloseTimeoutMs := 0; // the peer never echoes a close
+  try
+    TimedConnect(Client, Format('ws://127.0.0.1:%d/x', [PeerPort]) +
+      #13#10'X-Injected: 1', PathError);
+    TimedConnect(Client, Format('ws://127.0.0.1'#13#10'X-Injected: 1:%d/',
+      [PeerPort]), HostError);
+    TimedConnect(Client, Format('WS://%s@127.0.0.1:%d?x=1',
+      [UrlUserinfo, PeerPort]), Error);
+    Client.Close;
+  finally
+    Client.Free;
+  end;
+  Finished := WaitFinished(Peer, RobustPeerEndMs);
+  Request := Peer.Request;
+  Host := Peer.RequestHost;
+  Target := Peer.RequestTarget;
+  FinishRobustPeer(Peer, Listener, PeerPort, 0);
+
+  Check((PathError =
+    'EWSClient: control character or space in URL path or query') and
+    (HostError = 'EWSClient: invalid character in URL host') and
+    (Pos('X-Injected', Request) = 0),
+    'client: a URL with CR/LF in its path or host raises EWSClient ' +
+    'before connecting');
+  if Error <> '' then WriteLn('       connect: ', Error);
+  Check(Finished and (Error = '') and (Target = '/?x=1') and
+    (Host = Format('127.0.0.1:%d', [PeerPort])),
+    'client: WS:// with a query and no path requests /?x=1, ' +
+    'Host carries the non-default port');
+  // Target pins the request read as the one from the userinfo URL.
+  Check(Finished and (Target = '/?x=1') and (Pos('alice9', Request) = 0) and
+    (Pos('s3cr3t', Request) = 0) and
+    (Pos('Authorization', Request) = 0),
+    'client: URL userinfo is accepted and never sent');
+end;
+
+// True when this host can bind ::1 at all: the only condition under which
+// the IPv6 case skips. A server that then fails to bind ::1 is a failure.
+function IPv6LoopbackAvailable(out AReason: string): Boolean;
+var
+  Fd: Tsocket;
+  SA: TInetSockAddr6;
+begin
+  Result := False;
+  Fd := fpSocket(AF_INET6, SOCK_STREAM, 0);
+  if Fd < 0 then
+  begin
+    AReason := 'no AF_INET6 sockets';
+    Exit;
+  end;
+  FillChar(SA, SizeOf(SA), 0);
+  SA.sin6_family := AF_INET6;
+  SA.sin6_addr.u6_addr8[15] := 1; // ::1, port 0
+  Result := fpBind(Fd, @SA, SizeOf(SA)) = 0;
+  if not Result then AReason := 'cannot bind ::1';
+  CloseSocket(Fd);
+end;
+
+// ws://[::1]:port/ against a server bound to ::1. A host without IPv6
+// loopback says so on a skip line and moves on.
+procedure RunClientUrlIPv6Case;
+var
+  Recorder: TUpgradeRecorder;
+  Echoer: TEcho;
+  SrvThread: TServerThread;
+  Server: TWSServer;
+  SrvPort: Word;
+  Client: TWSClient;
+  Error, Host, Target: string;
+  Echoed, IsText: Boolean;
+  Data: TBytes;
+begin
+  if not IPv6LoopbackAvailable(Error) then
+  begin
+    WriteLn('skip - client: IPv6 loopback unavailable (', Error,
+      '); ws://[::1] not exercised');
+    Exit;
+  end;
+  try
+    Server := TWSServer.Create(0, True, 16 * 1024 * 1024, '::1');
+  except
+    on E: Exception do
+    begin
+      Check(False, 'client: a server binds ::1 (' + E.Message + ')');
+      Exit;
+    end;
+  end;
+  Recorder := TUpgradeRecorder.Create;
+  Echoer := TEcho.Create;
+  SrvThread := TServerThread.Create(True);
+  SrvThread.Srv := Server;
+  Server.OnMessage := Echoer.OnMsg;
+  Server.OnUpgradeRequest := Recorder.Accept;
+  SrvPort := Server.Port;
+  SrvThread.Start;
+
+  Client := TWSClient.Create;
+  Echoed := False;
+  try
+    TimedConnect(Client, Format('ws://[::1]:%d/six?v=6', [SrvPort]), Error);
+    if Error = '' then
+    begin
+      Client.SendText(UrlProbe);
+      Echoed := (Client.ReadMessage(IsText, Data, 5000) = wrrMessage) and
+        IsText and (AsText(Data) = UrlProbe);
+      Client.Close(1000, 'done');
+    end;
+  finally
+    Client.Free;
+  end;
+  Recorder.Snapshot(Host, Target);
+  if Error <> '' then WriteLn('       connect: ', Error);
+  Check((Error = '') and Echoed,
+    'client: ws://[::1]:port/ connects over IPv6 to a ::1-bound server, echo');
+  Check((Host = Format('[::1]:%d', [SrvPort])) and (Target = '/six?v=6'),
+    'client: IPv6 literal stays bracketed in Host, with the port');
+
+  SrvThread.Terminate;
+  Server.Stop;
+  SrvThread.WaitFor;
+  Server.Free;
+  SrvThread.Free;
+  Recorder.Free;
+  Echoer.Free;
+end;
+
+procedure RunClientUrlSection(var AStressPhase: ShortString);
+begin
+  AStressPhase := 'client URL section';
+  RunClientUrlRequestCase;
+  RunClientUrlIPv6Case;
 end;
 
 {$ifdef LINUX}
@@ -3501,23 +3721,30 @@ end;
 
 procedure RunHostnameSection;
 begin
-  // --- hostname resolution (files before dns) -------------------------------
-  // The UNIX client resolved names with DNS-only ResolveHostByName, so
-  // ws://localhost failed on any glibc resolver that does not synthesize
-  // the name (plain nameservers in containers and VMs; macOS answers, GH
-  // runners answer via systemd-resolved). One echo round through the
-  // hostname pins the /etc/hosts path on every platform; Windows resolves
-  // through getaddrinfo and was never affected.
+  // --- hostname resolution (getaddrinfo, AF_UNSPEC) ------------------------
+  // The client resolves through getaddrinfo with AF_UNSPEC on every
+  // platform, so localhost comes from the hosts file before DNS (FPC's
+  // DNS-only netdb path failed it on plain glibc resolvers). Where
+  // localhost lists ::1 ahead of an address this server is not
+  // listening on, that address is refused and the next one connects;
+  // whether a host's resolver exercises that fallback depends on its
+  // hosts file, so this check pins resolution, not the fallback.
   StressPhase := 'localhost resolution section';
   Cli := TWSClient.Create;
-  Cli.Connect(Format('ws://localhost:%d/', [Port]));
   S := 'via-hosts-file';
-  Cli.SendText(S);
-  Check(Cli.ReadMessage(IsText, Data) and IsText and
-    (Length(Data) = Length(S)) and CompareMem(@Data[0], @S[1], Length(S)),
-    'ws://localhost echo (hosts-file resolution)');
-  Cli.Close(1000, 'done');
+  Ok := False;
+  try
+    Cli.Connect(Format('ws://localhost:%d/', [Port]));
+    Cli.SendText(S);
+    Ok := Cli.ReadMessage(IsText, Data) and IsText and
+      (Length(Data) = Length(S)) and CompareMem(@Data[0], @S[1], Length(S));
+    Cli.Close(1000, 'done');
+  except
+    on E: Exception do
+      WriteLn('       connect: ', E.ClassName, ': ', E.Message);
+  end;
   Cli.Free;
+  Check(Ok, 'ws://localhost echo (getaddrinfo, AF_UNSPEC)');
 end;
 
 procedure RunBoundedReadSection;
@@ -4626,6 +4853,7 @@ begin
   RunViolationSection;
   RunClientDeliverySection(Url, StressPhase);
   RunClientRobustnessSection(Url, StressPhase);
+  RunClientUrlSection(StressPhase);
   RunEgressSection(Port, StressPhase);
   RunPlainRequestSection;
   RunUpgradeHookSection;
