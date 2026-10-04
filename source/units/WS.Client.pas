@@ -438,7 +438,7 @@ end;
 // as the OS keeps trying). Returns a connected socket, back in blocking
 // mode and configured for the client, or WSSocketInvalid with AError
 // saying why — 'timed out' when the deadline ran out first. Callers with
-// several addresses try each in turn against one shared deadline.
+// several addresses (ResolveAndConnect) give each a share of one deadline.
 //
 // The connect runs non-blocking so the deadline can cut it short. A
 // signal interrupting it (EINTR) does not abort it: the connection keeps
