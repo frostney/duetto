@@ -50,8 +50,12 @@ properties. `MaxConnections` is checked on the accept path, before a
 session connection exists (the `Run` thread on epoll and IOCP, the listener
 queue on Network.framework), so a change applies to later accepts. The
 other five are judged on each connection's own execution context
-(ADR-0003), so a change applies to connections whose next event lands
-after it. Set them all before `Run`. [deployment.md](deployment.md#server-limits-for-production-hosts)
+(ADR-0003). `MaxPendingOutput` is read on every flush. Each clock takes its
+property's value when it is armed: `HandshakeTimeoutMs` at accept,
+`CloseTimeoutMs` when a close or drain begins, `IdleTimeoutMs` and
+`PingIntervalMs` when the connection opens and whenever the peer sends. A
+change therefore never moves a deadline that is already armed. Set them all
+before `Run`. [deployment.md](deployment.md#server-limits-for-production-hosts)
 says which ones a production host should set.
 
 | Property | Default | What it bounds | When it trips |
@@ -74,9 +78,10 @@ where the previous read stopped, so a trickled request costs linear time.
 
 A handler fault is bounded the same way. An exception escaping `OnOpen`,
 `OnMessage`, `OnClientClose` or a `Post` proc is caught where the server
-called the handler, on every transport. The connection it escaped from
-queues 1011 and is dropped once that frame is on the wire, or when
-`CloseTimeoutMs` lapses for a peer that is not reading. `TWSServer.OnError`
+called the handler, on every transport. If the connection it escaped
+from is still open, it queues 1011; one that is already closing gets no
+1011. Either way it is dropped once its queued output is on the wire, or
+when `CloseTimeoutMs` lapses for a peer that is not reading. `TWSServer.OnError`
 reports the exception on the failing handler's execution context, and `Run`
 and every other connection carry on. A raising `OnClientClose` has nothing
 left to close and is only reported. `OnUpgradeRequest` and `OnPlainRequest`
@@ -134,20 +139,26 @@ any clock is armed.
   final bytes may hold the connection after the session dropped it. On
   epoll it bounds the TLS close drain (`close_notify` out, then FIN and the
   peer's EOF); a plaintext epoll connection closes at once and has no
-  drain. On IOCP it bounds every graceful close, TLS or plaintext: the
-  `close_notify` drain, a close deferred behind a send still in flight, and
-  the wait for the peer's EOF after FIN. On both, the transport's 100 ms
-  deadline sweep closes the socket abortively when the budget lapses. On
-  Network.framework it bounds any close deferred behind an in-flight send,
-  TLS or not, and a dispatch timer on the connection's queue cancels the
-  connection when it lapses. IOCP and Network.framework read the field with
-  `Enabled = False` too.
+  drain. On IOCP it bounds graceful closes, TLS or plaintext: the
+  `close_notify` drain, a plaintext close deferred behind a send still in
+  flight, and the wait for the peer's EOF after FIN. On both, the
+  transport's 100 ms deadline sweep closes the socket abortively when the
+  budget lapses. One IOCP wait is not bounded: when a TLS connection whose
+  handshake finished is closed while a send is in flight, the drain
+  deadline starts only once that send completes, so a peer that stops
+  reading holds the socket until then. On Network.framework the budget
+  bounds any close deferred behind an in-flight send, TLS or not, and a
+  dispatch timer on the connection's queue cancels the connection when it
+  lapses. IOCP and Network.framework read the field with `Enabled = False`
+  too.
 
 The transport budget starts only after the session drops the connection.
 A peer that stops reading can hold a descriptor for up to `CloseTimeoutMs`
 in the session and then up to `HandshakeDeadlineMs` in the transport's
-close drain. With `CloseTimeoutMs = 0` the session stage has no bound, so
-the transport budget never starts for a peer that never reads. Connections
+close drain, except in the IOCP TLS case above, where the wait for the
+in-flight send comes first and has no bound. With `CloseTimeoutMs = 0` the
+session stage has no bound, so the transport budget never starts for a
+peer that never reads. Connections
 in that transport drain are already out of the session registry, so
 `MaxConnections` no longer counts them.
 

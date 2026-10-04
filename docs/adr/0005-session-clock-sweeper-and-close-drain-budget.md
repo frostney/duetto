@@ -89,3 +89,8 @@ session has dropped a connection it holds no object to post a check to.
   transport's close drain, which starts only once the session has dropped
   the connection. With `CloseTimeoutMs = 0` the session stage, and so the
   whole hold, has no bound.
+- On IOCP, a TLS connection whose handshake finished and that is closed
+  while a send is in flight starts its drain deadline only once that send
+  completes. Until then nothing bounds the wait, so a peer that stops
+  reading can hold the socket past `CloseTimeoutMs` plus
+  `HandshakeDeadlineMs`.

@@ -95,11 +95,13 @@ Server.Run;
   every graceful close on IOCP, any close deferred behind a send on macOS.
   A peer that stops reading can therefore hold a descriptor for up to
   `CloseTimeoutMs` plus this value, since this budget starts only once the
-  session has dropped the connection. A plaintext listener on Windows or
+  session has dropped the connection. The exception is an IOCP TLS
+  connection closed while a send is in flight: its drain deadline starts
+  only when that send completes, so that wait has no bound. A plaintext listener on Windows or
   macOS sets it by passing a record with `Enabled = False` to the TLS
   constructor overload. The other `TWSTransportTls` fields bound
-  per-connection TLS buffers on epoll and IOCP; their defaults are documented in
-  `source/units/WS.Transport.pas`.
+  per-connection TLS buffers on epoll and IOCP; their defaults are
+  documented in `source/units/WS.Transport.pas`.
 
 The 16 KiB request header cap is fixed. A client whose upgrade request
 carries a larger header block, for example through large cookies a proxy
