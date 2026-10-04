@@ -33,20 +33,26 @@ wsprobe   = { source = "source/apps/wsprobe.pas",   output = "build/wsprobe" }
 wsautobahn = { source = "source/apps/wsautobahn.pas", output = "build/wsautobahn" }
 
 # Analysis gates. Ceilings sit above the measured 2026-10-04 baseline
-# (lwpt health / lwpt duplication): file cyclomatic 468 and file
-# cognitive 497 (both wsinterop, the E2E battery — it grows with every
-# observed bound; the client-robustness section of duetto#44 added 79
-# and 67, the client-URL section of duetto#39 17 and 9, the keepalive
-# cases of duetto#80 16 and 16), routine cyclomatic 58 and routine
-# cognitive 126 (TWSProtocol.Ingest), duplication 0.52%. A file's
-# cyclomatic figure is the sum of its routines, so splitting the battery
-# into section procedures (as it now is) keeps its routines small but
-# cannot lower the file figure; the file ceilings therefore follow the
-# battery, about 10 above its latest measured figures. Regression
-# ratchets — CI fails when a change pushes a metric past its ceiling.
+# (lwpt health / lwpt duplication): file cyclomatic 256 and file
+# cognitive 355 (WS.Transport.Iocp), routine cyclomatic 58 and routine
+# cognitive 126 (TWSProtocol.Ingest), duplication 0.51%. The file
+# ceilings sit about 10 above the measured figures; regression ratchets —
+# CI fails when a change pushes a metric past its ceiling.
+#
+# The E2E battery source/apps/wsinterop.pas is out of analysis scope
+# (duetto#97). It grows with every observed bound (468 / 497 at 0.6.0),
+# so file ceilings that followed it rose in 5 of the 0.6.0 milestone's
+# 8 battery merges, never caught a regression, and left every library
+# file unchecked. lwpt 0.7.0 scopes analysis only as a whole, so the
+# exclusion also takes the battery out of lwpt duplication; per-path
+# health and duplication settings in lwpt (frostney/lwpt#374) would let
+# it back in.
+[analysis]
+exclude = ["source/apps/wsinterop.pas"]
+
 [health]
-max-file-cyclomatic = 478
-max-file-cognitive = 507
+max-file-cyclomatic = 266
+max-file-cognitive = 365
 max-routine-cyclomatic = 70
 max-routine-cognitive = 130
 
