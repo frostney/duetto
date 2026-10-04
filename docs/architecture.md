@@ -46,9 +46,12 @@ Units higher in the table never depend on units lower down. The programs in
 ## Server resource bounds
 
 `WS.Server` bounds what one peer can cost the host through six `TWSServer`
-properties. Each is judged on the connection's own execution context
-(ADR-0003), so a change applies to connections whose next event lands after
-it; set them before `Run`. [deployment.md](deployment.md#server-limits-for-production-hosts)
+properties. `MaxConnections` is checked on the accept path, before a
+session connection exists (the `Run` thread on epoll and IOCP, the listener
+queue on Network.framework), so a change applies to later accepts. The
+other five are judged on each connection's own execution context
+(ADR-0003), so a change applies to connections whose next event lands
+after it. Set them all before `Run`. [deployment.md](deployment.md#server-limits-for-production-hosts)
 says which ones a production host should set.
 
 | Property | Default | What it bounds | When it trips |
