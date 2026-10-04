@@ -42,7 +42,7 @@ interface
 uses
   SysUtils,
   {$ifdef UNIX}
-  BaseUnix, Sockets, netdb,
+  BaseUnix, Sockets,
   {$endif}
   {$ifdef WINDOWS}
   WinSock2,
@@ -127,16 +127,26 @@ type
     constructor Create;
     destructor Destroy; override;
 
-    // url: ws://host[:port]/path or wss://host[:port]/path
+    // url: ws[s]://[userinfo@]host[:port][/path][?query], parsed by
+    // WSParseUrl (WS.Url, which documents the rules). The scheme is
+    // case-insensitive; host is a name, an IPv4 address or a bracketed
+    // IPv6 literal ('ws://[::1]:9001/'); userinfo is accepted and never
+    // sent, since RFC 6455 has no credentials in its URIs; a fragment is
+    // refused (RFC 6455 §3), and so is a control character or space in
+    // the host, path or query. The Host header carries the port only
+    // when it is not the scheme default (RFC 6455 §4.1). The name
+    // resolves through getaddrinfo, IPv4 and IPv6 alike, and each address
+    // is tried in turn (see ConnectTimeoutMs).
     //
-    // Raises EWSClient on any failure — resolution, connect, TLS, a
-    // timeout or a rejected upgrade — and leaves no socket or TLS
-    // session behind. A client is reusable: Connect after Close, after a
-    // failed Connect or after a connection ended by itself (a dead peer,
-    // a raising OnMessage) first releases everything the previous
-    // connection held, its undrained ReadMessage queue included. Until
-    // then that queue stays readable, so messages that arrived before a
-    // close are not lost to it. Connect on an open client raises.
+    // Raises EWSClient on any failure — a refused URL, resolution,
+    // connect, TLS, a timeout or a rejected upgrade — and leaves no
+    // socket or TLS session behind. A client is reusable: Connect after
+    // Close, after a failed Connect or after a connection ended by itself
+    // (a dead peer, a raising OnMessage) first releases everything the
+    // previous connection held, its undrained ReadMessage queue
+    // included. Until then that queue stays readable, so messages that
+    // arrived before a close are not lost to it. Connect on an open
+    // client raises.
     procedure Connect(const AUrl: string; AOfferDeflate: Boolean = False;
       AMaxMessage: NativeInt = WS_DEFAULT_MAX_MESSAGE);
 
@@ -213,9 +223,12 @@ type
     // bound runs on WSMonotonicMs, so a wall-clock step cannot move it.
     //
     // ConnectTimeoutMs (default 10 s) bounds the TCP connect, shared by
-    // every address a name resolves to. Name resolution itself is not
-    // bounded. <= 0 waits as long as the OS keeps trying (minutes on
-    // Linux against a host that drops SYNs).
+    // every address a name resolves to: they are tried one after another
+    // in the resolver's order, so an address that drops SYNs can use the
+    // whole budget before the next is tried (there is no RFC 6555
+    // racing). Name resolution itself is not bounded. <= 0 waits as
+    // long as the OS keeps trying (minutes on Linux against a host that
+    // drops SYNs).
     //
     // HandshakeTimeoutMs (default 10 s) starts once TCP is connected and
     // bounds the wait for the 101 (the upgrade request itself is a plain
@@ -252,53 +265,8 @@ type
 
 implementation
 
-{ url parsing — deliberately minimal: scheme://host[:port]path }
-
-procedure ParseWsUrl(const AUrl: string; out ATls: Boolean;
-  out AHost: string; out APort: Integer; out APath: string);
-var
-  Rest: string;
-  Slash, Colon: Integer;
-begin
-  if Copy(AUrl, 1, 5) = 'ws://' then
-  begin
-    ATls := False;
-    Rest := Copy(AUrl, 6, MaxInt);
-    APort := 80;
-  end
-  else if Copy(AUrl, 1, 6) = 'wss://' then
-  begin
-    ATls := True;
-    Rest := Copy(AUrl, 7, MaxInt);
-    APort := 443;
-  end
-  else
-    raise EWSClient.Create('URL must start with ws:// or wss://');
-
-  Slash := Pos('/', Rest);
-  if Slash = 0 then
-  begin
-    APath := '/';
-  end
-  else
-  begin
-    APath := Copy(Rest, Slash, MaxInt);
-    Rest := Copy(Rest, 1, Slash - 1);
-  end;
-
-  Colon := Pos(':', Rest);
-  if Colon > 0 then
-  begin
-    APort := StrToIntDef(Copy(Rest, Colon + 1, MaxInt), -1);
-    if (APort <= 0) or (APort > 65535) then
-      raise EWSClient.Create('bad port in URL');
-    AHost := Copy(Rest, 1, Colon - 1);
-  end
-  else
-    AHost := Rest;
-
-  if AHost = '' then raise EWSClient.Create('missing host in URL');
-end;
+uses
+  WS.Url;
 
 { sockets }
 
@@ -551,62 +519,46 @@ begin
   end;
 end;
 
-{$ifdef UNIX}
-// ATimeoutMs is ConnectTimeoutMs: the deadline starts once the name has
-// resolved, so a slow lookup does not eat the connect budget.
-function ResolveAndConnect(const AHost: string; APort: Integer;
-  ATimeoutMs: Integer): TWSPlatformSocket;
-var
-  SA: TInetSockAddr;
-  HE: THostEntry;
-  Addr: in_addr;
-  Err: string;
-begin
-  Addr := StrToNetAddr(AHost);
-  if Addr.s_addr = 0 then
-  begin
-    // libc resolves names through nsswitch (files before dns), but FPC's
-    // netdb splits the pair: GetHostByName reads /etc/hosts only and
-    // returns the address in host byte order, while ResolveHostByName
-    // queries the resolv.conf nameservers only and returns network byte
-    // order. Names like localhost normally exist only in /etc/hosts, so a
-    // DNS-only lookup fails on any resolver that does not synthesize them
-    // (plain glibc setups; macOS happens to answer). Match libc: hosts
-    // file first — flipping its host-order result — then DNS.
-    if GetHostByName(AHost, HE) then
-      Addr.s_addr := htonl(HE.Addr.s_addr)
-    else if ResolveHostByName(AHost, HE) then
-      Addr := HE.Addr
-    else
-      raise EWSClient.CreateFmt('cannot resolve %s', [AHost]);
-  end;
+{ name resolution }
 
-  FillChar(SA, SizeOf(SA), 0);
-  SA.sin_family := AF_INET;
-  SA.sin_port := htons(APort);
-  SA.sin_addr := Addr;
-  Result := ConnectAddress(AF_INET, @SA, SizeOf(SA),
-    DeadlineAfter(ATimeoutMs), Err);
-  if Result = WSSocketInvalid then
-    raise EWSClient.CreateFmt('connect to %s:%d failed: %s',
-      [AHost, APort, Err]);
-end;
-{$endif}
-
-{$ifdef WINDOWS}
+// getaddrinfo with AF_UNSPEC on every platform, so names go through the
+// system resolver (nsswitch on Linux, the hosts file before DNS; the
+// system resolver on macOS and Windows) and come back IPv4 and IPv6
+// alike, in the order it sorts them (RFC 6724). The struct differs by
+// platform: glibc and musl put ai_addr ahead of ai_canonname; Darwin,
+// the BSDs, Android's bionic and WinSock the other way round; WinSock's
+// ai_addrlen is a size_t rather than a socklen_t.
 type
   PWSAddrInfo = ^TWSAddrInfo;
+  {$push}
+  {$packrecords c}
   TWSAddrInfo = record
     ai_flags: LongInt;
     ai_family: LongInt;
     ai_socktype: LongInt;
     ai_protocol: LongInt;
+    {$ifdef WINDOWS}
     ai_addrlen: PtrUInt;
+    {$else}
+    ai_addrlen: TSockLen;
+    {$endif}
+    {$if defined(LINUX) and not defined(ANDROID)}
+    ai_addr: PSockAddr;
+    ai_canonname: PAnsiChar;
+    {$else}
     ai_canonname: PAnsiChar;
     ai_addr: PSockAddr;
+    {$endif}
     ai_next: PWSAddrInfo;
   end;
+  {$pop}
 
+const
+  // AI_NUMERICHOST: the same bit in glibc, Darwin and WinSock. An IPv6
+  // literal is parsed, never looked up.
+  WSAiNumericHost = $0004;
+
+{$ifdef WINDOWS}
 function C_getaddrinfo(ANodeName, AServiceName: PAnsiChar;
   AHints: PWSAddrInfo; out AResult: PWSAddrInfo): LongInt; stdcall;
   external WINSOCK2_DLL name 'getaddrinfo';
@@ -626,27 +578,69 @@ begin
   WinSockInitialized := True;
 end;
 
-// ATimeoutMs is ConnectTimeoutMs: the deadline starts once the name has
-// resolved, so a slow lookup does not eat the connect budget.
-function ResolveAndConnect(const AHost: string; APort: Integer;
+// WinSock's getaddrinfo returns a WSA error code.
+function ResolveErrorText(ACode: LongInt): string;
+begin
+  Result := Format('%s (%d)', [SysErrorMessage(ACode), ACode]);
+end;
+{$else}
+// libc is linked already (WS.Frame's memcpy, WS.Clock on Darwin).
+function C_getaddrinfo(ANodeName, AServiceName: PAnsiChar;
+  AHints: PWSAddrInfo; out AResult: PWSAddrInfo): cint; cdecl;
+  external 'c' name 'getaddrinfo';
+procedure C_freeaddrinfo(AInfo: PWSAddrInfo); cdecl;
+  external 'c' name 'freeaddrinfo';
+function C_gai_strerror(ACode: cint): PAnsiChar; cdecl;
+  external 'c' name 'gai_strerror';
+
+// An EAI_* code, which is no errno.
+function ResolveErrorText(ACode: LongInt): string;
+begin
+  Result := Format('%s (%d)', [string(C_gai_strerror(ACode)), ACode]);
+end;
+{$endif}
+
+// The authority as error messages show it, port always included.
+function PeerText(const AUrl: TWSUrl): string;
+begin
+  if AUrl.IPv6Literal then
+    Result := '[' + AUrl.Host + ']:' + IntToStr(AUrl.Port)
+  else
+    Result := AUrl.Host + ':' + IntToStr(AUrl.Port);
+end;
+
+// Try every address AUrl.Host resolves to, in order, each through
+// ConnectAddress with a socket of its own family (AF_INET6 for an IPv6
+// address), until one connects. ATimeoutMs is ConnectTimeoutMs, one
+// deadline shared by every attempt; it starts once the name has
+// resolved, so a slow lookup does not eat the connect budget. A refused
+// or unreachable address fails at once and the next is tried; one that
+// drops SYNs holds the rest back until the deadline (no RFC 6555 racing).
+function ResolveAndConnect(const AUrl: TWSUrl;
   ATimeoutMs: Integer): TWSPlatformSocket;
 var
   Hints: TWSAddrInfo;
   Info, Current: PWSAddrInfo;
   Host, Service: AnsiString;
   Err: string;
+  Code: LongInt;
   Deadline: QWord;
 begin
+  {$ifdef WINDOWS}
   EnsureWinSockInitialized;
+  {$endif}
   FillChar(Hints, SizeOf(Hints), 0);
-  Hints.ai_family := AF_INET;
+  Hints.ai_family := AF_UNSPEC;
   Hints.ai_socktype := SOCK_STREAM;
   Hints.ai_protocol := IPPROTO_TCP;
-  Host := AnsiString(AHost);
-  Service := AnsiString(IntToStr(APort));
+  if AUrl.IPv6Literal then Hints.ai_flags := WSAiNumericHost;
+  Host := AnsiString(AUrl.Host);
+  Service := AnsiString(IntToStr(AUrl.Port));
   Info := nil;
-  if C_getaddrinfo(PAnsiChar(Host), PAnsiChar(Service), @Hints, Info) <> 0 then
-    raise EWSClient.CreateFmt('cannot resolve %s', [AHost]);
+  Code := C_getaddrinfo(PAnsiChar(Host), PAnsiChar(Service), @Hints, Info);
+  if Code <> 0 then
+    raise EWSClient.CreateFmt('cannot resolve %s: %s',
+      [AUrl.Host, ResolveErrorText(Code)]);
 
   Result := WSSocketInvalid;
   Err := 'no address';
@@ -663,10 +657,9 @@ begin
     C_freeaddrinfo(Info);
   end;
   if Result = WSSocketInvalid then
-    raise EWSClient.CreateFmt('connect to %s:%d failed: %s',
-      [AHost, APort, Err]);
+    raise EWSClient.CreateFmt('connect to %s failed: %s',
+      [PeerText(AUrl), Err]);
 end;
-{$endif}
 
 { TWSClient }
 
@@ -900,8 +893,8 @@ end;
 procedure TWSClient.Connect(const AUrl: string; AOfferDeflate: Boolean;
   AMaxMessage: NativeInt);
 var
-  Host, Path, Key, Req, Err, Peer: string;
-  Port: Integer;
+  Url: TWSUrl;
+  Key, Req, Err: string;
   Raw: RawByteString;
   HdrEnd: Integer;
   Deadline: QWord;
@@ -912,23 +905,22 @@ begin
     raise EWSClient.Create('cannot connect from inside OnMessage');
   if FOpen then raise EWSClient.Create('already connected');
   ResetConnection;
-  ParseWsUrl(AUrl, FUseTls, Host, Port, Path);
-  Peer := Host + ':' + IntToStr(Port);
+  // Refused before any socket exists, a URL carrying CR/LF included.
+  if not WSParseUrl(AUrl, Url, Err) then raise EWSClient.Create(Err);
+  FUseTls := Url.Secure;
 
   try
-    FSock := ResolveAndConnect(Host, Port, FConnectTimeoutMs);
+    FSock := ResolveAndConnect(Url, FConnectTimeoutMs);
     Deadline := DeadlineAfter(FHandshakeTimeoutMs);
-    if FUseTls then StartTls(Host);
+    if FUseTls then StartTls(Url.Host);
 
     Key := ClientGenerateKey;
-    if (Port = 80) or (Port = 443) then
-      Req := ClientBuildRequest(Host, Path, Key, AOfferDeflate)
-    else
-      Req := ClientBuildRequest(Peer, Path, Key, AOfferDeflate);
+    Req := ClientBuildRequest(Url.HostHeader, Url.Resource, Key,
+      AOfferDeflate);
     if RawWrite(@Req[1], Length(Req)) <> Length(Req) then
       raise EWSClient.Create('handshake send failed');
 
-    Raw := ReadUpgradeResponse(Deadline, HdrEnd, Peer);
+    Raw := ReadUpgradeResponse(Deadline, HdrEnd, PeerText(Url));
     if not ClientParseResponse(Copy(Raw, 1, HdrEnd), Key, AOfferDeflate,
         FDeflate, Err) then
       raise EWSClient.Create('handshake rejected: ' + Err);
