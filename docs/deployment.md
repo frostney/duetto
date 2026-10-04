@@ -31,7 +31,7 @@ Downstream lwpt projects depend on duetto in their `lwpt.toml`:
 
 ```toml
 [dependencies]
-duetto = "frostney/duetto@^0.5.1"
+duetto = "frostney/duetto@^0.6.0"
 ```
 
 During the sandbox phase the dependency can also be a local path
