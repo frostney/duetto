@@ -9,6 +9,9 @@ license: Unlicense OR MIT
 compatibility: >-
   Requires the project's declared build and test tools plus network access for
   current third-party documentation and source verification.
+metadata:
+  agents-role: entry-point
+  agents-text: Audit a repository or subsystem for systemic engineering risks.
 ---
 
 # Codebase audit

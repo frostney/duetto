@@ -16,8 +16,10 @@ the reusable workflow owns scheduled refresh mechanics.
 Read
 [the project-skills maintenance runbook](references/project-skills-runbook.md)
 when adding or changing a caller, migrating a deleted or renamed inventory
-entry, or diagnosing a failed run. It holds the caller shape and permissions,
-immutable-pinning rules, migration evidence requirements, and failure branches.
+entry, declaring a skill's role in the generated `AGENTS.md` skills block, or
+diagnosing a failed run. It holds the caller shape and permissions,
+immutable-pinning rules, migration evidence requirements, role declarations,
+and failure branches.
 
 Do not copy the scheduled runtime into a consumer, install KGR globally, edit
 CLI-generated payloads or hashes by hand, or merge an automation PR. Use the
