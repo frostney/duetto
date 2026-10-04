@@ -127,16 +127,12 @@ type
     constructor Create;
     destructor Destroy; override;
 
-    // url: ws[s]://[userinfo@]host[:port][/path][?query], parsed by
-    // WSParseUrl (WS.Url, which documents the rules). The scheme is
-    // case-insensitive; host is a name, an IPv4 address or a bracketed
-    // IPv6 literal ('ws://[::1]:9001/'); userinfo is accepted and never
-    // sent, since RFC 6455 has no credentials in its URIs; a fragment is
-    // refused (RFC 6455 §3), and so is a control character or space in
-    // the host, path or query. The Host header carries the port only
-    // when it is not the scheme default (RFC 6455 §4.1). The name
-    // resolves through getaddrinfo, IPv4 and IPv6 alike, and each address
-    // is tried in turn (see ConnectTimeoutMs).
+    // url: ws[s]://[userinfo@]host[:port][/path][?query], host a name, an
+    // IPv4 address or a bracketed IPv6 literal ('ws://[::1]:9001/').
+    // WS.Url documents the accepted forms and the Host header; a URL it
+    // refuses raises EWSClient before any socket exists. The name
+    // resolves through getaddrinfo, IPv4 and IPv6 alike (see
+    // ConnectTimeoutMs).
     //
     // Raises EWSClient on any failure — a refused URL, resolution,
     // connect, TLS, a timeout or a rejected upgrade — and leaves no
@@ -223,10 +219,14 @@ type
     // bound runs on WSMonotonicMs, so a wall-clock step cannot move it.
     //
     // ConnectTimeoutMs (default 10 s) bounds the TCP connect, shared by
-    // every address a name resolves to: they are tried one after another
-    // in the resolver's order, so an address that drops SYNs can use the
-    // whole budget before the next is tried (there is no RFC 6555
-    // racing). Name resolution itself is not bounded. <= 0 waits as
+    // every address a name resolves to. They are tried one after another
+    // in the resolver's order (there is no RFC 6555 racing), each with an
+    // equal share of what is left of the budget, so an IPv6 address that
+    // drops SYNs leaves the IPv4 one after it time to connect. A refused
+    // address normally fails at once, but Windows retries SYNs against a
+    // refusal for about two seconds: where localhost lists ::1 first and
+    // the server listens on IPv4 only, that delay comes first. Name
+    // resolution itself is not bounded. <= 0 waits as
     // long as the OS keeps trying (minutes on Linux against a host that
     // drops SYNs).
     //
@@ -600,31 +600,21 @@ begin
 end;
 {$endif}
 
-// The authority as error messages show it, port always included.
-function PeerText(const AUrl: TWSUrl): string;
-begin
-  if AUrl.IPv6Literal then
-    Result := '[' + AUrl.Host + ']:' + IntToStr(AUrl.Port)
-  else
-    Result := AUrl.Host + ':' + IntToStr(AUrl.Port);
-end;
-
 // Try every address AUrl.Host resolves to, in order, each through
-// ConnectAddress with a socket of its own family (AF_INET6 for an IPv6
-// address), until one connects. ATimeoutMs is ConnectTimeoutMs, one
-// deadline shared by every attempt; it starts once the name has
-// resolved, so a slow lookup does not eat the connect budget. A refused
-// or unreachable address fails at once and the next is tried; one that
-// drops SYNs holds the rest back until the deadline (no RFC 6555 racing).
+// ConnectAddress with a socket of its own family, until one connects.
+// ATimeoutMs is ConnectTimeoutMs (see the property for the timing); its
+// deadline starts once the name has resolved, and each attempt gets an
+// equal share of what is left of it, so an address that drops SYNs
+// cannot starve the ones after it.
 function ResolveAndConnect(const AUrl: TWSUrl;
   ATimeoutMs: Integer): TWSPlatformSocket;
 var
   Hints: TWSAddrInfo;
   Info, Current: PWSAddrInfo;
   Host, Service: AnsiString;
-  Err: string;
-  Code: LongInt;
-  Deadline: QWord;
+  Err, Failed: string;
+  Code, Left: LongInt;
+  Deadline, Attempt: QWord;
 begin
   {$ifdef WINDOWS}
   EnsureWinSockInitialized;
@@ -638,27 +628,47 @@ begin
   Service := AnsiString(IntToStr(AUrl.Port));
   Info := nil;
   Code := C_getaddrinfo(PAnsiChar(Host), PAnsiChar(Service), @Hints, Info);
+  if (Code <> 0) and AUrl.IPv6Literal then
+    // Numeric-only: the literal's shape is what failed (see WS.Url).
+    raise EWSClient.CreateFmt('bad IPv6 literal [%s]: %s',
+      [AUrl.Host, ResolveErrorText(Code)]);
   if Code <> 0 then
     raise EWSClient.CreateFmt('cannot resolve %s: %s',
       [AUrl.Host, ResolveErrorText(Code)]);
 
   Result := WSSocketInvalid;
-  Err := 'no address';
+  Failed := '';
   Deadline := DeadlineAfter(ATimeoutMs);
   try
+    Left := 0;
+    Current := Info;
+    while Current <> nil do
+    begin
+      Inc(Left);
+      Current := Current^.ai_next;
+    end;
     Current := Info;
     while (Current <> nil) and (Result = WSSocketInvalid) do
     begin
+      Attempt := Deadline;
+      if (Deadline <> WSNoDeadline) and (Left > 1) then
+        Attempt := WSMonotonicMs + QWord(RemainingMs(Deadline) div Left);
       Result := ConnectAddress(Current^.ai_family, Current^.ai_addr,
-        Integer(Current^.ai_addrlen), Deadline, Err);
+        Integer(Current^.ai_addrlen), Attempt, Err);
+      // Every attempt's reason, in order: the first one is often the
+      // telling one (an IPv6 timeout ahead of an IPv4 refusal).
+      if Result = WSSocketInvalid then
+        if Failed = '' then Failed := Err else Failed := Failed + '; ' + Err;
+      Dec(Left);
       Current := Current^.ai_next;
     end;
   finally
     C_freeaddrinfo(Info);
   end;
+  if Failed = '' then Failed := 'no address';
   if Result = WSSocketInvalid then
     raise EWSClient.CreateFmt('connect to %s failed: %s',
-      [PeerText(AUrl), Err]);
+      [AUrl.Authority, Failed]);
 end;
 
 { TWSClient }
@@ -920,7 +930,7 @@ begin
     if RawWrite(@Req[1], Length(Req)) <> Length(Req) then
       raise EWSClient.Create('handshake send failed');
 
-    Raw := ReadUpgradeResponse(Deadline, HdrEnd, PeerText(Url));
+    Raw := ReadUpgradeResponse(Deadline, HdrEnd, Url.Authority);
     if not ClientParseResponse(Copy(Raw, 1, HdrEnd), Key, AOfferDeflate,
         FDeflate, Err) then
       raise EWSClient.Create('handshake rejected: ' + Err);

@@ -1,6 +1,6 @@
 { WS.Url.Test — the client's ws:// / wss:// parser (WSParseUrl): RFC 3986
   authority forms (registered names, bracketed IPv6 literals, userinfo
-  dropped, port 1..65535 or empty), the case-insensitive scheme, the
+  dropped but checked, port 1..65535 or empty), the case-insensitive scheme, the
   RFC 6455 §3 resource name (a query without a path gets '/'), the §4.1
   Host value (port only when it is not the scheme's default, IPv6 kept
   bracketed), and rejection tables: fragments (§3), control characters
@@ -30,6 +30,8 @@ type
     procedure TestHostHeaderPort;
     procedure TestIPv6Literals;
     procedure TestUserinfoDropped;
+    procedure TestBadUserinfoRejected;
+    procedure TestAuthority;
     procedure TestResourceName;
     procedure TestPortRange;
     procedure TestFragmentsRejected;
@@ -68,6 +70,7 @@ const
   BadPort = 'bad port in URL';
   MissingHost = 'missing host in URL';
   BadHostChar = 'invalid character in URL host';
+  BadUserinfo = 'invalid character in URL userinfo';
   BadLiteral = 'bad IPv6 literal in URL';
   BadPath = 'control character or space in URL path or query';
   Fragment = 'URL fragments are not allowed (RFC 6455 section 3)';
@@ -136,11 +139,40 @@ begin
   ExpectParsed('ws://u:p@[::1]:9/',
     'ws host=::1 port=9 resource=/ header=[::1]:9 ipv6');
   ExpectParsed('ws://:@h/', 'ws host=h port=80 resource=/ header=h');
-  // The last '@' of the authority ends the userinfo; one after the
-  // authority belongs to the path.
-  ExpectParsed('ws://a@b@h/', 'ws host=h port=80 resource=/ header=h');
+  ExpectParsed('ws://u%40x!$&''()*+,;=-._~:p@h/',
+    'ws host=h port=80 resource=/ header=h');
+  // An '@' after the authority belongs to the path or query.
   ExpectParsed('ws://h/a@b', 'ws host=h port=80 resource=/a@b header=h');
   ExpectParsed('ws://h?a@b', 'ws host=h port=80 resource=/?a@b header=h');
+end;
+
+procedure TUrlForms.TestBadUserinfoRejected;
+const
+  // '\' and ' ' would make a browser-style parser see host 'h', not
+  // 'evil'; '@' is not a userinfo character either.
+  Rejected: array[0..5] of string = (
+    'ws://h\@evil/', 'ws://h @evil/', 'ws://u'#13#10'@h/', 'ws://a@b@h/',
+    'ws://[::1]@h/', 'ws://u/@h/');
+var
+  I: Integer;
+begin
+  for I := 0 to High(Rejected) - 1 do
+    ExpectRejected(Rejected[I], BadUserinfo);
+  // The authority ends at the first '/': 'ws://u/@h/' is host 'u'.
+  ExpectParsed(Rejected[High(Rejected)],
+    'ws host=u port=80 resource=/@h/ header=u');
+end;
+
+procedure TUrlForms.TestAuthority;
+var
+  U: TWSUrl;
+  Err: string;
+begin
+  // Port always, brackets kept: what error messages name.
+  Expect<Boolean>(WSParseUrl('wss://example.com', U, Err)).ToBe(True);
+  Expect<string>(U.Authority).ToBe('example.com:443');
+  Expect<Boolean>(WSParseUrl('ws://u:p@[::1]:9/x', U, Err)).ToBe(True);
+  Expect<string>(U.Authority).ToBe('[::1]:9');
 end;
 
 procedure TUrlForms.TestResourceName;
@@ -211,8 +243,10 @@ procedure TUrlForms.TestBadHostsRejected;
 const
   Missing: array[0..5] of string = (
     'ws://', 'ws:///p', 'ws://:80/', 'ws://user@/', 'ws://?x', 'ws://::1/');
-  BadChars: array[0..4] of string = (
-    'ws://a<b/', 'ws://a]b/', 'ws://a[b/', 'ws://a"b/', 'ws://a\b/');
+  // ASCII only: an internationalized name goes in as its A-label.
+  BadChars: array[0..6] of string = (
+    'ws://a<b/', 'ws://a]b/', 'ws://a[b/', 'ws://a"b/', 'ws://a\b/',
+    'ws://'#$C3#$A9'.example/', 'ws://h'#$80'/');
   BadLiterals: array[0..4] of string = (
     'ws://[]/', 'ws://[v1.x]/', 'ws://[fe80::1%25eth0]/',
     'ws://[127.0.0.1]/', 'ws://[::g]/');
@@ -247,6 +281,8 @@ begin
   Test('Host carries the port only when non-default', TestHostHeaderPort);
   Test('bracketed IPv6 literals',                    TestIPv6Literals);
   Test('userinfo is accepted and dropped',           TestUserinfoDropped);
+  Test('invalid userinfo is rejected',               TestBadUserinfoRejected);
+  Test('Authority names the host and port',          TestAuthority);
   Test('resource name per RFC 6455 section 3',       TestResourceName);
   Test('port range 1..65535, digits only',           TestPortRange);
   Test('fragments are rejected',                     TestFragmentsRejected);

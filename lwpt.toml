@@ -32,19 +32,19 @@ wsinterop = { source = "source/apps/wsinterop.pas", output = "build/wsinterop" }
 wsprobe   = { source = "source/apps/wsprobe.pas",   output = "build/wsprobe" }
 wsautobahn = { source = "source/apps/wsautobahn.pas", output = "build/wsautobahn" }
 
-# Analysis gates. Ceilings sit above the measured 2026-10-03 baseline
-# (lwpt health / lwpt duplication): file cyclomatic 435 and file
-# cognitive 472 (both wsinterop, the E2E battery — it grows with every
+# Analysis gates. Ceilings sit above the measured 2026-10-04 baseline
+# (lwpt health / lwpt duplication): file cyclomatic 452 and file
+# cognitive 481 (both wsinterop, the E2E battery — it grows with every
 # observed bound; the client-robustness section of duetto#44 added 79
-# and 67), routine cyclomatic 58 and routine cognitive 126
+# and 67, the client-URL section of duetto#39 17 and 9), routine cyclomatic 58 and routine cognitive 126
 # (TWSProtocol.Ingest), duplication 0.67%. A file's cyclomatic figure is
 # the sum of its routines, so splitting the battery into section
 # procedures (as it now is) keeps its routines small but cannot lower the
 # file figure; the file ceilings therefore follow the battery. Regression
 # ratchets — CI fails when a change pushes a metric past its ceiling.
 [health]
-max-file-cyclomatic = 450
-max-file-cognitive = 490
+max-file-cyclomatic = 470
+max-file-cognitive = 500
 max-routine-cyclomatic = 70
 max-routine-cognitive = 130
 

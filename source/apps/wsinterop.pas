@@ -2829,8 +2829,7 @@ end;
 // query without a path requests '/?query'; the Host header carries a
 // non-default port; and a bracketed IPv6 literal connects over AF_INET6
 // to a server bound to ::1, with the literal bracketed in Host. The
-// localhost check in the hostname section covers getaddrinfo's AF_UNSPEC
-// list against an IPv4-only server.
+// hostname section's ws://localhost check covers name resolution.
 
 const
   UrlUserinfo = 'alice9:s3cr3t-pw';
@@ -2929,14 +2928,37 @@ begin
     (Host = Format('127.0.0.1:%d', [PeerPort])),
     'client: WS:// with a query and no path requests /?x=1, ' +
     'Host carries the non-default port');
-  Check(Finished and (Request <> '') and (Pos('alice9', Request) = 0) and
+  // Target pins the request read as the one from the userinfo URL.
+  Check(Finished and (Target = '/?x=1') and (Pos('alice9', Request) = 0) and
     (Pos('s3cr3t', Request) = 0) and
     (Pos('Authorization', Request) = 0),
     'client: URL userinfo is accepted and never sent');
 end;
 
+// True when this host can bind ::1 at all: the only condition under which
+// the IPv6 case skips. A server that then fails to bind ::1 is a failure.
+function IPv6LoopbackAvailable(out AReason: string): Boolean;
+var
+  Fd: Tsocket;
+  SA: TInetSockAddr6;
+begin
+  Result := False;
+  Fd := fpSocket(AF_INET6, SOCK_STREAM, 0);
+  if Fd < 0 then
+  begin
+    AReason := 'no AF_INET6 sockets';
+    Exit;
+  end;
+  FillChar(SA, SizeOf(SA), 0);
+  SA.sin6_family := AF_INET6;
+  SA.sin6_addr.u6_addr8[15] := 1; // ::1, port 0
+  Result := fpBind(Fd, @SA, SizeOf(SA)) = 0;
+  if not Result then AReason := 'cannot bind ::1';
+  CloseSocket(Fd);
+end;
+
 // ws://[::1]:port/ against a server bound to ::1. A host without IPv6
-// loopback cannot bind it: the case says so on a skip line and moves on.
+// loopback says so on a skip line and moves on.
 procedure RunClientUrlIPv6Case;
 var
   Recorder: TUpgradeRecorder;
@@ -2949,13 +2971,18 @@ var
   Echoed, IsText: Boolean;
   Data: TBytes;
 begin
+  if not IPv6LoopbackAvailable(Error) then
+  begin
+    WriteLn('skip - client: IPv6 loopback unavailable (', Error,
+      '); ws://[::1] not exercised');
+    Exit;
+  end;
   try
     Server := TWSServer.Create(0, True, 16 * 1024 * 1024, '::1');
   except
     on E: Exception do
     begin
-      WriteLn('skip - client: IPv6 loopback unavailable (', E.Message,
-        '); ws://[::1] not exercised');
+      Check(False, 'client: a server binds ::1 (' + E.Message + ')');
       Exit;
     end;
   end;
@@ -3695,21 +3722,29 @@ end;
 procedure RunHostnameSection;
 begin
   // --- hostname resolution (getaddrinfo, AF_UNSPEC) ------------------------
-  // The client resolves through getaddrinfo on every platform, so
-  // localhost comes from the hosts file before DNS, IPv4 and IPv6 alike.
-  // This server listens on IPv4 only: where localhost also lists ::1, and
-  // lists it first (macOS, Windows, most Linux hosts files), that address
-  // is refused and the next one in the list connects.
+  // The client resolves through getaddrinfo with AF_UNSPEC on every
+  // platform, so localhost comes from the hosts file before DNS (FPC's
+  // DNS-only netdb path failed it on plain glibc resolvers). Where
+  // localhost lists ::1 ahead of an address this server is not
+  // listening on, that address is refused and the next one connects;
+  // whether a host's resolver exercises that fallback depends on its
+  // hosts file, so this check pins resolution, not the fallback.
   StressPhase := 'localhost resolution section';
   Cli := TWSClient.Create;
-  Cli.Connect(Format('ws://localhost:%d/', [Port]));
   S := 'via-hosts-file';
-  Cli.SendText(S);
-  Check(Cli.ReadMessage(IsText, Data) and IsText and
-    (Length(Data) = Length(S)) and CompareMem(@Data[0], @S[1], Length(S)),
-    'ws://localhost echo (getaddrinfo AF_UNSPEC, each address in turn)');
-  Cli.Close(1000, 'done');
+  Ok := False;
+  try
+    Cli.Connect(Format('ws://localhost:%d/', [Port]));
+    Cli.SendText(S);
+    Ok := Cli.ReadMessage(IsText, Data) and IsText and
+      (Length(Data) = Length(S)) and CompareMem(@Data[0], @S[1], Length(S));
+    Cli.Close(1000, 'done');
+  except
+    on E: Exception do
+      WriteLn('       connect: ', E.ClassName, ': ', E.Message);
+  end;
   Cli.Free;
+  Check(Ok, 'ws://localhost echo (getaddrinfo, AF_UNSPEC)');
 end;
 
 procedure RunBoundedReadSection;
