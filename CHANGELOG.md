@@ -26,8 +26,9 @@ All notable changes to duetto are documented in this file. The format follows [K
 ### New Features
 
 - add --bind and passphrase sources outside the command line (#85)
-- pass OnUpgradeRequest a mutable upgrade context (#89)
-- contain handler exceptions behind OnError (#88)
+- **Breaking:** pass OnUpgradeRequest a mutable upgrade context (#89)
+- **Breaking:** contain handler exceptions behind OnError (#88)
+  — a raising OnClientClose no longer propagates out of Run (epoll, IOCP) or terminates the process (Network.framework); it is reported to OnError (reverses #58). Drops inside a Post proc are now deferred until it returns, as inside OnMessage.
 
 ## [0.5.1] - 2026-10-03
 
