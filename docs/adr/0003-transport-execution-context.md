@@ -2,6 +2,7 @@
 
 Date: 2026-07-19
 Status: accepted
+Superseded in part by: [ADR-0005](0005-session-clock-sweeper-and-close-drain-budget.md) (the session layer's lock)
 
 ## Context
 

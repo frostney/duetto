@@ -3,7 +3,17 @@ program wsinterop;
 // Live-socket battery: duetto TWSClient against duetto TWSServer over real
 // TCP (loopback), plus a raw-socket section that injects protocol
 // violations a conforming client cannot produce and asserts the close
-// codes RFC 6455 (and Autobahn cases 4.x/7.x) require, a plain-request
+// codes RFC 6455 (and Autobahn cases 4.x/7.x) require, a client-delivery
+// section (a raw peer playing Autobahn 3.2 at TWSClient: the OnMessage
+// echo must leave ahead of the 1002 close; Close from the handler
+// completes and ReadMessage from it raises), a client-robustness
+// section (SIGPIPE-safe sends into a reset peer, connect / handshake /
+// close timeouts, a TLS handshake failure raising EWSClient, EINTR on a
+// blocking read, reconnects after undrained messages and after a
+// raising OnMessage), a client-URL section (CR/LF in a URL refused
+// before connecting, userinfo never sent, '/?query' for a query without
+// a path, the Host port, ws://[::1] against a server bound to ::1, or a
+// skip line where IPv6 loopback is unavailable), a plain-request
 // section covering the single-port OnPlainRequest fallback, an
 // upgrade-hook section (a server bound to 127.0.0.1 explicitly whose
 // OnUpgradeRequest vetoes one Origin with a 403, treats a raising hook
@@ -359,9 +369,13 @@ end;
 { TLimitsHost }
 
 const
+  // The limits section's close-budget case runs where the peer sees the
+  // drop through the server's RST: epoll (Linux) and IOCP (Windows).
+  LimitsCloseBudgetCase = {$if defined(LINUX) or defined(WINDOWS)}True
+    {$else}False{$endif};
   // Sessions the limits section opens; each must see one OnClientClose.
-  // Linux adds the close-budget case that needs a closed socket's RST.
-  LimitsOpens = {$ifdef LINUX}9{$else}8{$endif};
+  // The keepalive section adds one on every platform (#80).
+  LimitsOpens = 8 + Ord(LimitsCloseBudgetCase);
 
 const
   CloseCue = 'close-me';
@@ -884,9 +898,8 @@ begin
   end;
 end;
 
-// Bound a blocking send: a flood into a server that has stopped reading
-// must return to the battery rather than sit on a full send buffer.
-procedure RawSetSendTimeout(AFd: Tsocket; AMs: Integer);
+// SO_SNDTIMEO or SO_RCVTIMEO (AOption) of AMs milliseconds.
+procedure RawSetTimeout(AFd: Tsocket; AOption, AMs: Integer);
 var
   {$ifdef WINDOWS}
   TimeoutMs: Cardinal;
@@ -896,11 +909,18 @@ var
 begin
   {$ifdef WINDOWS}
   TimeoutMs := AMs;
-  fpSetSockOpt(AFd, SOL_SOCKET, SO_SNDTIMEO, @TimeoutMs, SizeOf(TimeoutMs));
+  fpSetSockOpt(AFd, SOL_SOCKET, AOption, @TimeoutMs, SizeOf(TimeoutMs));
   {$else}
   TV.Seconds := AMs div 1000; TV.Microseconds := (AMs mod 1000) * 1000;
-  fpSetSockOpt(AFd, SOL_SOCKET, SO_SNDTIMEO, @TV, SizeOf(TV));
+  fpSetSockOpt(AFd, SOL_SOCKET, AOption, @TV, SizeOf(TV));
   {$endif}
+end;
+
+// Bound a blocking send: a flood into a server that has stopped reading
+// must return to the battery rather than sit on a full send buffer.
+procedure RawSetSendTimeout(AFd: Tsocket; AMs: Integer);
+begin
+  RawSetTimeout(AFd, SO_SNDTIMEO, AMs);
 end;
 
 // Wait for the server to hang up on a raw (non-TLS) socket. Returns the
@@ -1962,6 +1982,1281 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Client delivery ahead of a failing frame (duetto#72)
+// ---------------------------------------------------------------------------
+
+const
+  FailingPeerMessage: RawByteString = 'Hello, world!';
+  // Long enough for the client to be past its 101 read when the frames
+  // land, so they reach it through the pump rather than the handshake
+  // read. Either way the section asserts the same order.
+  FailingPeerUpgradeGapMs = 200;
+
+type
+  // A one-shot raw server that plays Autobahn case 3.2 at TWSClient: it
+  // answers the upgrade, then writes a valid text message, an RSV2 frame
+  // and a ping in a single send — glued to the 101 when Pipelined — and
+  // records every byte the client sends until the client hangs up.
+  TFailingPeer = class(TThread)
+  public
+    Listener: Tsocket;
+    Pipelined: Boolean;
+    Received: RawByteString;
+    Failure: string;
+    procedure Execute; override;
+  end;
+
+  // TWSClient.OnMessage that counts and echoes — or, when told to, closes
+  // or tries to read from inside the handler instead.
+  TClientEcho = class
+  public
+    Calls: Integer;
+    CloseInside, ReadInside: Boolean;
+    procedure Echo(AClient: TWSClient; AText: Boolean; P: PByte;
+      Len: NativeInt);
+  end;
+
+procedure TClientEcho.Echo(AClient: TWSClient; AText: Boolean; P: PByte;
+  Len: NativeInt);
+var
+  S: RawByteString;
+  IsText: Boolean;
+  Data: TBytes;
+begin
+  Inc(Calls);
+  if ReadInside then
+    // Must raise: the read is in progress. The bounded form with nothing
+    // queued or readable is the case that would otherwise return quietly.
+    AClient.ReadMessage(IsText, Data, 0)
+  else if CloseInside then
+    AClient.Close(1000, 'handler done')
+  else
+  begin
+    SetLength(S, Len);
+    if Len > 0 then Move(P^, S[1], Len);
+    AClient.SendText(S);
+  end;
+end;
+
+procedure TFailingPeer.Execute;
+var
+  Fd: Tsocket;
+  Raw, Frames, Bad: RawByteString;
+  HS: TWSServerHandshake;
+  Buf: array[0..4095] of Byte;
+  Got: Integer;
+  Eof: Boolean;
+begin
+  Fd := fpAccept(Listener, nil, nil);
+  if Fd < 0 then
+  begin
+    Failure := 'accept failed';
+    Exit;
+  end;
+  try
+    Raw := '';
+    repeat
+      Got := fpRecv(Fd, @Buf[0], SizeOf(Buf), 0);
+      if Got <= 0 then
+      begin
+        Failure := 'upgrade request lost';
+        Exit;
+      end;
+      SetLength(Raw, Length(Raw) + Got);
+      Move(Buf[0], Raw[Length(Raw) - Got + 1], Got);
+    until HandshakeFindEnd(Raw) > 0;
+    if not ServerParseRequest(Raw, False, HS) then
+    begin
+      Failure := 'upgrade request rejected: ' + HS.Failure;
+      Exit;
+    end;
+
+    Bad := BuildFrameBytes(WS_OP_TEXT, FailingPeerMessage, False);
+    Bad[1] := AnsiChar(Ord(Bad[1]) or $20); // RSV2: nothing negotiated it
+    Frames := BuildFrameBytes(WS_OP_TEXT, FailingPeerMessage, False) + Bad +
+      BuildFrameBytes(WS_OP_PING, FailingPeerMessage, False);
+    Raw := ServerBuildResponse(HS);
+    if Pipelined then
+      Raw := Raw + Frames
+    else
+    begin
+      fpSend(Fd, @Raw[1], Length(Raw), 0);
+      Sleep(FailingPeerUpgradeGapMs);
+      Raw := Frames;
+    end;
+    fpSend(Fd, @Raw[1], Length(Raw), 0);
+
+    // Everything the client answers, up to its hang-up.
+    Received := RawReadToEof(Fd, Eof);
+  finally
+    CloseSocket(Fd);
+  end;
+end;
+
+// Split what a client sent into frames: opcode and unmasked payload each.
+// False on a frame that is malformed, unmasked or cut short.
+function SplitClientFrames(const ARaw: RawByteString;
+  out AOpcodes: TBytes; out APayloads: array of RawByteString;
+  out ACount: Integer): Boolean;
+var
+  Off: NativeInt;
+  H: TWSFrameHeader;
+  Body: RawByteString;
+begin
+  ACount := 0;
+  SetLength(AOpcodes, 0);
+  Off := 0;
+  while Off < Length(ARaw) do
+  begin
+    if (ACount > High(APayloads)) or
+       (ParseFrameHeader(@ARaw[Off + 1], Length(ARaw) - Off, H) <> wprOK) or
+       (not H.Masked) or
+       (Off + H.HeaderLen + NativeInt(H.PayloadLen) > Length(ARaw)) then
+      Exit(False);
+    Body := Copy(ARaw, Off + H.HeaderLen + 1, H.PayloadLen);
+    if Body <> '' then
+      ApplyMask(@Body[1], Length(Body), H.MaskKey, 0);
+    SetLength(AOpcodes, ACount + 1);
+    AOpcodes[ACount] := H.Opcode;
+    APayloads[ACount] := Body;
+    Inc(ACount);
+    Inc(Off, H.HeaderLen + NativeInt(H.PayloadLen));
+  end;
+  Result := True;
+end;
+
+// A listening socket on 127.0.0.1 at a kernel-assigned port; -1 when
+// any step fails (the socket is then already closed).
+function OpenLoopbackListener(out APort: Word): Tsocket;
+var
+  SA: TInetSockAddr;
+  Len: LongInt; // socklen_t on POSIX, int on WinSock: 32 bits on both
+begin
+  Result := fpSocket(AF_INET, SOCK_STREAM, 0);
+  if Result < 0 then Exit(-1);
+  FillChar(SA, SizeOf(SA), 0);
+  SA.sin_family := AF_INET;
+  SA.sin_addr.s_addr := htonl($7F000001);
+  Len := SizeOf(SA);
+  if (fpBind(Result, @SA, SizeOf(SA)) <> 0) or (fpListen(Result, 1) <> 0) or
+     (fpGetSockName(Result, @SA, @Len) <> 0) then
+  begin
+    CloseSocket(Result);
+    Exit(-1);
+  end;
+  APort := ntohs(SA.sin_port);
+end;
+
+// One TWSClient with OnMessage against one TFailingPeer. The client must
+// echo the valid message ahead of the 1002 close the RSV2 frame provokes,
+// and answer nothing after it (no pong for the trailing ping).
+procedure RunFailingPeerCase(APipelined: Boolean; const ALabel: string);
+var
+  Listener: Tsocket;
+  PeerPort: Word;
+  Peer: TFailingPeer;
+  Handler: TClientEcho;
+  Client: TWSClient;
+  IsText: Boolean;
+  Data: TBytes;
+  Opcodes: TBytes;
+  Payloads: array[0..3] of RawByteString;
+  Count: Integer;
+  Split: Boolean;
+  ClientError: string;
+begin
+  Listener := OpenLoopbackListener(PeerPort);
+  if Listener < 0 then
+  begin
+    Check(False, ALabel + ' (no loopback listener)');
+    Exit;
+  end;
+  Peer := TFailingPeer.Create(True);
+  Peer.Listener := Listener;
+  Peer.Pipelined := APipelined;
+  Peer.Start;
+  Handler := TClientEcho.Create;
+  ClientError := '';
+  Client := TWSClient.Create;
+  try
+    try
+      Client.OnMessage := Handler.Echo;
+      Client.Connect(Format('ws://127.0.0.1:%d/', [PeerPort]));
+      // With the handler set ReadMessage only pumps, until the failure.
+      while Client.ReadMessage(IsText, Data) do ;
+      Client.Close; // releases the socket: the peer sees its hang-up
+    except
+      on E: Exception do
+        ClientError := E.ClassName + ': ' + E.Message;
+    end;
+  finally
+    Client.Free;
+  end;
+  if ClientError <> '' then
+  begin
+    // The check below fails on it. A client that died before the peer
+    // accepted would leave the peer in accept: a throwaway connection
+    // releases it (it then fails on the empty request).
+    WriteLn('       client: ', ClientError);
+    try
+      CloseSocket(RawConnectEx(PeerPort, False));
+    except
+      // the peer accepted earlier; nothing to release
+    end;
+  end;
+  Peer.WaitFor;
+  CloseSocket(Listener);
+
+  Split := SplitClientFrames(Peer.Received, Opcodes, Payloads, Count);
+  if Peer.Failure <> '' then
+    WriteLn('       peer: ', Peer.Failure);
+  Check((ClientError = '') and (Peer.Failure = '') and Split and (Count = 2) and
+    (Handler.Calls = 1) and
+    (Opcodes[0] = WS_OP_TEXT) and (Payloads[0] = FailingPeerMessage) and
+    (Opcodes[1] = WS_OP_CLOSE) and (Length(Payloads[1]) >= 2) and
+    (((Ord(Payloads[1][1]) shl 8) or Ord(Payloads[1][2])) = 1002),
+    ALabel);
+  Peer.Free;
+  Handler.Free;
+end;
+
+// What the handler may do besides sending, against the echo server at
+// AUrl: Close sends the close frame and the pumping ReadMessage sees the
+// handshake through; ReadMessage (here the bounded form) raises and ends
+// the connection.
+procedure RunClientHandlerCalls(const AUrl: string);
+var
+  Handler: TClientEcho;
+  Client: TWSClient;
+  IsText, Raised: Boolean;
+  Data: TBytes;
+begin
+  Handler := TClientEcho.Create;
+  Client := TWSClient.Create;
+  try
+    Handler.CloseInside := True;
+    Client.OnMessage := Handler.Echo;
+    Client.Connect(AUrl);
+    Client.SendText('close from the handler');
+    while Client.ReadMessage(IsText, Data) do ;
+    Check((Handler.Calls = 1) and (not Client.Open) and
+      (Client.CloseCode = 1000),
+      'client Close inside OnMessage completes through the pumping read');
+  finally
+    Client.Free;
+  end;
+
+  Handler.Calls := 0;
+  Handler.CloseInside := False;
+  Handler.ReadInside := True;
+  Client := TWSClient.Create;
+  try
+    Client.OnMessage := Handler.Echo;
+    Client.Connect(AUrl);
+    Client.SendText('read from the handler');
+    Raised := False;
+    try
+      // Bounded, so a handler that returned quietly fails the check
+      // below instead of parking the battery on the idle connection.
+      Client.ReadMessage(IsText, Data, 2000);
+    except
+      on EWSClient do Raised := True;
+    end;
+    Check(Raised and (Handler.Calls = 1) and (not Client.Open),
+      'client ReadMessage inside OnMessage raises and ends the connection');
+  finally
+    Client.Free;
+    Handler.Free;
+  end;
+end;
+
+procedure RunClientDeliverySection(const AUrl: string;
+  var AStressPhase: ShortString);
+begin
+  // --- client OnMessage ahead of a failing frame (Autobahn 3.2) ----------
+  AStressPhase := 'client delivery before a failing frame';
+  RunFailingPeerCase(False,
+    'client OnMessage echo leaves before the RSV2 close 1002');
+  RunFailingPeerCase(True,
+    'client OnMessage echo of a message pipelined behind the 101 ' +
+    'leaves before the RSV2 close 1002');
+  RunClientHandlerCalls(AUrl);
+end;
+
+// ---------------------------------------------------------------------------
+// Client robustness section (duetto#44)
+// ---------------------------------------------------------------------------
+// TWSClient against local peers that misbehave on purpose: one that hangs
+// up and resets while the client sends (with SIGPIPE back at its default
+// action, so a missing MSG_NOSIGNAL / SO_NOSIGPIPE kills the battery), a
+// listener whose accept backlog is full (connect timeout), one that
+// accepts and stays silent (handshake timeout), one that never echoes
+// the close (Close timeout), a plaintext peer behind wss:// (Connect
+// raises EWSClient), a signal landing in a blocking read (EINTR), and
+// reconnects that must not inherit the previous connection's queue or
+// socket. The mid-stream TLS failures live in the wss section, which has
+// the TLS server they need.
+
+const
+  RobustTimeoutMs = 400;
+  // Upper slack on every timeout check, for a loaded CI box. The lower
+  // bound is what proves the timeout, not an early failure, ended the
+  // call.
+  RobustSlackMs = 2500;
+  RobustPeerMessage: RawByteString = 'from the first peer';
+  RobustDelayMs = 300;
+  // Clients that may be needed to fill a listener's accept queue: Linux
+  // holds backlog + 1 there, macOS about one and a half times it.
+  RobustBacklogFillers = 16;
+  RobustSendAttempts = 64;
+  RobustPeerEndMs = 2000;
+  RobustPeerReadMs = 5000;
+
+type
+  // A one-shot raw peer. It accepts one connection and, except in
+  // rpmHangUpAtOnce, answers the upgrade; then rpmHangUp closes,
+  // rpmSilent says nothing more, rpmMessage sends one text message after
+  // DelayMs (and, with Gate set, once Gate^ > 0), rpmAnswerClose sends
+  // one when the client's close frame arrives instead of echoing it.
+  // Every mode but the hang-ups then reads until the client goes away,
+  // so Finished says the client released its socket.
+  TRobustPeerMode = (rpmHangUpAtOnce, rpmHangUp, rpmSilent, rpmMessage,
+    rpmAnswerClose);
+
+  TRobustPeer = class(TThread)
+  public
+    Listener: Tsocket;
+    Mode: TRobustPeerMode;
+    DelayMs: Integer;
+    Gate: PLongInt;
+    Failure: string;
+    // The upgrade request as read, and its parsed Host and target.
+    Request: RawByteString;
+    RequestHost, RequestTarget: string;
+    procedure Execute; override;
+  end;
+
+  EInteropHandlerRaise = class(Exception);
+
+  TRaisingHandler = class
+  public
+    procedure Fail(AClient: TWSClient; AText: Boolean; P: PByte;
+      Len: NativeInt);
+  end;
+
+procedure TRaisingHandler.Fail(AClient: TWSClient; AText: Boolean;
+  P: PByte; Len: NativeInt);
+begin
+  raise EInteropHandlerRaise.Create('handler raised on purpose');
+end;
+
+procedure TRobustPeer.Execute;
+var
+  Fd: Tsocket;
+  Raw: RawByteString;
+  HS: TWSServerHandshake;
+  Buf: array[0..4095] of Byte;
+  Got: Integer;
+  Eof: Boolean;
+begin
+  Fd := fpAccept(Listener, nil, nil);
+  if Fd < 0 then
+  begin
+    Failure := 'accept failed';
+    Exit;
+  end;
+  // Bounded reads: a client that leaks its socket fails a check instead
+  // of parking this thread, and the battery, for good.
+  RawSetTimeout(Fd, SO_RCVTIMEO, RobustPeerReadMs);
+  try
+    if Mode = rpmHangUpAtOnce then Exit;
+    Raw := '';
+    repeat
+      Got := fpRecv(Fd, @Buf[0], SizeOf(Buf), 0);
+      if Got <= 0 then
+      begin
+        Failure := 'upgrade request lost';
+        Exit;
+      end;
+      SetLength(Raw, Length(Raw) + Got);
+      Move(Buf[0], Raw[Length(Raw) - Got + 1], Got);
+    until HandshakeFindEnd(Raw) > 0;
+    Request := Raw;
+    if not ServerParseRequest(Raw, False, HS) then
+    begin
+      Failure := 'upgrade request rejected: ' + HS.Failure;
+      Exit;
+    end;
+    RequestHost := HS.Host;
+    RequestTarget := HS.Path;
+    Raw := ServerBuildResponse(HS);
+    fpSend(Fd, @Raw[1], Length(Raw), 0);
+    if Mode = rpmHangUp then Exit;
+    if Mode = rpmMessage then
+    begin
+      Sleep(DelayMs);
+      Got := 0;
+      while (Gate <> nil) and (Gate^ = 0) and (Got < RobustPeerReadMs) do
+      begin
+        Sleep(10);
+        Inc(Got, 10);
+      end;
+      RawSendFrame(Fd, WS_OP_TEXT, RobustPeerMessage, False);
+    end;
+    if (Mode = rpmAnswerClose) and
+       (fpRecv(Fd, @Buf[0], SizeOf(Buf), 0) > 0) then
+      RawSendFrame(Fd, WS_OP_TEXT, RobustPeerMessage, False);
+    RawReadToEof(Fd, Eof);
+  finally
+    CloseSocket(Fd);
+  end;
+end;
+
+function AsText(const AData: TBytes): RawByteString;
+begin
+  SetLength(Result, Length(AData));
+  if Length(AData) > 0 then Move(AData[0], Result[1], Length(AData));
+end;
+
+// Polls rather than WaitFor, which may only run once per thread.
+function WaitFinished(AThread: TThread; ABoundMs: Integer): Boolean;
+var
+  Deadline: QWord;
+begin
+  Deadline := GetTickCount64 + QWord(ABoundMs);
+  while not AThread.Finished and (GetTickCount64 < Deadline) do
+    Sleep(10);
+  Result := AThread.Finished;
+end;
+
+function StartRobustPeer(AMode: TRobustPeerMode; out AListener: Tsocket;
+  out APort: Word): TRobustPeer;
+begin
+  AListener := OpenLoopbackListener(APort);
+  if AListener < 0 then
+    raise Exception.Create('no loopback listener');
+  Result := TRobustPeer.Create(True);
+  Result.Listener := AListener;
+  Result.Mode := AMode;
+  Result.DelayMs := RobustDelayMs;
+  Result.Start;
+end;
+
+// True when APeer ended within ABoundMs. Either way it is waited for and
+// freed with its listener: a client that never reached it leaves it in
+// accept, and a throwaway connection releases it.
+function FinishRobustPeer(APeer: TRobustPeer; AListener: Tsocket;
+  APort: Word; ABoundMs: Integer): Boolean;
+begin
+  Result := WaitFinished(APeer, ABoundMs);
+  if not Result then
+  try
+    CloseSocket(RawConnectEx(APort, False));
+  except
+    // the peer accepted earlier; the client going away releases it
+  end;
+  APeer.WaitFor;
+  if APeer.Failure <> '' then
+    WriteLn('       peer: ', APeer.Failure);
+  APeer.Free;
+  CloseSocket(AListener);
+end;
+
+// Connect, timed. AError is '' on success, else the exception, class
+// included, so a check can tell EWSClient from anything else escaping.
+function TimedConnect(AClient: TWSClient; const AUrl: string;
+  out AError: string): Integer;
+var
+  Start: QWord;
+begin
+  AError := '';
+  Start := GetTickCount64;
+  try
+    AClient.Connect(AUrl);
+  except
+    on E: Exception do AError := E.ClassName + ': ' + E.Message;
+  end;
+  Result := Integer(GetTickCount64 - Start);
+end;
+
+function WithinTimeout(AElapsedMs, ATimeoutMs: Integer): Boolean;
+begin
+  // A few ms of clock granularity below the bound, slack above.
+  Result := (AElapsedMs >= ATimeoutMs - 20) and
+    (AElapsedMs <= ATimeoutMs + RobustSlackMs);
+end;
+
+// A peer that hangs up, then resets on the client's next bytes: the send
+// after that one fails with EPIPE, and without MSG_NOSIGNAL (Linux) or
+// SO_NOSIGPIPE (Darwin) the kernel raises SIGPIPE. The battery ignores
+// SIGPIPE process-wide, so the check restores the default action around
+// itself: a regression kills the battery instead of passing quietly.
+procedure RunClientResetSendCase;
+var
+  Peer: TRobustPeer;
+  Listener: Tsocket;
+  PeerPort: Word;
+  Client: TWSClient;
+  Error, Escaped: string;
+  Sends: Integer;
+  IsText: Boolean;
+  Data: TBytes;
+begin
+  Peer := StartRobustPeer(rpmHangUp, Listener, PeerPort);
+  Client := TWSClient.Create;
+  Escaped := '';
+  Sends := 0;
+  {$ifdef UNIX}
+  fpSignal(SIGPIPE, SignalHandler(SIG_DFL));
+  {$endif}
+  try
+    TimedConnect(Client, Format('ws://127.0.0.1:%d/', [PeerPort]), Error);
+    // Hung up: the client's first bytes draw the reset.
+    WaitFinished(Peer, RobustPeerEndMs);
+    try
+      while (Error = '') and Client.Open and (Sends < RobustSendAttempts) do
+      begin
+        Client.SendText('into a peer that hung up');
+        Inc(Sends);
+        Sleep(10); // let the reset land before the next send
+      end;
+    except
+      on E: Exception do Escaped := E.ClassName + ': ' + E.Message;
+    end;
+  finally
+    {$ifdef UNIX}
+    fpSignal(SIGPIPE, SignalHandler(SIG_IGN));
+    {$endif}
+  end;
+  if Error <> '' then WriteLn('       connect: ', Error);
+  if Escaped <> '' then WriteLn('       send: ', Escaped);
+  Check((Error = '') and (Escaped = '') and (Sends >= 1) and
+    (not Client.Open) and (not Client.ReadMessage(IsText, Data)),
+    'client: sends into a peer that hung up and reset end the connection ' +
+    'without raising, and SIGPIPE at its default action leaves the ' +
+    'process alive');
+  Client.Free;
+  FinishRobustPeer(Peer, Listener, PeerPort, 0);
+end;
+
+// A listener that never accepts: once its accept queue is full the
+// kernel drops further SYNs (Linux and macOS alike), so a connect hangs
+// until the client gives up. Clients that time out in the handshake
+// instead are the fillers: their connections stay queued.
+procedure RunClientConnectTimeoutCase;
+var
+  Listener: Tsocket;
+  ListenPort: Word;
+  Filler, Client: TWSClient;
+  Url, Error: string;
+  I, Elapsed: Integer;
+  Full: Boolean;
+begin
+  Listener := OpenLoopbackListener(ListenPort);
+  if Listener < 0 then
+  begin
+    Check(False, 'client: connect timeout (no loopback listener)');
+    Exit;
+  end;
+  Url := Format('ws://127.0.0.1:%d/', [ListenPort]);
+  Full := False;
+  for I := 1 to RobustBacklogFillers do
+  begin
+    Filler := TWSClient.Create;
+    try
+      Filler.ConnectTimeoutMs := RobustTimeoutMs;
+      Filler.HandshakeTimeoutMs := 1;
+      TimedConnect(Filler, Url, Error);
+    finally
+      Filler.Free;
+    end;
+    Full := Pos('connect to', Error) > 0;
+    if Full then Break;
+  end;
+  Client := TWSClient.Create;
+  try
+    Client.ConnectTimeoutMs := RobustTimeoutMs;
+    Elapsed := TimedConnect(Client, Url, Error);
+  finally
+    Client.Free;
+  end;
+  CloseSocket(Listener);
+  WriteLn('       connect: ', Error, ' (', Elapsed, ' ms)');
+  Check(Full and (Pos('EWSClient', Error) = 1) and
+    (Pos('timed out', Error) > 0) and (Pos('connect to', Error) > 0) and
+    WithinTimeout(Elapsed, RobustTimeoutMs),
+    Format('client: ConnectTimeoutMs %d bounds a connect to a listener ' +
+    'whose backlog is full', [RobustTimeoutMs]));
+end;
+
+// TCP completes from the listener's backlog; nobody ever answers.
+procedure RunClientHandshakeTimeoutCase;
+var
+  Listener: Tsocket;
+  ListenPort: Word;
+  Client: TWSClient;
+  Error: string;
+  Elapsed: Integer;
+begin
+  Listener := OpenLoopbackListener(ListenPort);
+  if Listener < 0 then
+  begin
+    Check(False, 'client: handshake timeout (no loopback listener)');
+    Exit;
+  end;
+  Client := TWSClient.Create;
+  try
+    Client.HandshakeTimeoutMs := RobustTimeoutMs;
+    Elapsed := TimedConnect(Client,
+      Format('ws://127.0.0.1:%d/', [ListenPort]), Error);
+  finally
+    Client.Free;
+  end;
+  CloseSocket(Listener);
+  WriteLn('       connect: ', Error, ' (', Elapsed, ' ms)');
+  Check((Pos('EWSClient', Error) = 1) and (Pos('timed out', Error) > 0) and
+    WithinTimeout(Elapsed, RobustTimeoutMs),
+    Format('client: HandshakeTimeoutMs %d bounds the wait for a 101 from a ' +
+    'silent listener', [RobustTimeoutMs]));
+end;
+
+// lwpt's TLS handshake fails against a peer that hangs up instead of
+// answering the ClientHello; Connect must raise EWSClient, not lwpt's
+// ETransportSecurityError, and leave nothing open.
+procedure RunClientTlsHandshakeFailureCase;
+var
+  Peer: TRobustPeer;
+  Listener: Tsocket;
+  PeerPort: Word;
+  Client: TWSClient;
+  Error: string;
+begin
+  Peer := StartRobustPeer(rpmHangUpAtOnce, Listener, PeerPort);
+  Client := TWSClient.Create;
+  try
+    TimedConnect(Client, Format('wss://127.0.0.1:%d/', [PeerPort]), Error);
+    WriteLn('       connect: ', Error);
+    Check((Pos('EWSClient', Error) = 1) and (Pos('TLS', Error) > 0) and
+      (not Client.Open),
+      'client: a TLS handshake failure raises EWSClient out of Connect');
+  finally
+    Client.Free;
+  end;
+  FinishRobustPeer(Peer, Listener, PeerPort, 0);
+end;
+
+// The peer takes the close frame and never answers it.
+procedure RunClientCloseTimeoutCase;
+var
+  Peer: TRobustPeer;
+  Listener: Tsocket;
+  PeerPort: Word;
+  Client: TWSClient;
+  Error, Escaped: string;
+  Start: QWord;
+  Elapsed: Integer;
+  Released: Boolean;
+begin
+  Peer := StartRobustPeer(rpmSilent, Listener, PeerPort);
+  Client := TWSClient.Create;
+  Escaped := '';
+  try
+    Client.CloseTimeoutMs := RobustTimeoutMs;
+    TimedConnect(Client, Format('ws://127.0.0.1:%d/', [PeerPort]), Error);
+    Start := GetTickCount64;
+    try
+      Client.Close;
+    except
+      on E: Exception do Escaped := E.ClassName + ': ' + E.Message;
+    end;
+    Elapsed := Integer(GetTickCount64 - Start);
+    Released := FinishRobustPeer(Peer, Listener, PeerPort, RobustPeerEndMs);
+    WriteLn('       close: ', Elapsed, ' ms ', Error, Escaped);
+    Check((Error = '') and (Escaped = '') and (not Client.Open) and
+      WithinTimeout(Elapsed, RobustTimeoutMs) and Released,
+      Format('client: CloseTimeoutMs %d bounds Close against a peer that ' +
+      'never echoes, and the socket is released', [RobustTimeoutMs]));
+  finally
+    Client.Free;
+  end;
+end;
+
+// OnMessage raising while Close waits for the echo: the exception comes
+// out of Close, but only after the socket has been released.
+procedure RunClientCloseRaiseCase;
+var
+  Peer: TRobustPeer;
+  Listener: Tsocket;
+  PeerPort: Word;
+  Handler: TRaisingHandler;
+  Client: TWSClient;
+  Error: string;
+  Raised, Released: Boolean;
+begin
+  Peer := StartRobustPeer(rpmAnswerClose, Listener, PeerPort);
+  Handler := TRaisingHandler.Create;
+  Client := TWSClient.Create;
+  Raised := False;
+  try
+    Client.OnMessage := Handler.Fail;
+    TimedConnect(Client, Format('ws://127.0.0.1:%d/', [PeerPort]), Error);
+    try
+      Client.Close;
+    except
+      on EInteropHandlerRaise do Raised := True;
+    end;
+    Released := FinishRobustPeer(Peer, Listener, PeerPort, RobustPeerEndMs);
+    if Error <> '' then WriteLn('       connect: ', Error);
+    Check((Error = '') and Raised and Released and (not Client.Open),
+      'client: OnMessage raising during Close propagates only after the ' +
+      'socket is released');
+  finally
+    Client.Free;
+    Handler.Free;
+  end;
+end;
+
+// Echoes queued during Close stay readable after it, and the next
+// Connect drops whatever is still undrained: the first read on the new
+// connection is the new peer's.
+procedure RunClientReconnectQueueCase(const AUrl: string);
+var
+  Client: TWSClient;
+  IsText, Kept: Boolean;
+  Data: TBytes;
+begin
+  Client := TWSClient.Create;
+  try
+    try
+      Client.Connect(AUrl);
+      Client.SendText('stale one');
+      Client.SendText('stale two');
+      Client.SendText('stale three');
+      Client.Close; // the echoes queue while Close waits for its own
+      Kept := Client.ReadMessage(IsText, Data) and
+        (AsText(Data) = 'stale one');
+      Client.Connect(AUrl);
+      Client.SendText('fresh');
+      Check(Kept and Client.ReadMessage(IsText, Data) and
+        (AsText(Data) = 'fresh'),
+        'client: messages queued before Close stay readable, and a ' +
+        'reconnect drops the rest: the first read is the new peer''s');
+      Client.Close;
+    except
+      on E: Exception do
+        Check(False, 'client: reconnect queue case raised ' +
+          E.ClassName + ': ' + E.Message);
+    end;
+  finally
+    Client.Free;
+  end;
+end;
+
+// A raising OnMessage ends the connection inside ReadMessage and leaves
+// its socket for the next Connect to release: the old peer must see the
+// client go away, and the new connection must work.
+procedure RunClientReconnectAfterRaiseCase(const AUrl: string);
+var
+  Peer: TRobustPeer;
+  Listener: Tsocket;
+  PeerPort: Word;
+  Handler: TRaisingHandler;
+  Client: TWSClient;
+  IsText, Raised, Released, Echoed: Boolean;
+  Data: TBytes;
+  Error: string;
+begin
+  Peer := StartRobustPeer(rpmMessage, Listener, PeerPort);
+  Handler := TRaisingHandler.Create;
+  Client := TWSClient.Create;
+  Raised := False;
+  Echoed := False;
+  try
+    Client.OnMessage := Handler.Fail;
+    // The message trails the 101, so the raise comes out of ReadMessage.
+    TimedConnect(Client, Format('ws://127.0.0.1:%d/', [PeerPort]), Error);
+    try
+      Client.ReadMessage(IsText, Data, RobustDelayMs + RobustSlackMs);
+    except
+      on EInteropHandlerRaise do Raised := True;
+    end;
+    Client.OnMessage := nil;
+    TimedConnect(Client, AUrl, Error);
+    Released := FinishRobustPeer(Peer, Listener, PeerPort, RobustPeerEndMs);
+    if Error = '' then
+    begin
+      Client.SendText('after the raise');
+      Echoed := Client.ReadMessage(IsText, Data) and
+        (AsText(Data) = 'after the raise');
+      Client.Close;
+    end
+    else
+      WriteLn('       reconnect: ', Error);
+    Check(Raised and Released and Echoed,
+      'client: a reconnect after a raising OnMessage releases the old ' +
+      'socket and works');
+  finally
+    Client.Free;
+    Handler.Free;
+  end;
+end;
+
+{$ifdef UNIX}
+function C_pthread_kill(AThread: TThreadID; ASignal: cint): cint; cdecl;
+  external 'c' name 'pthread_kill';
+
+var
+  RobustSignals: LongInt = 0;
+
+procedure RobustSignalHandler(ASignal: cint); cdecl;
+begin
+  InterlockedIncrement(RobustSignals);
+end;
+
+type
+  // Signals the battery's main thread a few times while it blocks in a
+  // read. The handler is installed without SA_RESTART, so each one fails
+  // the blocking recv with EINTR instead of resuming it.
+  TRobustSignaller = class(TThread)
+  public
+    Target: TThreadID;
+    procedure Execute; override;
+  end;
+
+procedure TRobustSignaller.Execute;
+var
+  I: Integer;
+begin
+  for I := 1 to 4 do
+  begin
+    Sleep(RobustDelayMs div 6);
+    C_pthread_kill(Target, SIGUSR1);
+  end;
+end;
+
+procedure RunClientInterruptedReadCase;
+var
+  Peer: TRobustPeer;
+  Listener: Tsocket;
+  PeerPort: Word;
+  Signaller: TRobustSignaller;
+  Client: TWSClient;
+  Action, Prior: SigActionRec;
+  IsText, Got: Boolean;
+  Data: TBytes;
+  Error: string;
+begin
+  FillChar(Action, SizeOf(Action), 0);
+  Action.sa_handler := SigActionHandler(@RobustSignalHandler);
+  Action.sa_flags := 0; // no SA_RESTART: the read sees EINTR
+  fpSigAction(SIGUSR1, @Action, @Prior);
+  RobustSignals := 0;
+  Got := False;
+  Peer := StartRobustPeer(rpmMessage, Listener, PeerPort);
+  // The message waits for a delivered signal, so the read it ends is
+  // one a signal has already interrupted.
+  Peer.Gate := @RobustSignals;
+  Client := TWSClient.Create;
+  try
+    TimedConnect(Client, Format('ws://127.0.0.1:%d/', [PeerPort]), Error);
+    if Error = '' then
+    begin
+      Signaller := TRobustSignaller.Create(True);
+      Signaller.Target := GetCurrentThreadId;
+      Signaller.Start;
+      // Unbounded: a blocking recv, which the signals interrupt before
+      // the peer's message arrives.
+      Got := Client.ReadMessage(IsText, Data) and
+        (AsText(Data) = RobustPeerMessage);
+      Signaller.WaitFor;
+      Signaller.Free;
+    end
+    else
+      WriteLn('       connect: ', Error);
+  finally
+    Client.Free;
+    fpSigAction(SIGUSR1, @Prior, nil);
+  end;
+  FinishRobustPeer(Peer, Listener, PeerPort, 0);
+  Check(Got and (RobustSignals > 0),
+    Format('client: a blocking read interrupted by %d signals (EINTR) ' +
+    'resumes and delivers the message', [RobustSignals]));
+end;
+{$endif}
+
+procedure RunClientRobustnessSection(const AUrl: string;
+  var AStressPhase: ShortString);
+begin
+  AStressPhase := 'client robustness';
+  RunClientResetSendCase;
+  RunClientConnectTimeoutCase;
+  RunClientHandshakeTimeoutCase;
+  RunClientTlsHandshakeFailureCase;
+  RunClientCloseTimeoutCase;
+  RunClientCloseRaiseCase;
+  RunClientReconnectQueueCase(AUrl);
+  RunClientReconnectAfterRaiseCase(AUrl);
+  {$ifdef UNIX}
+  RunClientInterruptedReadCase;
+  {$endif}
+end;
+
+// ---------------------------------------------------------------------------
+// Client URL section (duetto#39)
+// ---------------------------------------------------------------------------
+// What TWSClient makes of a URL, observed on the wire: a URL carrying
+// CR/LF is refused before any socket exists; userinfo is never sent; a
+// query without a path requests '/?query'; the Host header carries a
+// non-default port; and a bracketed IPv6 literal connects over AF_INET6
+// to a server bound to ::1, with the literal bracketed in Host. The
+// hostname section's ws://localhost check covers name resolution.
+
+const
+  UrlUserinfo = 'alice9:s3cr3t-pw';
+  UrlProbe: RawByteString = 'over ::1';
+
+type
+  // OnUpgradeRequest hook that accepts everything and records the Host
+  // and target of the last request, for the ::1 server.
+  TUpgradeRecorder = class
+  private
+    FLock: TCriticalSection;
+    FHost, FTarget: string;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    function Accept(var AContext: TWSUpgradeContext): Boolean;
+    procedure Snapshot(out AHost, ATarget: string);
+  end;
+
+constructor TUpgradeRecorder.Create;
+begin
+  inherited;
+  FLock := TCriticalSection.Create;
+end;
+
+destructor TUpgradeRecorder.Destroy;
+begin
+  FLock.Free;
+  inherited;
+end;
+
+function TUpgradeRecorder.Accept(var AContext: TWSUpgradeContext): Boolean;
+begin
+  FLock.Acquire;
+  try
+    FHost := AContext.Request.Host;
+    FTarget := AContext.Request.Path;
+  finally
+    FLock.Release;
+  end;
+  Result := True;
+end;
+
+procedure TUpgradeRecorder.Snapshot(out AHost, ATarget: string);
+begin
+  FLock.Acquire;
+  try
+    AHost := FHost;
+    ATarget := FTarget;
+  finally
+    FLock.Release;
+  end;
+end;
+
+// One raw peer that accepts a single connection. The two URLs carrying
+// CR/LF go first: had either reached a socket, the peer would have
+// recorded its request instead of the one that follows.
+procedure RunClientUrlRequestCase;
+var
+  Peer: TRobustPeer;
+  Listener: Tsocket;
+  PeerPort: Word;
+  Client: TWSClient;
+  PathError, HostError, Error, Host, Target: string;
+  Request: RawByteString;
+  Finished: Boolean;
+begin
+  Peer := StartRobustPeer(rpmSilent, Listener, PeerPort);
+  Client := TWSClient.Create;
+  Client.CloseTimeoutMs := 0; // the peer never echoes a close
+  try
+    TimedConnect(Client, Format('ws://127.0.0.1:%d/x', [PeerPort]) +
+      #13#10'X-Injected: 1', PathError);
+    TimedConnect(Client, Format('ws://127.0.0.1'#13#10'X-Injected: 1:%d/',
+      [PeerPort]), HostError);
+    TimedConnect(Client, Format('WS://%s@127.0.0.1:%d?x=1',
+      [UrlUserinfo, PeerPort]), Error);
+    Client.Close;
+  finally
+    Client.Free;
+  end;
+  Finished := WaitFinished(Peer, RobustPeerEndMs);
+  Request := Peer.Request;
+  Host := Peer.RequestHost;
+  Target := Peer.RequestTarget;
+  FinishRobustPeer(Peer, Listener, PeerPort, 0);
+
+  Check((PathError =
+    'EWSClient: control character or space in URL path or query') and
+    (HostError = 'EWSClient: invalid character in URL host') and
+    (Pos('X-Injected', Request) = 0),
+    'client: a URL with CR/LF in its path or host raises EWSClient ' +
+    'before connecting');
+  if Error <> '' then WriteLn('       connect: ', Error);
+  Check(Finished and (Error = '') and (Target = '/?x=1') and
+    (Host = Format('127.0.0.1:%d', [PeerPort])),
+    'client: WS:// with a query and no path requests /?x=1, ' +
+    'Host carries the non-default port');
+  // Target pins the request read as the one from the userinfo URL.
+  Check(Finished and (Target = '/?x=1') and (Pos('alice9', Request) = 0) and
+    (Pos('s3cr3t', Request) = 0) and
+    (Pos('Authorization', Request) = 0),
+    'client: URL userinfo is accepted and never sent');
+end;
+
+// True when this host can bind ::1 at all: the only condition under which
+// the IPv6 case skips. A server that then fails to bind ::1 is a failure.
+function IPv6LoopbackAvailable(out AReason: string): Boolean;
+var
+  Fd: Tsocket;
+  SA: TInetSockAddr6;
+begin
+  Result := False;
+  Fd := fpSocket(AF_INET6, SOCK_STREAM, 0);
+  if Fd < 0 then
+  begin
+    AReason := 'no AF_INET6 sockets';
+    Exit;
+  end;
+  FillChar(SA, SizeOf(SA), 0);
+  SA.sin6_family := AF_INET6;
+  SA.sin6_addr.u6_addr8[15] := 1; // ::1, port 0
+  Result := fpBind(Fd, @SA, SizeOf(SA)) = 0;
+  if not Result then AReason := 'cannot bind ::1';
+  CloseSocket(Fd);
+end;
+
+// ws://[::1]:port/ against a server bound to ::1. A host without IPv6
+// loopback says so on a skip line and moves on.
+procedure RunClientUrlIPv6Case;
+var
+  Recorder: TUpgradeRecorder;
+  Echoer: TEcho;
+  SrvThread: TServerThread;
+  Server: TWSServer;
+  SrvPort: Word;
+  Client: TWSClient;
+  Error, Host, Target: string;
+  Echoed, IsText: Boolean;
+  Data: TBytes;
+begin
+  if not IPv6LoopbackAvailable(Error) then
+  begin
+    WriteLn('skip - client: IPv6 loopback unavailable (', Error,
+      '); ws://[::1] not exercised');
+    Exit;
+  end;
+  try
+    Server := TWSServer.Create(0, True, 16 * 1024 * 1024, '::1');
+  except
+    on E: Exception do
+    begin
+      Check(False, 'client: a server binds ::1 (' + E.Message + ')');
+      Exit;
+    end;
+  end;
+  Recorder := TUpgradeRecorder.Create;
+  Echoer := TEcho.Create;
+  SrvThread := TServerThread.Create(True);
+  SrvThread.Srv := Server;
+  Server.OnMessage := Echoer.OnMsg;
+  Server.OnUpgradeRequest := Recorder.Accept;
+  SrvPort := Server.Port;
+  SrvThread.Start;
+
+  Client := TWSClient.Create;
+  Echoed := False;
+  try
+    TimedConnect(Client, Format('ws://[::1]:%d/six?v=6', [SrvPort]), Error);
+    if Error = '' then
+    begin
+      Client.SendText(UrlProbe);
+      Echoed := (Client.ReadMessage(IsText, Data, 5000) = wrrMessage) and
+        IsText and (AsText(Data) = UrlProbe);
+      Client.Close(1000, 'done');
+    end;
+  finally
+    Client.Free;
+  end;
+  Recorder.Snapshot(Host, Target);
+  if Error <> '' then WriteLn('       connect: ', Error);
+  Check((Error = '') and Echoed,
+    'client: ws://[::1]:port/ connects over IPv6 to a ::1-bound server, echo');
+  Check((Host = Format('[::1]:%d', [SrvPort])) and (Target = '/six?v=6'),
+    'client: IPv6 literal stays bracketed in Host, with the port');
+
+  SrvThread.Terminate;
+  Server.Stop;
+  SrvThread.WaitFor;
+  Server.Free;
+  SrvThread.Free;
+  Recorder.Free;
+  Echoer.Free;
+end;
+
+procedure RunClientUrlSection(var AStressPhase: ShortString);
+begin
+  AStressPhase := 'client URL section';
+  RunClientUrlRequestCase;
+  RunClientUrlIPv6Case;
+end;
+
+{$ifdef LINUX}
+type
+  // Sits between a wss client and the TLS server, copying bytes both ways
+  // until Cut; then breaks the client's TLS stream, with bytes that are
+  // no TLS record or (ResetOnCut) a hard reset of its TCP connection.
+  TTlsCutRelay = class(TThread)
+  public
+    Listener: Tsocket;
+    UpstreamPort: Word;
+    Cut: Boolean;
+    ResetOnCut: Boolean;
+    procedure Execute; override;
+  end;
+
+function RelayCopy(AFrom, ATo: Tsocket): Boolean;
+var
+  Buf: array[0..16383] of Byte;
+  Got, Sent, Off: Integer;
+begin
+  Got := fpRecv(AFrom, @Buf[0], SizeOf(Buf), 0);
+  if Got <= 0 then Exit(False);
+  Off := 0;
+  while Off < Got do
+  begin
+    Sent := fpSend(ATo, @Buf[Off], Got - Off, TlsSendFlags);
+    if Sent <= 0 then Exit(False);
+    Inc(Off, Sent);
+  end;
+  Result := True;
+end;
+
+procedure TTlsCutRelay.Execute;
+var
+  Down, Up: Tsocket;
+  PFD: array[0..1] of TPollFd;
+  Hard: TInteropLinger;
+  Junk: RawByteString;
+begin
+  Down := fpAccept(Listener, nil, nil);
+  if Down < 0 then Exit;
+  Up := -1;
+  try
+    Up := RawConnectEx(UpstreamPort, False);
+    while not Cut do
+    begin
+      PFD[0].fd := Down;
+      PFD[0].events := POLLIN;
+      PFD[0].revents := 0;
+      PFD[1].fd := Up;
+      PFD[1].events := POLLIN;
+      PFD[1].revents := 0;
+      if FpPoll(@PFD[0], 2, 50) <= 0 then Continue;
+      if (PFD[0].revents <> 0) and not RelayCopy(Down, Up) then Exit;
+      if (PFD[1].revents <> 0) and not RelayCopy(Up, Down) then Exit;
+    end;
+    if ResetOnCut then
+    begin
+      Hard.OnOff := 1;
+      Hard.Seconds := 0;
+      fpSetSockOpt(Down, SOL_SOCKET, SO_LINGER, @Hard, SizeOf(Hard));
+    end
+    else
+    begin
+      Junk := 'this is no TLS record';
+      fpSend(Down, @Junk[1], Length(Junk), TlsSendFlags);
+    end;
+  finally
+    CloseSocket(Down);
+    if Up >= 0 then CloseSocket(Up);
+  end;
+end;
+
+// A wss session through the relay: one echo proves the path, then the
+// relay breaks the stream. Reading (garbage) or sending (reset) must end
+// the connection through the client's own contract — wrrClosed, Open
+// False — with no lwpt exception escaping ReadMessage, SendText or
+// Close. (The reset case writes into a reset TLS socket, which on Linux
+// still raises SIGPIPE inside OpenSSL — duetto#79 — so it relies on the
+// battery ignoring SIGPIPE.)
+procedure RunClientTlsFailureCase(ATlsPort: Word; AReset: Boolean;
+  const ALabel: string);
+var
+  Relay: TTlsCutRelay;
+  Listener: Tsocket;
+  RelayPort: Word;
+  Client: TWSClient;
+  Escaped: string;
+  Echoed: Boolean;
+  Res: TWSReadResult;
+  Sends: Integer;
+  IsText: Boolean;
+  Data: TBytes;
+begin
+  Listener := OpenLoopbackListener(RelayPort);
+  Relay := TTlsCutRelay.Create(True);
+  Relay.Listener := Listener;
+  Relay.UpstreamPort := ATlsPort;
+  Relay.ResetOnCut := AReset;
+  Relay.Start;
+  Client := TWSClient.Create;
+  Escaped := '';
+  Echoed := False;
+  Res := wrrTimeout;
+  try
+    try
+      Client.Connect(Format('wss://127.0.0.1:%d/', [RelayPort]));
+      Client.SendText(RobustPeerMessage);
+      Echoed := Client.ReadMessage(IsText, Data, 5000) = wrrMessage;
+      Relay.Cut := True;
+      if AReset then
+      begin
+        WaitFinished(Relay, RobustPeerEndMs); // the reset has gone out
+        Sends := 0;
+        while Client.Open and (Sends < RobustSendAttempts) do
+        begin
+          Client.SendText(RobustPeerMessage);
+          Inc(Sends);
+          Sleep(10);
+        end;
+      end;
+      Res := Client.ReadMessage(IsText, Data, 5000);
+      Client.Close;
+    except
+      on E: Exception do Escaped := E.ClassName + ': ' + E.Message;
+    end;
+    if Escaped <> '' then WriteLn('       client: ', Escaped);
+    Check(Echoed and (Escaped = '') and (Res = wrrClosed) and
+      (not Client.Open), ALabel);
+  finally
+    Client.Free;
+  end;
+  if not Relay.Finished then
+  try
+    CloseSocket(RawConnectEx(RelayPort, False));
+  except
+    // the relay accepted earlier
+  end;
+  Relay.Cut := True;
+  Relay.WaitFor;
+  Relay.Free;
+  CloseSocket(Listener);
+end;
+{$endif}
+
+// ---------------------------------------------------------------------------
 
 const
   HelloProbe: RawByteString = 'hello duetto';
@@ -2358,10 +3653,10 @@ begin
   // come back than went in, and the connection ends. How the flood's
   // own sends fare differs — epoll resets at once so they fail
   // part-way, Network.framework stops reading so they block (hence the
-  // send bound), IOCP keeps draining input behind its FIN so they all
-  // land — and the transport's 300 ms close drain (a close deferred
-  // behind a send the peer never takes) bounds the end on the transports
-  // that defer.
+  // send bound), IOCP reads and drops input behind its close so they
+  // land until its drain ends — and the transport's 300 ms close drain
+  // (a close deferred behind a send the peer never takes, or a FIN the
+  // peer never answers) bounds the end on the transports that defer.
   // Idle and ping off for this case, so only the cap (and the close
   // drain behind it) can end the connection: the idle bound must not be
   // what passes it.
@@ -2387,13 +3682,17 @@ begin
     'after the flood)', [SentBytes div 1024, Length(Got) div 1024,
     Elapsed]));
 
-{$ifdef LINUX}
   // A peer that sends Close, never reads the echo, and keeps sending:
   // the echo is stuck behind megabytes of queued output (the cap is off
   // here so the queue can build), so the server drains it under the
   // 300 ms CloseTimeoutMs — and the peer's later bytes must not restart
-  // that budget. Linux only: the peer sees the drop through the RST a
-  // closed Linux socket answers further data with.
+  // that budget. Linux and Windows: the peer sees the drop through the
+  // RST the server's socket answers further data with — at once on
+  // epoll, which closes outright; on IOCP only when the transport's own
+  // 300 ms close drain resets a close the peer never lets finish (it
+  // waits behind a send the peer is not taking, then for a FIN), so
+  // here the case also pins that drain deadline.
+{$if LimitsCloseBudgetCase}
   LimSrvT.Srv.MaxPendingOutput := 0;
   Fd := RawUpgraded(LimPort, 4096);
   RawSetSendTimeout(Fd, 1000);
@@ -2546,23 +3845,30 @@ end;
 
 procedure RunHostnameSection;
 begin
-  // --- hostname resolution (files before dns) -------------------------------
-  // The UNIX client resolved names with DNS-only ResolveHostByName, so
-  // ws://localhost failed on any glibc resolver that does not synthesize
-  // the name (plain nameservers in containers and VMs; macOS answers, GH
-  // runners answer via systemd-resolved). One echo round through the
-  // hostname pins the /etc/hosts path on every platform; Windows resolves
-  // through getaddrinfo and was never affected.
+  // --- hostname resolution (getaddrinfo, AF_UNSPEC) ------------------------
+  // The client resolves through getaddrinfo with AF_UNSPEC on every
+  // platform, so localhost comes from the hosts file before DNS (FPC's
+  // DNS-only netdb path failed it on plain glibc resolvers). Where
+  // localhost lists ::1 ahead of an address this server is not
+  // listening on, that address is refused and the next one connects;
+  // whether a host's resolver exercises that fallback depends on its
+  // hosts file, so this check pins resolution, not the fallback.
   StressPhase := 'localhost resolution section';
   Cli := TWSClient.Create;
-  Cli.Connect(Format('ws://localhost:%d/', [Port]));
   S := 'via-hosts-file';
-  Cli.SendText(S);
-  Check(Cli.ReadMessage(IsText, Data) and IsText and
-    (Length(Data) = Length(S)) and CompareMem(@Data[0], @S[1], Length(S)),
-    'ws://localhost echo (hosts-file resolution)');
-  Cli.Close(1000, 'done');
+  Ok := False;
+  try
+    Cli.Connect(Format('ws://localhost:%d/', [Port]));
+    Cli.SendText(S);
+    Ok := Cli.ReadMessage(IsText, Data) and IsText and
+      (Length(Data) = Length(S)) and CompareMem(@Data[0], @S[1], Length(S));
+    Cli.Close(1000, 'done');
+  except
+    on E: Exception do
+      WriteLn('       connect: ', E.ClassName, ': ', E.Message);
+  end;
   Cli.Free;
+  Check(Ok, 'ws://localhost echo (getaddrinfo, AF_UNSPEC)');
 end;
 
 procedure RunBoundedReadSection;
@@ -3165,6 +4471,17 @@ begin
       end;
       FreeAndNil(TlsCli);
 
+      // TWSClient's own failure contract over wss (duetto#44): a TLS
+      // stream that breaks mid-session ends the connection through
+      // wrrClosed and Open, never through an lwpt exception.
+      StressPhase := 'tls section: client TLS failure mid-stream';
+      RunClientTlsFailureCase(TlsPort, False,
+        'tls: a broken TLS record mid-stream ends the client connection ' +
+        '(wrrClosed, Open False), nothing escapes ReadMessage or Close');
+      RunClientTlsFailureCase(TlsPort, True,
+        'tls: a reset under a wss send ends the client connection ' +
+        '(wrrClosed, Open False), nothing escapes SendText or Close');
+
       // close_notify before FIN, observed from a probe that keeps its
       // socket open past the WebSocket close: lwpt's blocking read
       // returns 0 on an orderly TLS shutdown and raises on a reset. On
@@ -3658,6 +4975,9 @@ begin
   RunBoundedReadSection;
   RunDeflateSection;
   RunViolationSection;
+  RunClientDeliverySection(Url, StressPhase);
+  RunClientRobustnessSection(Url, StressPhase);
+  RunClientUrlSection(StressPhase);
   RunEgressSection(Port, StressPhase);
   RunPlainRequestSection;
   RunUpgradeHookSection;

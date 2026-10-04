@@ -1,6 +1,7 @@
 # Thin caller for known-good-route's reusable project-skills refresh
 # (see .agents/skills/maintain-project-skills/references/
-# project-skills-runbook.md). The refresh job runs read-only; the publish
+# project-skills-runbook.md). The refresh job runs read-only and regenerates
+# the AGENTS.md skills block (known-good-route:agents markers); the publish
 # job opens or updates a DRAFT pull request on the automation branch,
 # which then goes through ordinary review. Pin: KGR main at the SHA below;
 # bump it only after reading the KGR diff between the two pins. Dependabot
@@ -27,7 +28,7 @@ permissions:
 
 jobs:
   update:
-    uses: frostney/known-good-route/.github/workflows/update-project-skills.yml@1099a7f5afc3e35afd2a13193ef17819b4267320 # main 2026-09-26
+    uses: frostney/known-good-route/.github/workflows/update-project-skills.yml@c2c76e4fab6b4571018f5f75dd921542cc6629b7 # main 2026-10-02
     with:
       skills-root: "."
       skills-cli-version: "1.5.23"

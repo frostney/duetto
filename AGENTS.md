@@ -56,7 +56,7 @@ tools/autobahn.sh client   # Autobahn fuzzingserver vs wsautobahn (Docker)
 
 | Path | Role |
 | --- | --- |
-| `source/units/` | Library: `WS.Clock` (monotonic deadline clock), `WS.Frame`, `WS.Utf8`, `WS.Handshake`, `WS.Deflate`, `WS.Protocol` (sans-I/O core), `WS.Client`, `WS.Transport(.Epoll/.NetworkFramework/.Iocp)`, `WS.Transport.PostQueue` (cross-thread post hand-off), `WS.Transport.TlsServer` (server TLS for the fd-owning transports), `WS.Server` (session layer) |
+| `source/units/` | Library: `WS.Clock` (monotonic deadline clock), `WS.Frame`, `WS.Utf8`, `WS.Handshake`, `WS.Url` (client ws/wss URL parsing), `WS.Deflate`, `WS.Protocol` (sans-I/O core), `WS.Client`, `WS.Transport(.Epoll/.NetworkFramework/.Iocp)`, `WS.Transport.PostQueue` (cross-thread post hand-off), `WS.Transport.TlsServer` (server TLS for the fd-owning transports), `WS.Server` (session layer) |
 | `source/apps/` | Programs: `wsecho`, `wsprobe`, `wsinterop`, `wsbench`, `wsautobahn` |
 | `tests/autobahn/` | Autobahn testsuite configs (reports/ is generated) |
 | `tools/` | Cross-implementation checks, benchmarks, Autobahn runner |
@@ -255,3 +255,26 @@ Generated from the same immutable structural registry used by manifest validatio
   - `script`: retired; optional; invalid values are errors. Retired; use command and args.
 
 <!-- lwpt:agents:end -->
+
+<!-- known-good-route:agents:begin -->
+
+## Agent skills
+
+Generated from the `metadata.agents-role` and `metadata.agents-text` of the skills installed in `.agents/skills`. Edit outside the `known-good-route:agents` markers only.
+
+- Always apply `agent-writing`: Write replies, reports, PR and issue text, and docs that lead with the outcome and keep the evidence.
+- Always apply `software-engineering-excellence`: Keep the agreed scope, ground claims in current evidence, and finish verified work during substantial technical tasks.
+- Start with `/code-review`: Review a PR, branch, or worktree for evidence-backed findings.
+- Start with `/codebase-audit`: Audit a repository or subsystem for systemic engineering risks.
+- Start with `/create-issue`: File a project-aligned GitHub issue from a short description.
+- Start with `/create-pr`: Publish the current change as a pull request and bring it to ready for review.
+- Start with `/create-release`: Prepare or publish a release through the repository's release workflow.
+- Start with `/deliver`: Carry one feature, bug, issue, branch, or PR to its verified delivery endpoint.
+- Start with `/implement`: Develop an issue or idea until its requirements are verified.
+- Start with `/milestone-rush`: Complete one confirmed milestone, from its work items to its release.
+- Start with `/roadmap-review`: Turn current project evidence into a verified version plan.
+- Start with `/run-retro`: Review a workstream and agree process improvements.
+- Start with `/test-against-spec`: Test a change against its requirements through the real interface.
+- Start with `/update-pr`: Push new changes to an existing pull request and refresh its metadata.
+
+<!-- known-good-route:agents:end -->

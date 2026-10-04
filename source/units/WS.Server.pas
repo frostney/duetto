@@ -19,8 +19,11 @@ unit WS.Server;
 // Per-connection order is guaranteed everywhere; handlers for DIFFERENT
 // connections may run concurrently on macOS, so cross-connection state
 // in user handlers needs the user's own synchronization. The hot path
-// here is confined to one connection and stays lock-free; the only lock
-// guards the connection registry on accept/close (cold path).
+// here is confined to one connection and stays lock-free. The one lock
+// guards the connection registry: it is taken on accept and close, by
+// each Post's rendezvous, and by the clock sweeper for one walk of the
+// live connections about every 100 ms (ADR-0005) — never on the
+// receive or send path.
 // TWSConnection.Post is the one cross-thread hand-off: it schedules a
 // proc onto the connection's callback context via the transport seam,
 // so server-driven pushes need no locks of their own.
