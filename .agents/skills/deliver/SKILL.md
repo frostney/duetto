@@ -86,6 +86,11 @@ capability. Do not invent a successful handoff. Reuse matching evidence for
 unchanged content, command, environment and requirements; rerun only missing or
 invalidated checks. Preserve independent review judgment.
 
+Apply `git-workflow`'s
+[default-branch health](../git-workflow/SKILL.md#default-branch-health) gate
+before development starts and again before each merge. A default-branch repair
+it calls for is a separate work item that comes before this one.
+
 Integration delivery and release publication are separate outcomes. Never
 invoke `/create-release` from this single-item loop or use a milestone release
 as a substitute for integration delivery. A configured nightly integration can
@@ -100,6 +105,18 @@ investigation remains. When repeated attempts produce no new evidence or
 progress, reassess the cause and approach; escalate the specific remaining
 blocker after safe alternatives are exhausted. Do not loop unchanged probes,
 weaken acceptance or expand scope to manufacture progress.
+
+When only external transitions remain, such as CI, review automation or a
+deployment, park the work item: arm one wait for each awaited transition under
+[`delivery-wait`'s running rules](../delivery-wait/SKILL.md#running-a-wait),
+record resumable state, and end the turn. Resume from each returned result,
+and arm the next wait before ending another turn. Never end a turn with a
+transition still expected and nothing armed to resume it. If the host cannot
+keep a wait armed, report the exact time or event to resume at.
+
+When the session goes on to another work item, start it from the recorded
+result and handoff, not from this item's working context. Compact the context
+or start a fresh one at that boundary where the host allows it.
 
 Finish only when the selected endpoint has observed evidence. An external
 blocker, unresolved material decision or needed authority can leave it
