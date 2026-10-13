@@ -49,7 +49,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.7.0"
+  LWPT_VERSION: "0.8.0"
 
 jobs:
   test:
