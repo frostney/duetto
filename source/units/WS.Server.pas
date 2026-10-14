@@ -336,6 +336,7 @@ type
 
     // Blocks. ATimeoutMs >= 0 returns after one completion round (test
     // use); -1 loops until Stop.
+    procedure Start;
     procedure Run(ATimeoutMs: Integer = -1);
     procedure Stop;
 
@@ -1437,6 +1438,11 @@ end;
 function TWSServer.GetPort: Word;
 begin
   Result := FTransport.Port;
+end;
+
+procedure TWSServer.Start;
+begin
+  // Stub: the transport still opens in Create.
 end;
 
 procedure TWSServer.Run(ATimeoutMs: Integer);

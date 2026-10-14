@@ -4930,6 +4930,195 @@ begin
   Watchdog.Free;
 end;
 
+// ---------------------------------------------------------------------------
+// Open-on-Start: handlers assigned after Create must govern every
+// connection. Network.framework serves handshakes on GCD as soon as the
+// transport is open, so a server that opened in its constructor answered
+// early peers with whatever hooks were set at that instant (none).
+// ---------------------------------------------------------------------------
+
+type
+  TStartHost = class
+  public
+    Calls, Opens: LongInt;
+    function RejectAll(var AContext: TWSUpgradeContext): Boolean;
+    function AcceptAll(var AContext: TWSUpgradeContext): Boolean;
+    procedure HandleOpen(AConn: TWSConnection);
+  end;
+
+function TStartHost.RejectAll(var AContext: TWSUpgradeContext): Boolean;
+begin
+  InterLockedIncrement(Calls);
+  AContext.Reason := 'not yet';
+  Result := False;
+end;
+
+function TStartHost.AcceptAll(var AContext: TWSUpgradeContext): Boolean;
+begin
+  InterLockedIncrement(Calls);
+  Result := True;
+end;
+
+procedure TStartHost.HandleOpen(AConn: TWSConnection);
+begin
+  InterLockedIncrement(Opens);
+end;
+
+// The response header block on AFd, or whatever arrived before EOF, an
+// error or the 5 s SO_RCVTIMEO.
+function RawReadHead(AFd: Tsocket): RawByteString;
+var
+  Buf: array[0..4095] of Byte;
+  Got: Integer;
+begin
+  Result := '';
+  repeat
+    Got := fpRecv(AFd, @Buf[0], SizeOf(Buf), 0);
+    if Got <= 0 then Exit;
+    SetLength(Result, Length(Result) + Got);
+    Move(Buf[0], Result[Length(Result) - Got + 1], Got);
+  until HandshakeFindEnd(Result) > 0;
+end;
+
+function Is101(const AHead: RawByteString): Boolean;
+begin
+  Result := Pos(' 101 ', Copy(AHead, 1, 16)) > 0;
+end;
+
+procedure StopServerThread(ASrvT: TServerThread);
+begin
+  ASrvT.Terminate;
+  ASrvT.Srv.Stop;
+  ASrvT.WaitFor;
+  ASrvT.Srv.Free;
+  ASrvT.Free;
+end;
+
+// A peer that sends a full upgrade before any hook is wired must be
+// judged by the hooks wired before Start, never by the empty set.
+procedure RunStartRaceCase;
+var
+  Host: TStartHost;
+  SrvT: TServerThread;
+  Fd: Tsocket;
+  Req, Head: RawByteString;
+  Eof: Boolean;
+begin
+  Host := TStartHost.Create;
+  SrvT := TServerThread.Create(True);
+  SrvT.Srv := TWSServer.Create(0, False, 16 * 1024 * 1024, '127.0.0.1');
+  Check(SrvT.Srv.Port <> 0, 'start: port 0 resolves to a real port before Start');
+  Fd := -1;
+  Head := '';
+  try
+    Fd := RawConnect(SrvT.Srv.Port);
+    Req := ClientBuildRequest('127.0.0.1', '/', ClientGenerateKey, False);
+    fpSend(Fd, @Req[1], Length(Req), 0);
+  except
+    // NF may refuse outright; that is the fixed behaviour too.
+  end;
+  Sleep(300);
+  SrvT.Srv.OnUpgradeRequest := Host.RejectAll;
+  SrvT.Srv.OnOpen := Host.HandleOpen;
+  SrvT.Srv.Start;
+  SrvT.Start;
+  if Fd <> -1 then
+  begin
+    Head := RawReadHead(Fd);
+    CloseSocket(Fd);
+  end;
+  Sleep(100);
+  if Is101(Head) then
+    WriteLn('       early peer got: ', Copy(Head, 1, 40));
+  Check(not Is101(Head),
+    'start: an upgrade sent before hooks were wired never gets a 101');
+  Check(Host.Opens = 0,
+    'start: OnOpen never fires for a peer the late-wired hook rejects (' +
+    IntToStr(Host.Calls) + ' hook calls)');
+  // The hook is live for a peer arriving after Start.
+  Fd := RawConnect(SrvT.Srv.Port);
+  Head := RawUpgrade(Fd, '', Eof);
+  CloseSocket(Fd);
+  Check((not Is101(Head)) and (Host.Calls >= 1) and (Host.Opens = 0),
+    'start: the late-wired reject-all hook governs connections after Start');
+  StopServerThread(SrvT);
+  Host.Free;
+end;
+
+procedure RunStartContractCase;
+var
+  Host: TStartHost;
+  SrvT: TServerThread;
+  Fd: Tsocket;
+  T0: QWord;
+  Srv: TWSServer;
+  {$ifdef DARWIN}
+  Head: RawByteString;
+  Eof: Boolean;
+  {$endif}
+begin
+  // Start is idempotent: twice by hand, once more inside Run.
+  Host := TStartHost.Create;
+  SrvT := TServerThread.Create(True);
+  SrvT.Srv := TWSServer.Create(0, False, 16 * 1024 * 1024, '127.0.0.1');
+  SrvT.Srv.OnUpgradeRequest := Host.AcceptAll;
+  SrvT.Srv.OnOpen := Host.HandleOpen;
+  SrvT.Srv.Start;
+  SrvT.Srv.Start;
+  SrvT.Start;
+  Fd := RawUpgraded(SrvT.Srv.Port);
+  Check(Fd <> -1, 'start: Start twice then Run still serves (idempotent)');
+  if Fd <> -1 then CloseSocket(Fd);
+  StopServerThread(SrvT);
+
+  // Run without an explicit Start serves.
+  SrvT := TServerThread.Create(True);
+  SrvT.Srv := TWSServer.Create(0, False, 16 * 1024 * 1024, '127.0.0.1');
+  SrvT.Srv.OnUpgradeRequest := Host.AcceptAll;
+  SrvT.Start;
+  Fd := RawUpgraded(SrvT.Srv.Port);
+  Check(Fd <> -1, 'start: Run without Start serves');
+  if Fd <> -1 then CloseSocket(Fd);
+  StopServerThread(SrvT);
+
+  // A never-started server tears down without hanging.
+  T0 := GetTickCount64;
+  Srv := TWSServer.Create(0, False, 16 * 1024 * 1024, '127.0.0.1');
+  Srv.Free;
+  Check(GetTickCount64 - T0 < 3000,
+    'start: destroying a never-started server returns promptly');
+
+  {$ifdef DARWIN}
+  // Network.framework refuses (cancels) a connection before Start; the
+  // listener is already up, so the TCP connect itself may complete.
+  SrvT := TServerThread.Create(True);
+  SrvT.Srv := TWSServer.Create(0, False, 16 * 1024 * 1024, '127.0.0.1');
+  SrvT.Srv.OnUpgradeRequest := Host.AcceptAll;
+  Head := '';
+  try
+    Fd := RawConnect(SrvT.Srv.Port);
+    Head := RawUpgrade(Fd, '', Eof);
+    CloseSocket(Fd);
+  except
+  end;
+  Check(not Is101(Head), 'start (NF): a connection before Start is refused');
+  SrvT.Srv.Start;
+  SrvT.Start;
+  Fd := RawUpgraded(SrvT.Srv.Port);
+  Check(Fd <> -1, 'start (NF): a connection after Start succeeds');
+  if Fd <> -1 then CloseSocket(Fd);
+  StopServerThread(SrvT);
+  {$endif}
+  Host.Free;
+end;
+
+procedure RunStartSection(var AStressPhase: ShortString);
+begin
+  AStressPhase := 'start section';
+  RunStartRaceCase;
+  RunStartContractCase;
+end;
+
 begin
   {$ifdef UNIX}
   // Ignore SIGPIPE once, up front and unconditionally — before any
@@ -4985,6 +5174,7 @@ begin
   RunLimitsSection(StressPhase);
   RunCloseHandlerSection(StressPhase);
   RunHandlerFaultSection(StressPhase);
+  RunStartSection(StressPhase);
   RunServerTlsSection;
   RunStressSection;
   for I := 0 to High(Linger) do
