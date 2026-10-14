@@ -109,6 +109,12 @@ Page := TPageServer.Create(5800,
 Ws.Run;   // blocks until Ws.Stop
 ```
 
+`TWSServer.Create` binds the port but serves nothing until `Start` or
+`Run` (which calls `Start` itself), so assign every handler first: a
+handler set after `Start` races live connections. Call `Ws.Start`
+explicitly when `Run` happens later on another thread. See
+[ADR-0006](adr/0006-server-opens-on-start-not-create.md).
+
 Handlers run on the transport's execution context — see the concurrency
 notes at the top of `source/units/WS.Server.pas` and
 [architecture.md](architecture.md) before sharing state between the two

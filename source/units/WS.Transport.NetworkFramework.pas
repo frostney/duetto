@@ -546,6 +546,9 @@ begin
     Nw_connection_cancel(ANwConn);
     Exit;
   end;
+  // FOpen seen True: the handler writes published before it (see Open)
+  // are visible to everything this connection runs.
+  ReadBarrier;
   Nw_retain(ANwConn);
   C := TWSNwConn.Create;
   C.FTransport := T;
@@ -1018,6 +1021,10 @@ end;
 
 procedure TWSNetworkFrameworkTransport.Open;
 begin
+  // Publish the session's handler writes (made on the opening thread)
+  // before the flag GCD's listener queue reads; pairs with the
+  // ReadBarrier in NewConnInvoke.
+  WriteBarrier;
   FOpen := True;
 end;
 
