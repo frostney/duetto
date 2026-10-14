@@ -337,12 +337,12 @@ type
 
     // Blocks. ATimeoutMs >= 0 returns after one completion round (test
     // use); -1 loops until Stop.
-    // Begin accepting. Create binds and resolves Port but serves no
+    // Open the transport. Create binds and resolves Port but serves no
     // connection: assign the handlers, then Start (or just Run, which
     // starts first). Idempotent. Handlers assigned after Start race
-    // live connections — wire them before. On Network.framework a peer
-    // arriving before Start is refused; epoll and IOCP leave it in the
-    // kernel backlog until Start.
+    // live connections — wire them before. Before Start, Network.framework
+    // refuses a peer; IOCP leaves it in the kernel backlog until Start
+    // arms accepts, and epoll until Run processes the listener event.
     procedure Start;
     procedure Run(ATimeoutMs: Integer = -1);
     procedure Stop;

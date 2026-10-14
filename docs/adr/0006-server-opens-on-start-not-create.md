@@ -51,7 +51,9 @@ changes: ADR-0003's execution contexts stand.
 - What a peer sees before `Start` depends on the transport. On
   Network.framework the listener is already up, so the TCP connect may
   complete, but the connection is cancelled at once (refused). On epoll
-  and IOCP the connection waits in the kernel backlog and is served by
-  the hooks in place when `Start` runs.
+  the connection waits in the kernel backlog until `Run` processes the
+  listener event. On IOCP it waits until `Start` arms accepts, and `Run`
+  dispatches the completion. Either way it is served by the hooks in
+  place at that point.
 - `Start` is new public API, so this ships as a minor release (0.7.0).
 - Destroying a server that never started is safe and does not block.
