@@ -245,9 +245,12 @@ type
     procedure Stop; virtual; abstract;
 
     // Constructors bind and resolve Port but deliver no completions;
-    // connections arriving before Open are refused. Wire the four
-    // events, then Open — closes the window where an accept could fire
-    // with no session attached.
+    // connections arriving before Open are not served (Network.framework
+    // cancels them; epoll and IOCP leave them in the kernel backlog).
+    // Wire the events, then Open — closes the window where an accept
+    // could fire with no session attached. TWSServer calls Open from
+    // Start (or Run), never from its constructor, so the host's own
+    // handlers are in place too (ADR-0006). Open must be idempotent.
     procedure Open; virtual;
 
     // Thread-safe scheduling hook: deliver OnPost exactly once per

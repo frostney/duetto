@@ -60,6 +60,11 @@ Server.IdleTimeoutMs := 60000;
 Server.Run;
 ```
 
+Set the limits and handlers before `Start` or `Run`. `Create` binds the
+port but accepts nothing until then, so every connection sees the
+configured server
+([ADR-0006](adr/0006-server-opens-on-start-not-create.md)).
+
 - **Message cap (`AMaxMessage`, constructor).** Set it to the largest
   message your protocol needs. It bounds inbound messages, and
   `MaxPendingOutput` defaults to four times it, so the 16 MiB default
