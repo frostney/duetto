@@ -8,6 +8,7 @@
 - Layers are strictly bottom-up: frame codec → UTF-8 → handshake → deflate → protocol machine → client / server.
 - The server is a platform-neutral session layer over a completion-shaped **transport** seam (ADR-0001/0003): epoll on Linux and IOCP on Windows (native `wss://` over lwpt's memory-BIO accept API — OpenSSL on Linux, SChannel on Windows x64 and win32 — shared through `WS.Transport.TlsServer`), Network.framework on macOS (native `wss://` inside the platform stack). The client runs on POSIX and Windows (direct WinSock2) with TLS delegated to lwpt's `TransportSecurity`.
 - The server bounds what one peer can cost: six `TWSServer` properties cap unsent output, connection count and session clocks, and one sweeper thread posts clock checks onto each connection's execution context (ADR-0005).
+- The server accepts nothing until `Start` or `Run`: `Create` binds and resolves `Port`, so handlers assigned before `Start` govern every connection on every transport ([ADR-0006](adr/0006-server-opens-on-start-not-create.md)).
 
 ## The sans-I/O core
 

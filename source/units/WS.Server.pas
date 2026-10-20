@@ -272,6 +272,7 @@ type
     FPingIntervalMs: Integer;
     FSweeper: TThread;
     FSweepWake: TEvent;
+    FStarted: Boolean;
 
     procedure RegistryAdd(AConn: TWSConnection);
     procedure SweepClocks;
@@ -336,6 +337,13 @@ type
 
     // Blocks. ATimeoutMs >= 0 returns after one completion round (test
     // use); -1 loops until Stop.
+    // Open the transport. Create binds and resolves Port but serves no
+    // connection: assign the handlers, then Start (or just Run, which
+    // starts first). Idempotent. Handlers assigned after Start race
+    // live connections — wire them before. Before Start, Network.framework
+    // refuses a peer; IOCP leaves it in the kernel backlog until Start
+    // arms accepts, and epoll until Run processes the listener event.
+    procedure Start;
     procedure Run(ATimeoutMs: Integer = -1);
     procedure Stop;
 
@@ -795,7 +803,8 @@ begin
   FTransport.OnSendReady := HandleSendReady;
   FTransport.OnClosed := HandleClosed;
   FTransport.OnPost := HandlePost;
-  FTransport.Open;
+  // No Open here: the transport accepts nothing until Start (or Run), so
+  // every handler the host assigns after Create governs every connection.
   FSweeper := TWSSweeper.Create(True);
   TWSSweeper(FSweeper).FServer := Self;
   FSweeper.Start;
@@ -1439,8 +1448,16 @@ begin
   Result := FTransport.Port;
 end;
 
+procedure TWSServer.Start;
+begin
+  if FStarted then Exit;
+  FStarted := True;
+  FTransport.Open;
+end;
+
 procedure TWSServer.Run(ATimeoutMs: Integer);
 begin
+  Start;
   FTransport.Run(ATimeoutMs);
 end;
 
