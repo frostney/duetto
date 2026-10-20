@@ -15,8 +15,9 @@ name: PR
 #
 # The lwpt toolchain comes from its published release (checksum-
 # verified tarball, no sibling checkout, no bootstrap); dependencies
-# resolve from the same release tag and are verified against the
-# committed lockfile + .lwpt/modules tree via install --frozen.
+# resolve from the lwpt release tag lwpt.toml pins (which may trail
+# LWPT_VERSION) and are verified against the committed lockfile +
+# .lwpt/modules tree via install --frozen.
 
 # No `branches:` filter on purpose (the GocciaScript fix). That key
 # matches the pull request's BASE, so a stacked pull request — one whose
@@ -38,7 +39,7 @@ permissions:
   contents: read
 
 env:
-  LWPT_VERSION: "0.7.0"
+  LWPT_VERSION: "0.8.0"
 
 jobs:
   build-and-test:

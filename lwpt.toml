@@ -43,7 +43,7 @@ wsautobahn = { source = "source/apps/wsautobahn.pas", output = "build/wsautobahn
 # (duetto#97). It grows with every observed bound (468 / 497 at 0.6.0),
 # so file ceilings that followed it rose in 5 of the 0.6.0 milestone's
 # 8 battery merges, never caught a regression, and left every library
-# file unchecked. lwpt 0.7.0 scopes analysis only as a whole, so the
+# file unchecked. lwpt 0.8.0 still scopes analysis only as a whole, so the
 # exclusion also takes the battery out of lwpt duplication; per-path
 # health and duplication settings in lwpt (frostney/lwpt#374) would let
 # it back in.

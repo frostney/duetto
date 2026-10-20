@@ -14,11 +14,11 @@ Install lwpt from its release (pick the archive for your platform —
 `windows-x64` / `windows-x86` zips):
 
 ```bash
-curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.7.0/lwpt-0.7.0-macos-arm64.tar.gz
-curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.7.0/lwpt-0.7.0-checksums.txt
-shasum -a 256 -c <(grep macos-arm64 lwpt-0.7.0-checksums.txt)
-tar xzf lwpt-0.7.0-macos-arm64.tar.gz
-export PATH="$PWD/lwpt-0.7.0-macos-arm64:$PATH"   # or copy lwpt into ~/bin
+curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.8.0/lwpt-0.8.0-macos-arm64.tar.gz
+curl -fsSLO https://github.com/frostney/lwpt/releases/download/0.8.0/lwpt-0.8.0-checksums.txt
+shasum -a 256 -c <(grep macos-arm64 lwpt-0.8.0-checksums.txt)
+tar xzf lwpt-0.8.0-macos-arm64.tar.gz
+export PATH="$PWD/lwpt-0.8.0-macos-arm64:$PATH"   # or copy lwpt into ~/bin
 ```
 
 Then set up the project:
