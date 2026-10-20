@@ -5095,12 +5095,17 @@ begin
   SrvT.Srv := TWSServer.Create(0, False, 16 * 1024 * 1024, '127.0.0.1');
   SrvT.Srv.OnUpgradeRequest := Host.AcceptAll;
   Head := '';
+  T0 := GetTickCount64;
   try
     Fd := RawConnect(SrvT.Srv.Port);
     Head := RawUpgrade(Fd, '', Eof);
     CloseSocket(Fd);
   except
   end;
+  // A refused connection closes at once. One left pending would also
+  // return no 101, but only after RawConnect's 5 s receive timeout.
+  Check(GetTickCount64 - T0 < 3000,
+    'start (NF): a connection before Start is closed promptly');
   Check(not Is101(Head), 'start (NF): a connection before Start is refused');
   SrvT.Srv.Start;
   SrvT.Start;
