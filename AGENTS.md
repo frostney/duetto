@@ -36,7 +36,8 @@
 
 lwpt is the **released binary on PATH** (checksum-verified tarball from
 lwpt's GitHub releases — see `docs/quick-start.md`); no sibling checkout,
-no bootstrap. Dependencies resolve from the same release tag.
+no bootstrap. Dependencies resolve from the lwpt release tag that
+`lwpt.toml` pins, which may trail the binary's version.
 
 ```bash
 lwpt install         # resolve deps, regenerate lwpt.cfg + lwpt.lock
