@@ -134,3 +134,11 @@ cleanup or message delivery. Verify required outcomes; omit optional unconfirmed
 claims or label them unconfirmed, without implying failure. Apply this to the
 whole report, including tables and parenthetical remarks; see
 [agent-writing](../agent-writing/SKILL.md) for shared writing guidance.
+
+Call remote CI green, or a PR ready, only after `delivery-wait` reports it
+satisfied for the current head commit, and then say so in plain words. Call a
+local check passing from its actual result on the tested content. Treat a
+failure as flaky or transient only after its failing log shows it is
+intermittent. Blaming something other than the change, or leaving the failure
+out of the required repair, needs its own evidence; a flaky failure the change
+introduced is in scope.
