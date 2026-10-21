@@ -91,7 +91,7 @@ rule may live in one.
   `.lwpt/install.lock`.
 - Benchmarks (`wsbench`, `tools/benchmatrix.sh`) are measurement tools;
   never wire their numbers into CI assertions.
-- Edit `AGENTS.md` only — `CLAUDE.md` is a symlink to it.
+- Edit shared instructions in `AGENTS.md`; `CLAUDE.md` contains only `@AGENTS.md`.
 - Human contributors follow [CONTRIBUTING.md](CONTRIBUTING.md) (merge
   gate, commit format); it links here for the constraints rather than
   repeating them.
