@@ -12,9 +12,36 @@ compatibility: >-
 
 # Delivery wait
 
-Run `scripts/delivery_wait.py` as a silent foreground child whenever a workflow
-must await external GitHub state. The harness passively waits for the command to
-finish; it must not simulate waiting with model heartbeats.
+Run `scripts/delivery_wait.py` whenever a workflow must await external GitHub
+state. The harness passively waits for the command to finish; it must not
+simulate waiting with model heartbeats.
+
+## Running a wait
+
+Hosts limit how long one command may run, and a delivery transition can take
+longer. These rules keep a wait armed for as long as the transition needs:
+
+- If the host can run a command in the background and resume the session when
+  it exits, run the wait that way. Then end the turn, or continue only work
+  independent of the awaited state. Otherwise, run it as a blocking command.
+- Set each invocation's `--deadline` inside the host's limit for one command,
+  and keep the time the caller gives up on the transition separately. A
+  `timed-out` result before that time means: run the wait again with the same
+  `--state`. That resumes one wait; it is not a heartbeat.
+- Run the helper as the whole command, with nothing piped or chained after it,
+  so the exit status the host reports is the helper's own. A host notice that
+  the command finished says only that it ended; the result envelope says what
+  happened.
+- Keep one running wait per state file. Never detach a wait from the host, for
+  example with `setsid`, `nohup` or `&`: a detached process cannot resume the
+  session.
+- While a wait runs, do not inspect the state it covers. Act on its result.
+
+The `address-feedback` CodeRabbit adapter's `run` follows the same rules. It
+keeps no state file: run it again with the same arguments, and it re-reads the
+head's state from GitHub.
+
+## Inputs
 
 The caller supplies the repository, expected identity, absolute deadline, and
 an optional state path. The command reconciles any saved state with fresh
@@ -27,7 +54,7 @@ through `--state`.
 ## Invocation
 
 `wait <kind> --repo <owner/repo> --deadline <ISO 8601> [--interval <seconds>]
-[--state <path>] [--json]` runs a foreground wait; `inspect <kind>` takes the
+[--state <path>] [--json]` runs a wait; `inspect <kind>` takes the
 same identity flags without `--deadline`, `--interval`, or `--state`. Each kind
 requires its own identity flags:
 
@@ -49,11 +76,21 @@ requires its own identity flags:
   - `--all-workflows` does not cover commit statuses or check runs from other
     apps, such as CodeRabbit or Vercel. Add a `--check` for each one the caller
     needs; the wait then also requires those contexts to succeed.
+  - A named check passes when it ends in success, skipped or neutral. The wait
+    reports `changed` as soon as one named check ends any other way, even
+    while the rest still run. Check runs that share a name count once per
+    source: their app and, for GitHub Actions, their workflow and triggering
+    event. A workflow that runs on both `push` and `pull_request` therefore
+    needs both runs to pass. From one source only the newest check suite
+    counts, so a re-run, a run cancelled by a newer one or a re-check after an
+    edit replaces the older run, whichever started first. A commit status
+    counts by its latest state.
   - `--check` alone judges only the named contexts, whatever else is still
     running for the head. Use it only when the complete expected set is known,
     such as the repository's required status checks. Checks visible at wait
     time are not that set: workflows add jobs in stages.
-- `pr-merged`: `--pr <number>` and `--head <sha>`.
+- `pr-merged`: `--pr <number>` and `--head <sha>`. It reports `changed` when
+  the pull request is closed without merging.
 - `workflow-terminal`: `--run-id <id>` and `--head <sha>`. Use it for a
   dispatched or other run whose checks do not appear on the pull request.
 - `tag-target`: `--tag <name>` and `--head <sha>`.
@@ -65,6 +102,13 @@ requires its own identity flags:
 There is no `--checkpoint` flag. The state path is `--state`, and the command
 derives a default path from the kind and identity when it is omitted.
 
+Both `inspect` and `wait` accept `--rest-page-size <1..100>` (default: 100).
+Use a smaller value when GitHub fails to serve large REST pages. It applies
+to workflow runs, jobs, and the REST fallback for checks and statuses. All
+pages are still read and the complete workflow census is still required.
+The option does not change GraphQL queries or the saved wait identity, so
+an existing wait can resume with a different REST page size.
+
 ## Results
 
 `--json` prints one envelope whose `state` is the result. Only `satisfied`
@@ -75,8 +119,8 @@ longer matches, `timed-out` means the deadline passed, and `cancelled` means
 the wait was interrupted. These exit 0; `operational-error` exits 2. `inspect`
 can also report `waiting`.
 
-Use `inspect` for a single authoritative delivery snapshot and `wait` for a
-foreground transition wait. Supported predicates are exact-head checks,
+Use `inspect` for a single authoritative delivery snapshot and `wait` to
+await a transition. Supported predicates are exact-head checks,
 pull-request merge, workflow completion, tag target, release assets, and an
 absolute wake time. A changed expected head or ref invalidates the wait instead
 of being followed silently. GitHub remains authoritative; checkpoints contain

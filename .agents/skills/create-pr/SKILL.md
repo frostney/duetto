@@ -144,7 +144,8 @@ readiness. Recording a walkthrough does not replace behavior testing.
     development loop. Revalidate affected requirements, then use `/update-pr`
     for the same PR and verify its new head. Continue until all verified
     requirement gaps are resolved.
-12. Invoke `delivery-wait`'s foreground `wait checks-terminal` operation with
+12. Invoke `delivery-wait`'s `wait checks-terminal` operation, under its
+    [running rules](../delivery-wait/SKILL.md#running-a-wait), with
     the repository, PR number, exact head, `--all-workflows`, absolute deadline
     and `--json`. `--all-workflows` waits for every GitHub Actions run and job
     on the head, including jobs that later stages add. Add one `--check` per
@@ -158,7 +159,13 @@ readiness. Recording a walkthrough does not replace behavior testing.
     in-scope causes to step 11. If expected PR checks have no run, inspect
     mergeability and resolve an established conflict through `/update-pr`
     before considering a retrigger. An unavailable external dependency remains
-    pending or blocked, never a passed check.
+    pending or blocked, never a passed check. Call CI green only after the
+    wait reports it satisfied for the current head, and then say so in plain
+    words. Call a local check passing from its actual result on the tested
+    content. Treat a failure as flaky or transient only after its failing log
+    shows it is intermittent. Blaming something other than the change, or
+    leaving the failure out of repair, needs its own evidence; a flaky failure
+    the change introduced is in scope.
 13. Once the PR is missing nothing required by the publication and PR-specific
     phases and all applicable CI is observed green for its exact head, mark it
     ready for review. Return every affected URL, native stack order when

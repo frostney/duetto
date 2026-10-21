@@ -10,7 +10,7 @@ license: Unlicense OR MIT
 compatibility: >-
   Requires authenticated GitHub access, git worktrees, the internal
   `delivery-wait` skill, and a host that supports subagents and passive
-  foreground-process waiting; implementation, review, and validation use the
+  command waiting; implementation, review, and validation use the
   project's installed workflow skills and declared gates.
 metadata:
   agents-role: entry-point
@@ -90,7 +90,9 @@ work-item deliveries and the release at the verified milestone boundary.
 1. Keep the coordinator thin: it owns confirmed decisions and provenance,
    graph state, worker admission and replacement, delivery-state promotion,
    integration, merge, and milestone closure. Detailed investigation,
-   implementation, remediation, and validation belong to bounded workers.
+   implementation, remediation, and validation belong to workers, each on the
+   [capability tier](references/orchestration.md#capability-tiers) its packet
+   records.
 2. Give each worker one context-isolated task packet and its dependencies.
    Use `/deliver` with the issue or confirmed roadmap item, required endpoint,
    configured integration destination and applicable evidence. Pass the selected
@@ -108,8 +110,8 @@ work-item deliveries and the release at the verified milestone boundary.
    competing workers authority over the same stack or merge a partial prefix
    beneath a required fix layer.
 5. Keep remediation validation focused on the changed behavior. Run the
-   repository's complete local gate once only after implementation and bounded
-   review fixes converge on the intended head, unless a new material source
+   repository's complete local gate once only after implementation and review
+   fixes converge on the intended head, unless a new material source
    change invalidates it. Do not repeatedly use a complete suite as the
    diagnostic loop.
 6. Treat heavyweight full CI as terminal promotion evidence, never as a remote
@@ -138,9 +140,11 @@ Normalize every material lifecycle, decision, wait, gate, usage, retry, rework,
 and integration transition, then pass it to the event-ledger `ingest` command.
 Host adapters own translation from native events; never add provider transcript
 parsers to this skill. Inner delivery and review loops launch the bundled
-deterministic foreground waits; the outer milestone loop passively awaits
-worker or command completion as the orchestration reference's event-driven
-waits describe and reconciles its checkpoint after each returned transition.
+deterministic waits under
+[`delivery-wait`'s running rules](../delivery-wait/SKILL.md#running-a-wait);
+the outer milestone loop passively awaits worker or command completion as the
+orchestration reference's event-driven waits describe and reconciles its
+checkpoint after each returned transition.
 Unsupported passive waiting required by repository policy blocks spawning.
 
 ## Blockers and completion
