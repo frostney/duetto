@@ -95,8 +95,9 @@ continues its own lane-independent work while lanes run.
   the most consequential failure or boundary case.
 - Record setup, action or command, input, expected result, and observed result.
   Credit returned results or matching stored evidence; a request, acknowledgment,
-  or expected outcome is not an observed result. Mark missing results
-  `unverified` and source-only conclusions `static only`.
+  or expected outcome is not an observed result. Re-run a check that returned
+  no result; mark a result that cannot be obtained `unverified` and source-only
+  conclusions `static only`.
 - Verify test value: relevant wrong behavior should fail; assertions should
   cover outcomes and meaningful failure paths without excessive mocks,
   snapshots, or implementation coupling.

@@ -297,8 +297,8 @@ Generated from the same immutable structural registry used by manifest validatio
 
 Generated from the `metadata.agents-role` and `metadata.agents-text` of the skills installed in `.agents/skills`. Edit outside the `known-good-route:agents` markers only.
 
-- Always apply `agent-writing`: Write replies, reports, PR and issue text, and docs that give the answer first, in plain words, define or drop any label the reader has not seen, and keep the evidence.
-- Always apply `software-engineering-excellence`: Base each material claim about current project state or a completed action on a file, command result or page read this session, or on what the person said, and keep what was observed apart from what was inferred; in substantial technical tasks, keep the agreed scope and finish verified work.
+- Always apply `agent-writing`: Write replies, reports, PR and issue text, and docs that give the answer first, in plain words, define or drop any label the reader has not seen, and keep the evidence; a correction re-runs its check first.
+- Always apply `software-engineering-excellence`: Base each material claim about current project state or a completed action on a file, command result or page read this session, or on what the person said, and keep what was observed apart from what was inferred; keep the agreed scope, re-run checks that return nothing, finish verified work, and stop only for a secret, a paid or account action, or the person's decision.
 - Start with `/code-review`: Review a PR, branch, or worktree for evidence-backed findings.
 - Start with `/codebase-audit`: Audit a repository or subsystem for systemic engineering risks.
 - Start with `/create-issue`: File a project-aligned GitHub issue from a short description.
