@@ -19,9 +19,10 @@ metadata:
 
 Develop the smallest complete change that satisfies the agreed requirements.
 Reuse settled scope, approach and authorization. A failed check, diagnosis or
-available fix does not end implementation. Only a material unresolved
-decision, new authority or an external blocker after safe alternatives are
-exhausted can stop dependent work; complete independent work before asking. If
+available fix does not end implementation. Only a
+[material](../software-engineering-excellence/SKILL.md#blockers-and-decisions)
+unresolved decision, new authority or an external blocker after safe
+alternatives are exhausted can stop dependent work; complete independent work before asking. If
 a skill requires a pause, link its loaded file as a Markdown link and quote the
 rule verbatim in a block quote; a paraphrase or a bare path does not let the
 user check the rule.
@@ -51,13 +52,16 @@ comparison, read [references/approach-selection.md](references/approach-selectio
 It owns comparison evidence and the registered `grilling` loop. Explicit
 `automatic` mode skips that interview while preserving investigation and the
 user's ownership of material product, architecture, security or scope choices.
-If required external evidence is unavailable, stop the dependent work; continue
-independent investigation and any established in-scope correction. A
-conclusively failed readiness threshold blocks dependent work the same way.
+If a search or source for required external evidence fails, reach the same
+primary source another way, such as the installed package's documentation URL
+or shipped declarations, and report that route. Stop the dependent work only
+when no route works; continue independent investigation and any established
+in-scope correction. A conclusively failed readiness threshold blocks dependent
+work the same way.
 
 ## Develop and verify
 
-This loop covers development only: `/deliver` owns end-to-end delivery and
+This loop covers development: `/deliver` owns end-to-end delivery and
 `/create-pr` owns publication. Reuse the confirmed requirements and approach.
 
 1. Reuse or create a focused branch/worktree under `git-workflow`. Apply its
@@ -66,28 +70,37 @@ This loop covers development only: `/deliver` owns end-to-end delivery and
 2. Implement the smallest complete change, then run and inspect the real result.
    For UI/UX work, compare affected states with the requested appearance,
    interactions and fidelity; include relevant accessibility and viewports.
-   Run focused developer checks while fixing observed gaps.
+   Run focused developer checks while fixing observed gaps. Run long builds and
+   tests under the shared
+   [long-command and lane rules](../delivery-wait/SKILL.md#long-commands-and-delegated-lanes);
+   ending a turn with a tracked pending command does not finish implementation.
 3. Apply `/code-review fix-all` and `/test-against-spec fix`. Review the actual
-   change against the agreed requirements; test observable behavior against
-   explicit specification sources. Use their direct documented equivalents if
-   unavailable. Reuse matching evidence without repeating already-covered work.
+   change against the agreed requirements and, rule by rule, against the
+   repository's binding guides, recording the review's
+   [binding-guide ledger](../code-review/SKILL.md#binding-guides); test
+   observable behavior against explicit specification sources. Use their
+   direct documented equivalents if unavailable. Reuse matching evidence
+   without repeating already-covered work.
 4. Repair every verified requirement gap, including visual or behavioral fidelity,
-   regardless of a finding's severity. Optional improvements outside the agreed
-   outcome do not become requirements. Any edit invalidates affected evidence:
-   repeat the necessary review, inspection and behavior checks until they agree
+   regardless of a finding's severity, and every instance of a broken guide
+   rule. Optional improvements outside the agreed outcome do not become
+   requirements. Any edit invalidates affected evidence, including the ledger
+   rows for what it touches: repeat the necessary review, inspection and behavior checks until they agree
    on the unchanged result. Own the final applicable Definition of Done and
    project gate; run only its missing or invalidated checks.
 
 Continue safe in-scope repair; reconsider an approach that is not advancing
 acceptance. If required behavior needs an unavailable exact-revision preview,
 return the specific publication need to the active delivery or PR caller, which
-owns that operation and resumes testing afterward. A standalone implementation
-asks only for the missing authority or environment.
+owns that operation and resumes testing afterward.
 
 ## Finish
 
-Finish when every verified requirement gap is resolved and applicable gates
+Finish when every verified requirement gap is resolved, the binding-guide
+ledger covers the final diff with no broken rule left, and applicable gates
 pass; unrelated improvements do not extend the task. Return the implemented
-result and observed requirement evidence to the caller. Report unresolved
-required behavior as incomplete; never waive it because its finding is low
+result, observed requirement evidence, the ledger and any route that replaced
+a failed source to the caller, or continue under the
+[delivery settings](../deliver/SKILL.md#delivery-settings) when started
+directly. Report unresolved required behavior as incomplete; never waive it because its finding is low
 severity.

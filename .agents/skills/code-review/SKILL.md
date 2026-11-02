@@ -6,8 +6,9 @@ description: >-
   changes, a diff, a branch, or a PR, or to recheck earlier review findings.
 license: Unlicense OR MIT
 compatibility: >-
-  Requires git, the project's declared build and test tools, and network access
-  when pull-request context or current third-party documentation is relevant.
+  Requires git, Python 3.11 or newer, the project's declared build and test
+  tools, and network access when pull-request context or current third-party
+  documentation is relevant.
 metadata:
   agents-role: entry-point
   agents-text: Review a PR, branch, or worktree for evidence-backed findings.
@@ -42,8 +43,9 @@ Remediation is independent of the operation:
   findings.
 - Fix modes authorize local edits and validation, not commits, pushes, PR
   comments, review-thread changes, deployments, publication, or shared-state
-  mutation. Stop remediation for a material product, architecture, security,
-  compatibility, or scope decision.
+  mutation. Stop remediation for a
+  [material](../software-engineering-excellence/SKILL.md#blockers-and-decisions)
+  product, architecture, security, compatibility, or scope decision.
 - A request to save JSON authorizes only the named findings artifact; it does
   not authorize remediation.
 - Exact file lists and prior-findings JSON are additive inputs. They do not
@@ -116,12 +118,14 @@ follows the prior-findings reference instead.
    then verify that the bounded diff can be computed and is non-empty. Stop
    before review when either revision is unavailable, the boundary is ambiguous,
    or the change is empty or unrelated.
-4. Include committed, staged, unstaged, and relevant untracked work. Separate
+4. List and read the repository's binding guides for the bounded change, and
+   start the [binding-guide ledger](#binding-guides) from them.
+5. Include committed, staged, unstaged, and relevant untracked work. Separate
    dirty-worktree findings from committed-change findings.
-5. Establish the claim from the issue, PR, confirmed mini-spec, required
+6. Establish the claim from the issue, PR, confirmed mini-spec, required
    behavior, and commits. If none exists, reconstruct the narrowest supported
    claim from the change and label it as inferred.
-6. Activate de-duplication, claim and specification, and engineering quality for
+7. Activate de-duplication, claim and specification, and engineering quality for
    every fresh review. Activate discoverability only for changes to public pages,
    routing, metadata, crawl controls, structured data, public content, or
    web-performance behavior. Within engineering quality, cover correctness,
@@ -129,7 +133,7 @@ follows the prior-findings reference instead.
    add UI/accessibility, trust boundaries, persistence/migrations, concurrency,
    compatibility, deployment/rollback, observability, or performance only when
    the change touches those concerns.
-7. Measure churn for every changed file in the finding scope and, where history
+8. Measure churn for every changed file in the finding scope and, where history
    can identify it reliably, each changed function, method, class, or module.
    Follow renames, state the history window, and record touch count and line
    churn. Use the repository's declared churn window or 90 days when none
@@ -155,11 +159,46 @@ Apply these requirements across the mapped finding scope.
   migration, packaging, or deployment path.
 - Record setup, action or command, input, expected result, and observed result.
   Credit returned results or matching stored evidence; a request, acknowledgment,
-  or expected outcome is not an observed result. Mark missing results
-  `unverified` and source-only conclusions `static only`.
+  or expected outcome is not an observed result. Re-run a check that returned
+  no result; mark a result that cannot be obtained `unverified` and source-only
+  conclusions `static only`.
 - Verify that changed tests fail for the relevant wrong behavior and assert
   outcomes rather than implementation details. Do not credit brittle,
   over-mocked, incidental, or snapshot-heavy coverage.
+
+## Binding guides
+
+A binding guide is a repository document whose rules a change must follow: the
+`AGENTS.md` and `CLAUDE.md` files that govern each changed path, the
+contribution guide, and the testing, code-style, comment, writing and pull
+request guides they point to. List them with
+`python3 "$SKILL_DIR/scripts/binding_guides.py" --base FIXED_POINT`, where
+`SKILL_DIR` is this skill's directory, from the checkout under review. It
+prints each guide with the changed paths it governs or the lines that link to
+it, following links one level from the instruction files and the contribution
+guide; pass `--depth 2` when a listed guide only indexes the guides that hold
+rules. Exit 2 means Git could not answer: fix the cause it names and rerun.
+With `no binding guides found`, record that and review against the project
+instructions you found.
+
+Open every listed guide, then record the binding-guide ledger: one row per rule
+the change could break, giving the guide and section, the rule in a few words
+and its result. The result is `followed`, `not applicable` with the reason, or
+every `file:line` that breaks the rule. A section whose subject the change does
+not touch is one `not applicable` row.
+
+- Check each rule against the complete finding scope, not a sample. When one
+  location breaks a rule, search the whole diff for the same rule before you
+  record the row, and report every instance in one finding with the guide's
+  text as its evidence. This holds as well when a person, a reviewer or a check
+  flagged the first instance.
+- Rules for commit messages and pull request titles and bodies get rows marked
+  `for publication`; the
+  [publication guard](../git-workflow/SKILL.md#publication-guard) step checks
+  each message, title and body against them before it is written.
+
+The ledger is part of the review result: callers return it with their evidence
+and renew the rows an edit touches.
 
 ## Review axes
 
@@ -228,7 +267,13 @@ the map's term and describe your own role there as the `coordinator`. A short
 report may compress wording but keeps every applicable field below.
 
 For a fresh review, lead with the verdict: `APPROVE`,
-`APPROVE WITH IMPROVEMENTS`, or `REQUEST CHANGES`.
+`APPROVE WITH IMPROVEMENTS`, or `REQUEST CHANGES`. The report ends this
+skill's step. Started directly, continue under the
+[delivery settings](../deliver/SKILL.md#delivery-settings); with
+`entry-points: deliver`, the reviewed change and its validated findings go on
+to `/deliver`, which fixes the findings, verifies and publishes the change up to
+the configured endpoint (`ready-to-merge` when there is no `ORCHESTRATION.md`).
+With `stop`, end with this report.
 
 Include:
 
@@ -240,6 +285,8 @@ Include:
   lane's `complete` or `incomplete` status, worker candidates the coordinator
   filtered out with the reason (listed apart from findings), and every
   coordinator-completed fallback with its reason, or that none was needed;
+- the binding guides listed and the binding-guide ledger, or that none was
+  found;
 - the churn window, symbol/file coverage, and architectural-risk hotspots;
 - exact probes and checks with observed results;
 - de-duplication coverage, coalesced evidence sources, and merged or conflicted
@@ -259,7 +306,10 @@ names the mechanism the repository documents, not a generic one. Check the
 project's git workflow first: where it forbids rebasing an ordinary branch,
 write "merge the base branch in", and reserve stack commands for branches in a
 confirmed stack. The same applies to review comments and pull request text
-posted from the report.
+posted from the report. When a caller has the review result recorded on a
+pull request, record it where
+[PR descriptions](../agent-writing/references/pr-descriptions.md#review-and-status-results)
+directs.
 
 `BLOCKING` prevents safe shipment. `IMPORTANT` has material correctness,
 security, operability, test-value, maintainability, simplification, or
