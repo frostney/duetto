@@ -30,7 +30,8 @@ mutation.
 
 - The caller remains thin and pins an immutable reusable-workflow revision.
 - `.agents/skills` and `skills-lock.json` changed only through the pinned skills
-  CLI or the workflow's opt-in deterministic hash normalization.
+  CLI or the workflow's opt-in deterministic hash normalization, and the report
+  states whether the regenerated payloads and lock hashes reconcile.
 - Inventory membership changes have source evidence and were reviewed as a
   migration.
 - The caller's workflow validation passes, and any resulting PR remains draft

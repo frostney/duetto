@@ -6,8 +6,10 @@ spawning any worker.
 ## Policy gate
 
 A valid file is authoritative for repository-owned routing rules, context
-envelopes, token checkpoints, monitoring requirements, and escalation policy.
-It may narrow the [capability tiers](#capability-tiers) but never widen them.
+envelopes, token checkpoints, monitoring requirements, such as an optional
+default-branch staleness bound that `git-workflow`'s
+[default-branch health](../../git-workflow/SKILL.md#declared-staleness-bound)
+gate applies, and escalation policy. It may narrow the [capability tiers](#capability-tiers) but never widen them.
 Unlike the `escalate` usage-limit intervention below, the tier escalation rule
 under Capability tiers is not repository-owned: no repository rule may resume a
 lane that stopped, or raise its tier in place. The file must use host-neutral
@@ -50,12 +52,16 @@ than silently overriding it or asking the same question again.
 
 Default independent workers to the host equivalent of no inherited conversation
 history. A packet contains only applicable decision IDs and selected contracts,
-issue or PR identity, branch and exact head, owned scope, dependencies,
-requirements, applicable gates, capability tier, context envelope, and
-the required structured transition output. Include a small recent-turn slice
-only when immediately relevant. Full-history inheritance requires a recorded,
-scoped exception. Publication and merge in a packet follow the delegation rule
-in [deliver](../../deliver/SKILL.md).
+issue or PR identity, branch and exact head, owned scope, who repairs what the
+lane's change breaks outside that scope, dependencies, requirements, applicable
+gates, capability tier, context envelope, and the required structured transition
+output. Include a small recent-turn slice only when immediately relevant.
+Full-history inheritance requires a recorded, scoped exception. Publication and
+merge in a packet follow the delegation rule in
+[deliver](../../deliver/SKILL.md). When a lane hands back, settle its result as
+[Coordinating
+deliverables](../../software-engineering-excellence/SKILL.md#coordinating-deliverables)
+describes before integrating it.
 
 Before starting a worker, identify its actual model from host metadata. Deliver
 the applicable role, scope, authority, completion condition, and required skill
@@ -124,4 +130,9 @@ state; use an exact known timestamp for time-based wakes. If the host cannot
 passively await the command under
 [`delivery-wait`'s running rules](../../delivery-wait/SKILL.md#running-a-wait),
 report the capability as unsupported.
-Never substitute repeated model inferences for waiting.
+Apply the shared
+[long-command and lane rules](../../delivery-wait/SKILL.md#long-commands-and-delegated-lanes)
+to every worker packet, including who owns a pending command after its turn
+ends. When only waits remain, checkpoint and end the turn once each has a live
+wake; use the stated bounded-check fallback only when the host cannot notify. Never substitute
+repeated model inferences for waiting.
