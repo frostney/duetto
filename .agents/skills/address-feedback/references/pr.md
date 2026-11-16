@@ -147,7 +147,7 @@ it is no gate and its adapter posts no trigger.
    [delivery settings](../../deliver/SKILL.md#delivery-settings); with
    `entry-points: deliver`, the PR goes on to `/deliver` from its current head,
    which awaits that head's checks and review and takes the PR to the
-   configured endpoint (`ready-to-merge` when there is no `ORCHESTRATION.md`).
+   configured endpoint (its default when `ORCHESTRATION.md` sets none).
    With `stop`, end with the result contract.
    Never guess a timer, quota, provider policy, or retry count. If the host
    cannot passively await a command, return `pending` with that unsupported
