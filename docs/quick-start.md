@@ -3,7 +3,7 @@
 ## Executive Summary
 
 - Prerequisites: FPC 3.2.2, the lwpt **release binary** on PATH, Lefthook, and Docker for the Autobahn suite.
-- `lwpt install` resolves dependencies from the lwpt release tag, `lwpt build` compiles the programs, `lwpt test` runs the unit suites.
+- `lwpt install` resolves dependencies from the lwpt release tags `lwpt.toml` names, `lwpt build` compiles the programs, `lwpt test` runs the unit suites.
 - Every program builds on Linux, macOS, and Windows; the server rides the platform transport (epoll / Network.framework / IOCP).
 - `lefthook install` wires the pre-commit formatter hook.
 
