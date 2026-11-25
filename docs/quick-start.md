@@ -25,12 +25,13 @@ Then set up the project:
 
 ```bash
 git clone https://github.com/frostney/duetto.git && cd duetto
-lwpt install        # resolve deps from the lwpt release tag, write lwpt.cfg
+lwpt install        # resolve deps from lwpt release tags, write lwpt.cfg
 lefthook install    # pre-commit formatter hook
 ```
 
-The `httpclient`, `testing`, and `cli` dependencies resolve from the
-`frostney/lwpt` 0.2.0 release tag with include filters (see `lwpt.toml`);
+The `httpclient` dependency resolves from the `frostney/lwpt` 0.10.0
+release tag, and `testing` and `cli` from 0.2.0, with include filters
+(see `lwpt.toml`);
 no sibling checkout is needed. The committed `.lwpt/modules/` tree plus
 `lwpt.lock` make `lwpt install --frozen` work offline (CI mode).
 

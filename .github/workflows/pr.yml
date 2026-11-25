@@ -15,7 +15,7 @@ name: PR
 #
 # The lwpt toolchain comes from its published release (checksum-
 # verified tarball, no sibling checkout, no bootstrap); dependencies
-# resolve from the same release tag and are verified against the
+# resolve from the lwpt release tags lwpt.toml names and are verified against the
 # committed lockfile + .lwpt/modules tree via install --frozen.
 
 on:

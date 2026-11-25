@@ -79,8 +79,8 @@ committed toolchain binaries.
 
 ### Dependency layout note
 
-The `httpclient` / `testing` / `cli` deps are fetched from the
-`frostney/lwpt` release tag with `include = ["packages/<name>/**"]`
+The `httpclient` / `testing` / `cli` deps are fetched from
+`frostney/lwpt` release tags (httpclient 0.10.0, the others 0.2.0) with `include = ["packages/<name>/**"]`
 filters, which preserve the `packages/<name>/` prefix inside
 `.lwpt/modules/<name>/`. lwpt 0.2.0 discovers each dep's units through
 its nested manifest, so the project's own `units` array lists only
