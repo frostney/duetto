@@ -3,10 +3,10 @@ version = 3
 
 [package.httpclient]
 source = "frostney/lwpt"
-resolvedRef = "0.2.0"
-resolvedURL = "https://github.com/frostney/lwpt/archive/0.2.0.tar.gz"
-computedHash = "sha256:ed82f8c383dd4c4b9feb3c4075cfe6ce5803ea913d5ef82b212fbae0102d4c9f"
-archiveHash = "sha256:f0cfd07ec5e2bd5f68cb99311f7722ff16505278a141cd95205f7f879b6400d0"
+resolvedRef = "0.10.0"
+resolvedURL = "https://github.com/frostney/lwpt/archive/0.10.0.tar.gz"
+computedHash = "sha256:0680b8c122a8d084a913b80f2f1a330dda0f083528ecbe09d2c2bb240bdcd5de"
+archiveHash = "sha256:2dc423af91d2502b0aacc6fd70400511b01d060cd06160da43216790ec08b3d5"
 
 [package.testing]
 source = "frostney/lwpt"
