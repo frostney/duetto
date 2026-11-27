@@ -122,13 +122,17 @@ Network.framework and IOCP transports are self-contained. Server-side
   from the usual library paths. They ship with any current distribution's
   `openssl` / `libssl3` package; without them the TLS server context
   fails to build at startup.
-- **Windows (IOCP, x64 and win32).** Nothing extra — lwpt 0.7.0's server
+- **Windows (IOCP, x64 and win32).** Nothing extra — lwpt 0.10.0's server
   accept rides SChannel natively, so no OpenSSL DLLs are shipped, loaded,
   or searched for. One behavioural note: SChannel requires the PKCS#12
-  private key in a persisted CNG container, so lwpt imports it under the
-  running user's profile for the context's lifetime and deletes it on
-  release; a hard kill can leave one container behind in
-  `%APPDATA%\Microsoft\Crypto\Keys`.
+  private key in a persisted CNG container, so lwpt imports the bundle
+  under the running user's profile for the context's lifetime and deletes
+  what it imported on release. It also adds the bundle's intermediates to
+  the user's Intermediate Certification Authorities store, so SChannel
+  sends the full chain, and withdraws them on release. A hard kill can
+  leave a container per keyed certificate in the bundle behind in
+  `%APPDATA%\Microsoft\Crypto\Keys`, and those intermediates in the
+  user's store.
 - **macOS (Network.framework).** Nothing extra — TLS terminates inside
   the platform stack.
 
