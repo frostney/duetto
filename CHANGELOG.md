@@ -2,6 +2,24 @@
 
 All notable changes to duetto are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); entries are generated from Conventional Commits by git-cliff.
 
+## [0.7.0] - 2026-11-27
+
+### Bug Fixes
+
+- stop macOS serving connections before your handlers are set (#111)
+
+### Documentation
+
+- import AGENTS.md through a regular CLAUDE.md (#112)
+
+### Internal
+
+- take httpclient, testing and cli from lwpt 0.10.0 (#117)
+- refresh project Agent Skills (#109)
+- builds use lwpt 0.8.0 and its v4 lockfile (#110)
+- take the wsinterop battery out of analysis scope and lower the file ceilings (#105)
+- add grilling, domain-modeling and codebase-design (#96)
+
 ## [0.6.0] - 2026-10-04
 
 ### Bug Fixes
