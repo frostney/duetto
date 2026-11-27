@@ -5,9 +5,13 @@
   subcommands (install, build, test, format, repair, init, run),
   each with its own option set. This unit is the generalisation: a
   registry of named subcommands, each carrying a handler and its own
-  TOptionArray. Run reads argv[1] as the subcommand name, then hands
-  argv[2..] to that subcommand's options via the existing
-  ParseCommandLine.
+  TOptionArray. Run reads the first argument as the subcommand name, then
+  hands the rest to that subcommand's options via CLI.Parser.
+
+  The registry carries no host's identity or policy. A host sets its own
+  description, top-level flags such as `--version`, usage-error exit code
+  and bare-invocation behaviour, and opts individual subcommands in to
+  subcommand aliasing or argument pass-through.
 
   Lives under the CLI namespace (no LWPT prefix) so it can graduate
   into a standalone package alongside CLI.Options / CLI.Parser /
@@ -25,11 +29,25 @@ uses
 
   CLI.Options;
 
+const
+  { The exit code of a usage error unless the host sets another one: the
+    code a failing handler conventionally returns. }
+  DEFAULT_USAGE_EXIT_CODE = 1;
+
 type
   { A subcommand handler receives the positional args (after the subcommand
     name) and its already-parsed option objects. Returns a process exit code. }
   TSubcommandHandler = function(const APositionals: TStringList;
     const AOptions: TOptionArray): Integer;
+
+  { A top-level flag handler runs instead of a command. Returns a process
+    exit code. }
+  TTopLevelFlagHandler = function: Integer;
+
+  { What Run does when the program is given no arguments at all. }
+  TBareInvocation = (
+    biShowHelp,     { top-level help on standard output, exit code 0 }
+    biUsageError);  { a usage error, reported like an unknown command }
 
   { Neutral dispatch metadata for hosts that need completion reporting.
     The CLI package owns measurement and resolved command identity; the host
@@ -56,26 +74,88 @@ type
   end;
 
   TSubcommand = class
+  private
+    { Length of the shared-flag usage that leads UsageArg (PassThrough). }
+    FSharedUsageLength : Integer;
   public
     Name     : string;
     Summary  : string;            { one-line description for top-level help }
     UsageArg : string;            { e.g. '[--offline]' shown after the name }
     Handler  : TSubcommandHandler;
     Options  : TOptionArray;
+    { When True, `<program> <Name> <subcommand> [arguments]` dispatches
+      <subcommand> with those arguments instead of this command. Only the
+      argument directly after <Name> is looked up, so an option or `--`
+      in that place keeps the line with this command. }
+    AliasesSubcommands : Boolean;
+    { When True, option parsing stops at the first positional: that
+      argument and everything after it reach the handler untouched,
+      including `--`, `--help`, `help` and options this command does not
+      define. For a command that launches another program. Its own options
+      and `--help` / `-h` are read before the first positional only. Set it
+      before the command is added to a registry. }
+    PassThrough : Boolean;
     constructor Create(const AName, ASummary, AUsageArg: string;
       AHandler: TSubcommandHandler; const AOptions: TOptionArray);
+  end;
+
+  { A flag the program accepts in place of a command, such as `--version`.
+    It is matched against the first argument only, the way the built-in
+    `--help` is; later arguments are ignored unless the registry sets
+    StrictTopLevelFlags. Set its fields before it is added to a registry,
+    which checks them once, on registration. }
+  TTopLevelFlag = class
+  public
+    { Both names are given without their leading dashes. }
+    LongName  : string;   { matched as --<LongName>, case-sensitively }
+    ShortName : string;   { matched as -<ShortName> when not empty }
+    { When True, <LongName> without dashes matches too, in any letter
+      case, the way the built-in `help` word does. }
+    BareWord  : Boolean;
+    HelpText  : string;   { listed in top-level help; empty hides the flag }
+    Handler   : TTopLevelFlagHandler;
+    constructor Create(const ALongName, AHelpText: string;
+      const AHandler: TTopLevelFlagHandler);
   end;
 
   TSubcommandRegistry = class
   private
     FItems : array of TSubcommand;
     FSharedFlags : array of TSubcommandSharedFlag;
+    FTopLevelFlags : array of TTopLevelFlag;
+    FDescription : string;
+    FUsageExitCode : Integer;
+    FUsageHelpToStandardError : Boolean;
+    FBareInvocation : TBareInvocation;
+    FStrictSingleDash : Boolean;
+    FStrictTopLevelFlags : Boolean;
+    FExactCommandNames : Boolean;
     FOnCommandCompleted : TSubcommandCompletionHandler;
     FOnCommandPrepared : TSubcommandPreparedHandler;
+    function FindTopLevelFlag(const AArgument: string): TTopLevelFlag;
+    function FindCommand(const AName: string;
+      const AExact: Boolean): TSubcommand;
+    function CommandName(const AArgument: string): string;
+    function ReportUsageError(const AProgramName, AMessage: string): Integer;
   public
+    constructor Create;
     destructor Destroy; override;
     procedure AddSharedFlag(const ALongName, AHelpText: string);
     procedure Add(ASub: TSubcommand);
+    { Registers a top-level flag and takes ownership of it. Raises
+      EArgumentException, leaving the registry unchanged and the flag with
+      its caller, for an empty name, a name or short name that begins with
+      a dash, a missing handler, a spelling the built-in help uses, a name
+      or short name that is already registered, and a bare word that is
+      also a subcommand name. }
+    procedure AddTopLevelFlag(const AFlag: TTopLevelFlag);
+    { Read iteration over the top-level flags, in registration order: the
+      part of the command surface that Count and Item do not cover. }
+    function TopLevelFlagCount: Integer;
+    function TopLevelFlagItem(const AIndex: Integer): TTopLevelFlag;
+    { The subcommand named AName, or nil. Find uses Run's letter-case rule
+      for command names: ASCII letters match in any case, or only in the
+      registered case under ExactCommandNames. }
     function Find(const AName: string): TSubcommand;
     { Read iteration over the registered subcommands, in registration
       order. The registry is the single source of truth for the
@@ -84,11 +164,66 @@ type
       host program) iterate it rather than keeping their own list. }
     function Count: Integer;
     function Item(AIndex: Integer): TSubcommand;
-    procedure PrintTopLevelHelp(const AProgramName: string);
+    procedure PrintTopLevelHelp(const AProgramName: string); overload;
+    procedure PrintTopLevelHelp(var AOutput: Text;
+      const AProgramName: string); overload;
     procedure PrintSubcommandHelp(const AProgramName: string;
       ASub: TSubcommand);
-    { Run argv. Returns the process exit code. }
-    function Run(const AProgramName: string): Integer;
+    { Run the process's own arguments. Returns the process exit code. }
+    function Run(const AProgramName: string): Integer; overload;
+    { Run AArguments, the arguments after the program name. Reads nothing
+      from the process's own command line. A dispatch applies options to
+      the registered option objects, which keep that state: a second Run
+      on the same registry starts from what the first one applied. }
+    function Run(const AProgramName: string;
+      const AArguments: array of string): Integer; overload;
+    { Printed after the program name at the head of top-level help. When
+      empty, that line is left out. }
+    property Description: string read FDescription write FDescription;
+    { Returned for a usage error: an unknown command, an option or value
+      the parser rejects, a rejected preparation, a bare invocation under
+      biUsageError, and an argument after a top-level flag or the top-level
+      help under StrictTopLevelFlags. A host that needs to tell a usage error from a
+      failing handler sets a code its handlers do not return,
+      conventionally 2. }
+    property UsageExitCode: Integer read FUsageExitCode write FUsageExitCode;
+    { When True, the top-level help that follows a usage error the
+      registry reports itself (an unknown or missing command, or an
+      argument after a top-level flag under StrictTopLevelFlags) goes to
+      standard error with the message, and standard output stays empty.
+      When False it goes to standard output. }
+    property UsageHelpToStandardError: Boolean
+      read FUsageHelpToStandardError write FUsageHelpToStandardError;
+    property BareInvocation: TBareInvocation
+      read FBareInvocation write FBareInvocation;
+    { When True, a single-dash argument read as an option that is neither a
+      declared short option nor an opted-in attached short value is a usage
+      error (`Unknown option: -verify`), whatever its length, instead of a
+      positional. A negative number (`-5`, `-1.5`), a lone `-`, a value an
+      option takes, everything after `--`, and everything from a
+      pass-through command's first positional on are unaffected. False by
+      default. }
+    property StrictSingleDash: Boolean
+      read FStrictSingleDash write FStrictSingleDash;
+    { When True, a top-level flag or the built-in top-level help (`help`,
+      `--help`, `-h`) must be the only argument: any argument after it is a
+      usage error (`unexpected argument after --version: extra`), and the
+      flag's handler does not run. False by default: arguments after them
+      are ignored. }
+    property StrictTopLevelFlags: Boolean
+      read FStrictTopLevelFlags write FStrictTopLevelFlags;
+    { When True, a command name, and the subcommand name an aliasing
+      command looks up, match only in the letter case it was registered
+      in: `BUILD` is an unknown command, reported as typed, rather than
+      `build`. Find follows the same rule. The built-in help (`help`,
+      `--help` and `-h` as the first argument, the `help` word after a
+      command) and a top-level flag's bare word still match in any letter
+      case, and registration still refuses a bare word that differs from a
+      subcommand name only in letter case. False by default: ASCII letters
+      in a command name match in any case, and an unknown name is reported
+      with them lowercased. }
+    property ExactCommandNames: Boolean
+      read FExactCommandNames write FExactCommandNames;
     property OnCommandCompleted: TSubcommandCompletionHandler
       read FOnCommandCompleted write FOnCommandCompleted;
     property OnCommandPrepared: TSubcommandPreparedHandler
@@ -100,6 +235,12 @@ implementation
 uses
   CLI.Parser;
 
+const
+  HELP_WORD = 'help';
+  HELP_SHORT_NAME = 'h';
+  HELP_LONG_FLAG = '--' + HELP_WORD;
+  HELP_SHORT_FLAG = '-' + HELP_SHORT_NAME;
+
 constructor TSubcommand.Create(const AName, ASummary, AUsageArg: string;
   AHandler: TSubcommandHandler; const AOptions: TOptionArray);
 begin
@@ -108,6 +249,54 @@ begin
   UsageArg := AUsageArg;
   Handler  := AHandler;
   Options  := AOptions;
+end;
+
+constructor TTopLevelFlag.Create(const ALongName, AHelpText: string;
+  const AHandler: TTopLevelFlagHandler);
+begin
+  LongName := ALongName;
+  HelpText := AHelpText;
+  Handler  := AHandler;
+end;
+
+{ Gives ASub its own instance of a shared flag and shows it in the usage
+  line: after the command's own usage, or ahead of it for a pass-through
+  command, which reads options before its first positional only. }
+procedure AttachSharedFlag(const ASub: TSubcommand;
+  const AFlag: TSubcommandSharedFlag);
+var
+  OptionIndex: Integer;
+  Usage: string;
+begin
+  OptionIndex := Length(ASub.Options);
+  SetLength(ASub.Options, OptionIndex + 1);
+  ASub.Options[OptionIndex] := TFlagOption.Create(AFlag.LongName,
+    AFlag.HelpText);
+  Usage := '[--' + AFlag.LongName + ']';
+  if not ASub.PassThrough then
+  begin
+    if ASub.UsageArg <> '' then ASub.UsageArg := ASub.UsageArg + ' ';
+    ASub.UsageArg := ASub.UsageArg + Usage;
+  end
+  else if ASub.FSharedUsageLength = 0 then
+  begin
+    if ASub.UsageArg <> '' then ASub.UsageArg := ' ' + ASub.UsageArg;
+    ASub.UsageArg := Usage + ASub.UsageArg;
+    ASub.FSharedUsageLength := Length(Usage);
+  end
+  else
+  begin
+    { Later shared flags follow the earlier ones, in registration order. }
+    Usage := ' ' + Usage;
+    Insert(Usage, ASub.UsageArg, ASub.FSharedUsageLength + 1);
+    Inc(ASub.FSharedUsageLength, Length(Usage));
+  end;
+end;
+
+constructor TSubcommandRegistry.Create;
+begin
+  inherited Create;
+  FUsageExitCode := DEFAULT_USAGE_EXIT_CODE;
 end;
 
 destructor TSubcommandRegistry.Destroy;
@@ -119,15 +308,22 @@ begin
       FItems[i].Options[j].Free;
     FItems[i].Free;
   end;
+  for i := 0 to High(FTopLevelFlags) do
+    FTopLevelFlags[i].Free;
   inherited Destroy;
 end;
 
 procedure TSubcommandRegistry.Add(ASub: TSubcommand);
 var
-  ExistingOptionIndex, FlagIndex, OptionIndex: Integer;
+  ExistingOptionIndex, FlagIndex: Integer;
 begin
   { Check the complete command surface before appending any shared option so a
     rejected command remains untouched and owned by its caller. }
+  for FlagIndex := 0 to High(FTopLevelFlags) do
+    if FTopLevelFlags[FlagIndex].BareWord
+       and SameText(FTopLevelFlags[FlagIndex].LongName, ASub.Name) then
+      raise EArgumentException.CreateFmt(
+        'subcommand %s has the name of a top-level flag word', [ASub.Name]);
   for FlagIndex := 0 to High(FSharedFlags) do
     for ExistingOptionIndex := 0 to High(ASub.Options) do
       if SameText(ASub.Options[ExistingOptionIndex].LongName,
@@ -137,15 +333,7 @@ begin
           [ASub.Name, FSharedFlags[FlagIndex].LongName]);
 
   for FlagIndex := 0 to High(FSharedFlags) do
-  begin
-    OptionIndex := Length(ASub.Options);
-    SetLength(ASub.Options, OptionIndex + 1);
-    ASub.Options[OptionIndex] := TFlagOption.Create(
-      FSharedFlags[FlagIndex].LongName, FSharedFlags[FlagIndex].HelpText);
-    if ASub.UsageArg <> '' then ASub.UsageArg := ASub.UsageArg + ' ';
-    ASub.UsageArg := ASub.UsageArg + '[--'
-      + FSharedFlags[FlagIndex].LongName + ']';
-  end;
+    AttachSharedFlag(ASub, FSharedFlags[FlagIndex]);
   SetLength(FItems, Length(FItems) + 1);
   FItems[High(FItems)] := ASub;
 end;
@@ -178,25 +366,104 @@ begin
   FSharedFlags[FlagIndex].HelpText := AHelpText;
 
   for ItemIndex := 0 to High(FItems) do
-  begin
-    OptionIndex := Length(FItems[ItemIndex].Options);
-    SetLength(FItems[ItemIndex].Options, OptionIndex + 1);
-    FItems[ItemIndex].Options[OptionIndex] := TFlagOption.Create(
-      ALongName, AHelpText);
-    if FItems[ItemIndex].UsageArg <> '' then
-      FItems[ItemIndex].UsageArg := FItems[ItemIndex].UsageArg + ' ';
-    FItems[ItemIndex].UsageArg := FItems[ItemIndex].UsageArg
-      + '[--' + ALongName + ']';
-  end;
+    AttachSharedFlag(FItems[ItemIndex], FSharedFlags[FlagIndex]);
 end;
 
-function TSubcommandRegistry.Find(const AName: string): TSubcommand;
+procedure TSubcommandRegistry.AddTopLevelFlag(const AFlag: TTopLevelFlag);
+var
+  FlagIndex: Integer;
+begin
+  if AFlag.LongName = '' then
+    raise EArgumentException.Create('top-level flag name cannot be empty');
+  { A name given with its dashes would never match what the user types. }
+  if AFlag.LongName[1] = '-' then
+    raise EArgumentException.CreateFmt(
+      'top-level flag name "%s" must be given without its leading dashes',
+      [AFlag.LongName]);
+  if (AFlag.ShortName <> '') and (AFlag.ShortName[1] = '-') then
+    raise EArgumentException.CreateFmt(
+      'top-level flag short name "%s" must be given without its leading dash',
+      [AFlag.ShortName]);
+  if not Assigned(AFlag.Handler) then
+    raise EArgumentException.CreateFmt(
+      'top-level flag --%s has no handler', [AFlag.LongName]);
+  { Help is matched in any letter case, so it owns every case of both. }
+  if SameText(AFlag.LongName, HELP_WORD)
+     or SameText(AFlag.ShortName, HELP_SHORT_NAME) then
+    raise EArgumentException.CreateFmt(
+      'top-level flag --%s uses a spelling reserved for help',
+      [AFlag.LongName]);
+  for FlagIndex := 0 to High(FTopLevelFlags) do
+    if SameText(FTopLevelFlags[FlagIndex].LongName, AFlag.LongName)
+       or ((AFlag.ShortName <> '')
+         and (FTopLevelFlags[FlagIndex].ShortName = AFlag.ShortName)) then
+      raise EArgumentException.CreateFmt(
+        'top-level flag --%s is already registered', [AFlag.LongName]);
+  { A bare word matches in any letter case, so it may not differ from a
+    subcommand name in letter case only, whatever ExactCommandNames is. }
+  if AFlag.BareWord and (FindCommand(AFlag.LongName, False) <> nil) then
+    raise EArgumentException.CreateFmt(
+      'top-level flag word %s is already a subcommand', [AFlag.LongName]);
+
+  SetLength(FTopLevelFlags, Length(FTopLevelFlags) + 1);
+  FTopLevelFlags[High(FTopLevelFlags)] := AFlag;
+end;
+
+function TSubcommandRegistry.TopLevelFlagCount: Integer;
+begin
+  Result := Length(FTopLevelFlags);
+end;
+
+function TSubcommandRegistry.TopLevelFlagItem(
+  const AIndex: Integer): TTopLevelFlag;
+begin
+  if (AIndex < 0) or (AIndex > High(FTopLevelFlags)) then
+    raise EArgumentOutOfRangeException.CreateFmt(
+      'top-level flag index %d out of range 0..%d',
+      [AIndex, High(FTopLevelFlags)]);
+  Result := FTopLevelFlags[AIndex];
+end;
+
+function TSubcommandRegistry.FindTopLevelFlag(
+  const AArgument: string): TTopLevelFlag;
+var
+  FlagIndex: Integer;
+begin
+  for FlagIndex := 0 to High(FTopLevelFlags) do
+  begin
+    Result := FTopLevelFlags[FlagIndex];
+    if (AArgument = '--' + Result.LongName)
+       or ((Result.ShortName <> '') and (AArgument = '-' + Result.ShortName))
+       or (Result.BareWord and SameText(AArgument, Result.LongName)) then
+      Exit;
+  end;
+  Result := nil;
+end;
+
+function TSubcommandRegistry.FindCommand(const AName: string;
+  const AExact: Boolean): TSubcommand;
 var i: Integer;
 begin
   Result := nil;
   for i := 0 to High(FItems) do
-    if SameText(FItems[i].Name, AName) then
+    if (AExact and (FItems[i].Name = AName))
+       or ((not AExact) and SameText(FItems[i].Name, AName)) then
       Exit(FItems[i]);
+end;
+
+function TSubcommandRegistry.Find(const AName: string): TSubcommand;
+begin
+  Result := FindCommand(AName, FExactCommandNames);
+end;
+
+{ The command name Run looks up and reports for AArgument: as typed under
+  ExactCommandNames, lowercased otherwise. }
+function TSubcommandRegistry.CommandName(const AArgument: string): string;
+begin
+  if FExactCommandNames then
+    Result := AArgument
+  else
+    Result := LowerCase(AArgument);
 end;
 
 function TSubcommandRegistry.Count: Integer;
@@ -215,25 +482,77 @@ begin
   Result := FItems[AIndex];
 end;
 
-procedure TSubcommandRegistry.PrintTopLevelHelp(const AProgramName: string);
-var i: Integer;
+{ Writes an `options:` section: each name padded to the widest one, then
+  its help text. Top-level help and subcommand help share it, so the two
+  sections cannot drift apart. }
+procedure WriteOptionRows(var AOutput: Text;
+  const ANames, AHelpTexts: array of string);
+var
+  i, MaxWidth, W: Integer;
 begin
-  WriteLn(AProgramName, ' — lightweight Pascal toolkit');
-  WriteLn;
-  WriteLn('usage: ', AProgramName, ' <command> [options]');
-  WriteLn;
-  WriteLn('commands:');
+  MaxWidth := 0;
+  for i := 0 to High(ANames) do
+    if Length(ANames[i]) > MaxWidth then MaxWidth := Length(ANames[i]);
+
+  WriteLn(AOutput);
+  WriteLn(AOutput, 'options:');
+  for i := 0 to High(ANames) do
+  begin
+    Write(AOutput, '  ', ANames[i]);
+    for W := Length(ANames[i]) to MaxWidth do Write(AOutput, ' ');
+    WriteLn(AOutput, '  ', AHelpTexts[i]);
+  end;
+end;
+
+procedure TSubcommandRegistry.PrintTopLevelHelp(const AProgramName: string);
+begin
+  PrintTopLevelHelp(Output, AProgramName);
+end;
+
+procedure TSubcommandRegistry.PrintTopLevelHelp(var AOutput: Text;
+  const AProgramName: string);
+var
+  i, Listed: Integer;
+  Names, HelpTexts: array of string;
+begin
+  if FDescription <> '' then
+  begin
+    WriteLn(AOutput, AProgramName, ' — ', FDescription);
+    WriteLn(AOutput);
+  end;
+  WriteLn(AOutput, 'usage: ', AProgramName, ' <command> [options]');
+  WriteLn(AOutput);
+  WriteLn(AOutput, 'commands:');
   for i := 0 to High(FItems) do
-    WriteLn('  ', FItems[i].Name:10, '  ', FItems[i].Summary);
-  WriteLn;
-  WriteLn('run "', AProgramName, ' <command> --help" for command options');
+    WriteLn(AOutput, '  ', FItems[i].Name:10, '  ', FItems[i].Summary);
+
+  { A flag without help text is accepted but not listed. }
+  SetLength(Names, Length(FTopLevelFlags));
+  SetLength(HelpTexts, Length(FTopLevelFlags));
+  Listed := 0;
+  for i := 0 to High(FTopLevelFlags) do
+    if FTopLevelFlags[i].HelpText <> '' then
+    begin
+      Names[Listed] := FormatHelpLabel(FTopLevelFlags[i].ShortName,
+        '--' + FTopLevelFlags[i].LongName);
+      HelpTexts[Listed] := FTopLevelFlags[i].HelpText;
+      Inc(Listed);
+    end;
+  SetLength(Names, Listed);
+  SetLength(HelpTexts, Listed);
+  if Listed > 0 then
+    WriteOptionRows(AOutput, Names, HelpTexts);
+
+  WriteLn(AOutput);
+  WriteLn(AOutput, 'run "', AProgramName,
+    ' <command> --help" for command options');
 end;
 
 procedure TSubcommandRegistry.PrintSubcommandHelp(const AProgramName: string;
   ASub: TSubcommand);
 var
-  i, MaxOptWidth, W: Integer;
-  OptName: string;
+  i: Integer;
+  Names, HelpTexts: array of string;
 begin
   WriteLn(AProgramName, ' ', ASub.Name, ' — ', ASub.Summary);
   WriteLn;
@@ -242,126 +561,158 @@ begin
     Write(' ', ASub.UsageArg);
   WriteLn;
 
-  if Length(ASub.Options) = 0 then Exit;
+  if Length(ASub.Options) > 0 then
+  begin
+    { HelpLabel (see CLI.Options) shows the short name and value shape:
+      -o, --name=<value>. }
+    SetLength(Names, Length(ASub.Options));
+    SetLength(HelpTexts, Length(ASub.Options));
+    for i := 0 to High(ASub.Options) do
+    begin
+      Names[i] := ASub.Options[i].HelpLabel;
+      HelpTexts[i] := ASub.Options[i].HelpText;
+    end;
+    WriteOptionRows(Output, Names, HelpTexts);
+  end;
 
   WriteLn;
-  WriteLn('options:');
-
-  { compute max option-token width for aligned descriptions.
-    FormatForHelp (not the bare long name) so valued options show
-    their value shape (--name=<value>, --name=<N>, --name=a|b) and
-    every surface rendered from the registry — this help text and the
-    host program's agents block — stays identical by construction. }
-  MaxOptWidth := 0;
-  for i := 0 to High(ASub.Options) do
-  begin
-    W := Length(ASub.Options[i].FormatForHelp);
-    if W > MaxOptWidth then MaxOptWidth := W;
-  end;
-
-  for i := 0 to High(ASub.Options) do
-  begin
-    OptName := ASub.Options[i].FormatForHelp;
-    Write('  ', OptName);
-    for W := Length(OptName) to MaxOptWidth do Write(' ');
-    WriteLn('  ', ASub.Options[i].HelpText);
-  end;
+  WriteLn('run "', AProgramName, ' --help" to see all commands');
 end;
 
-{ Walk the real argv (positions 2..) looking for --help / -h / help.
-  Done as a separate scan because ParseCommandLine would reject --help
-  as "Unknown option" before we can intercept it. }
-function WantsHelp: Boolean;
-var i: Integer; A: string;
+{ Whether AArguments, the arguments after the command name, ask for the
+  help of ASub. Checked before parsing, which would reject --help as an
+  unknown option. Any argument that spells --help, -h or the word `help`
+  asks for it, up to the end-of-options marker. A pass-through command
+  reads only --help and -h, and only before its first positional: from
+  there on every argument belongs to the program it launches. Both read
+  the arguments the way the parser does, so a value that a valued option
+  takes (`-o help`, a `--` after `-o`) is neither a help request nor the
+  end of options. }
+function HelpRequested(const ASub: TSubcommand;
+  const AArguments: array of string;
+  const AStrictSingleDash: Boolean): Boolean;
 begin
-  for i := 2 to ParamCount do
+  if ASub.PassThrough then
+    Result := LeadingFlagGiven(AArguments, ASub.Options, HELP_WORD,
+      HELP_SHORT_NAME, AStrictSingleDash)
+  else
+    Result := FlagGiven(AArguments, ASub.Options, HELP_WORD,
+      HELP_SHORT_NAME, HELP_WORD);
+end;
+
+{ A usage error of the whole line (an unknown or missing command, or an
+  argument after a top-level flag under StrictTopLevelFlags): the message
+  on standard error, then the top-level help on the stream the host
+  chose. On standard error a blank
+  line sets the help apart from the message. }
+function TSubcommandRegistry.ReportUsageError(
+  const AProgramName, AMessage: string): Integer;
+begin
+  WriteLn(ErrOutput, AMessage);
+  if FUsageHelpToStandardError then
   begin
-    A := ParamStr(i);
-    if (A = '--help') or (A = '-h') or (LowerCase(A) = 'help') then
-      Exit(True);
-  end;
-  Result := False;
+    WriteLn(ErrOutput);
+    PrintTopLevelHelp(ErrOutput, AProgramName);
+  end
+  else
+    PrintTopLevelHelp(AProgramName);
+  Result := FUsageExitCode;
 end;
 
 function TSubcommandRegistry.Run(const AProgramName: string): Integer;
+begin
+  Result := Run(AProgramName, GetCommandLineArguments);
+end;
+
+function TSubcommandRegistry.Run(const AProgramName: string;
+  const AArguments: array of string): Integer;
 var
   CmdName : string;
   Sub, AliasSub : TSubcommand;
+  Flag : TTopLevelFlag;
+  CommandArguments : TCommandLineArguments;
   Positionals : TStringList;
-  ParseStart : Integer;
+  FirstArgument, i : Integer;
   StartedAt : QWord;
   Completion : TSubcommandCompletion;
   PreparationError : string;
+  TopLevelHelp : Boolean;
 begin
-  if ParamCount < 1 then
+  if Length(AArguments) < 1 then
+  begin
+    if FBareInvocation = biUsageError then
+      Exit(ReportUsageError(AProgramName, 'missing command'));
+    PrintTopLevelHelp(AProgramName);
+    Exit(0);
+  end;
+
+  Flag := FindTopLevelFlag(AArguments[0]);
+  { The built-in help matches in any letter case, whatever
+    ExactCommandNames is. }
+  TopLevelHelp := SameText(AArguments[0], HELP_WORD)
+    or SameText(AArguments[0], HELP_LONG_FLAG)
+    or SameText(AArguments[0], HELP_SHORT_FLAG);
+  if FStrictTopLevelFlags and ((Flag <> nil) or TopLevelHelp)
+     and (Length(AArguments) > 1) then
+    Exit(ReportUsageError(AProgramName, 'unexpected argument after '
+      + AArguments[0] + ': ' + AArguments[1]));
+
+  if Flag <> nil then
+    Exit(Flag.Handler());
+
+  if TopLevelHelp then
   begin
     PrintTopLevelHelp(AProgramName);
     Exit(0);
   end;
 
-  CmdName := LowerCase(ParamStr(1));
-  if (CmdName = 'help') or (CmdName = '--help') or (CmdName = '-h') then
-  begin
-    PrintTopLevelHelp(AProgramName);
-    Exit(0);
-  end;
-
+  CmdName := CommandName(AArguments[0]);
   Sub := Find(CmdName);
   if Sub = nil then
-  begin
-    WriteLn(ErrOutput, 'unknown command: ', CmdName);
-    PrintTopLevelHelp(AProgramName);
-    Exit(1);
-  end;
+    Exit(ReportUsageError(AProgramName, 'unknown command: ' + CmdName));
 
   StartedAt := GetTickCount64;
   Result := 1;
   try
 
-    { `lwpt run <subcommand>` subcommand-aliasing (ADR-0013). If the
-      second positional is a registered subcommand, dispatch to THAT
-      subcommand directly with its args starting at argv[3]. The run
-      handler never sees this case — it only fires for user-defined
-      run tasks (which are forbidden from shadowing subcommand names
-      by the manifest-load guard, so there's no ambiguity here). }
-    ParseStart := 1;
-    if (CmdName = 'run') and (ParamCount >= 2) then
+    { Subcommand aliasing, as in `lwpt run <subcommand>` (ADR-0013). When
+      the command opted in and its first argument names a registered
+      subcommand, dispatch THAT subcommand with the arguments after its
+      name. The aliasing command's own handler never sees this case. }
+    FirstArgument := 1;
+    if Sub.AliasesSubcommands and (Length(AArguments) >= 2) then
     begin
-      AliasSub := Find(LowerCase(ParamStr(2)));
+      AliasSub := Find(CommandName(AArguments[1]));
       if AliasSub <> nil then
       begin
         Sub := AliasSub;
-        ParseStart := 2;
-        CmdName := LowerCase(ParamStr(2));
+        FirstArgument := 2;
+        CmdName := CommandName(AArguments[1]);
       end;
     end;
 
-    { Intercept per-subcommand --help / -h before ParseCommandLine sees
-      them and reports "Unknown option". }
-    if WantsHelp then
+    SetLength(CommandArguments, Length(AArguments) - FirstArgument);
+    for i := FirstArgument to High(AArguments) do
+      CommandArguments[i - FirstArgument] := AArguments[i];
+
+    if HelpRequested(Sub, CommandArguments, FStrictSingleDash) then
     begin
       PrintSubcommandHelp(AProgramName, Sub);
       Exit(0);
     end;
 
-    { ParseCommandLine reads the real argv. We need it to see only argv[2..]
-      for normal dispatch, or argv[3..] for `lwpt run <subcmd>` aliasing.
-      The AStartArg parameter (added to CLI.Parser for this) gates that. }
     try
-      Positionals := ParseCommandLine(Sub.Options, ParseStart);
+      Positionals := ParseArguments(CommandArguments, Sub.Options,
+        Sub.PassThrough, FStrictSingleDash);
     except
       on E: TParseError do
       begin
         WriteLn(ErrOutput, AProgramName, ' ', CmdName, ': ', E.Message);
-        Exit(1);
+        Exit(FUsageExitCode);
       end;
     end;
 
     try
-      { drop the leading positional (the subcommand name itself) }
-      if (Positionals.Count > 0)
-         and SameText(Positionals[0], CmdName) then
-        Positionals.Delete(0);
       PreparationError := '';
       if Assigned(FOnCommandPrepared) then
         PreparationError := FOnCommandPrepared(CmdName, Sub.Options);
@@ -369,7 +720,7 @@ begin
       begin
         WriteLn(ErrOutput, AProgramName, ' ', CmdName, ': ',
           PreparationError);
-        Result := 1;
+        Result := FUsageExitCode;
       end
       else
         Result := Sub.Handler(Positionals, Sub.Options);
